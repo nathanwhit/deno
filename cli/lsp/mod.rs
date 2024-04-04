@@ -37,6 +37,7 @@ mod search;
 mod semantic_tokens;
 mod testing;
 mod text;
+mod trace;
 mod tsc;
 mod urls;
 
