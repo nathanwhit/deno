@@ -6762,7 +6762,7 @@ dependencies = [
  "fnv",
  "once_cell",
  "onig",
- "regex-syntax",
+ "regex-syntax 0.8.3",
  "serde",
  "serde_derive",
  "serde_json",

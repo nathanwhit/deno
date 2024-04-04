@@ -232,6 +232,7 @@ impl LanguageServer {
 
   /// Similar to `deno cache` on the command line, where modules will be cached
   /// in the Deno cache, including any of their dependencies.
+  #[tracing::instrument(skip_all)]
   pub async fn cache(
     &self,
     specifiers: Vec<ModuleSpecifier>,
@@ -325,6 +326,7 @@ impl LanguageServer {
     Ok(Some(json!(true)))
   }
 
+  #[tracing::instrument(skip_all)]
   /// This request is only used by the lsp integration tests to
   /// coordinate the tests receiving the latest diagnostics.
   pub async fn latest_diagnostic_batch_index_request(
@@ -406,6 +408,7 @@ impl LanguageServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn refresh_configuration(&self) {
     let (client, folders, capable) = {
       let ls = self.0.read().await;
@@ -508,6 +511,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   /// Searches assets and documents for the provided
   /// specifier erroring if it doesn't exist.
   pub fn get_asset_or_document(
@@ -536,6 +540,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_navigation_tree(
     &self,
     specifier: &ModuleSpecifier,
@@ -604,6 +609,7 @@ impl Inner {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn update_cache(&mut self) -> Result<(), AnyError> {
     let mark = self.performance.mark("lsp.update_cache");
     self.performance.measure(mark);
@@ -888,6 +894,7 @@ impl Inner {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   fn walk_workspace(config: &Config) -> (BTreeSet<ModuleSpecifier>, bool) {
     let mut workspace_files = Default::default();
     let entry_limit = 1000;
@@ -990,6 +997,7 @@ impl Inner {
     (workspace_files, false)
   }
 
+  #[tracing::instrument(skip_all)]
   fn refresh_workspace_files(&mut self) {
     let enable_settings_hash = self.config.settings.enable_settings_hash();
     if self.workspace_files_hash == enable_settings_hash {
@@ -1017,6 +1025,7 @@ impl Inner {
     self.workspace_files_hash = enable_settings_hash;
   }
 
+  #[tracing::instrument(skip_all)]
   async fn refresh_config_tree(&mut self) {
     let file_fetcher = self.create_file_fetcher(CacheSetting::RespectHeaders);
     self
@@ -1061,6 +1070,7 @@ impl Inner {
       .await;
   }
 
+  #[tracing::instrument(skip_all)]
   async fn refresh_documents_config(&mut self) {
     self.documents.update_config(
       &self.config,
@@ -1079,6 +1089,7 @@ impl Inner {
     Ok(())
   }
 
+  #[tracing::instrument(skip_all)]
   fn did_open(
     &mut self,
     specifier: &ModuleSpecifier,
@@ -1113,6 +1124,7 @@ impl Inner {
     document
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change(&mut self, params: DidChangeTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_change", &params);
     let specifier = self
@@ -1140,6 +1152,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[tracing::instrument(skip_all)]
   async fn refresh_npm_specifiers(&mut self) {
     let package_reqs = self.documents.npm_package_reqs();
     let resolver = self.resolver.clone();
@@ -1151,6 +1164,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_close(&mut self, params: DidCloseTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_close", &params);
     self.diagnostics_state.clear(&params.text_document.uri);
@@ -1174,6 +1188,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change_configuration(
     &mut self,
     params: DidChangeConfigurationParams,
@@ -1212,6 +1227,7 @@ impl Inner {
     self.send_testing_update();
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change_watched_files(
     &mut self,
     params: DidChangeWatchedFilesParams,
@@ -1321,6 +1337,7 @@ impl Inner {
     self.config.set_workspace_folders(workspace_folders);
   }
 
+  #[tracing::instrument(skip_all)]
   async fn document_symbol(
     &self,
     params: DocumentSymbolParams,
@@ -1363,6 +1380,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn formatting(
     &self,
     params: DocumentFormattingParams,
@@ -1455,6 +1473,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     let specifier = self.url_map.normalize_url(
       &params.text_document_position_params.text_document.uri,
@@ -1572,6 +1591,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_action(
     &self,
     params: CodeActionParams,
@@ -1766,6 +1786,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_action_resolve(
     &self,
     params: CodeAction,
@@ -1880,6 +1901,7 @@ impl Inner {
     )
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_lens(
     &self,
     params: CodeLensParams,
@@ -1945,6 +1967,7 @@ impl Inner {
     Ok(Some(code_lenses))
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_lens_resolve(
     &self,
     code_lens: CodeLens,
@@ -1968,6 +1991,7 @@ impl Inner {
     result
   }
 
+  #[tracing::instrument(skip_all)]
   async fn document_highlight(
     &self,
     params: DocumentHighlightParams,
@@ -2011,6 +2035,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn references(
     &self,
     params: ReferenceParams,
@@ -2067,6 +2092,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_definition(
     &self,
     params: GotoDefinitionParams,
@@ -2105,6 +2131,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_type_definition(
     &self,
     params: GotoTypeDefinitionParams,
@@ -2150,6 +2177,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn completion(
     &self,
     params: CompletionParams,
@@ -2248,6 +2276,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn completion_resolve(
     &self,
     params: CompletionItem,
@@ -2328,6 +2357,7 @@ impl Inner {
     Ok(completion_item)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_implementation(
     &self,
     params: GotoImplementationParams,
@@ -2373,6 +2403,7 @@ impl Inner {
     Ok(result)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn folding_range(
     &self,
     params: FoldingRangeParams,
@@ -2416,6 +2447,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn incoming_calls(
     &self,
     params: CallHierarchyIncomingCallsParams,
@@ -2461,6 +2493,7 @@ impl Inner {
     Ok(Some(resolved_items))
   }
 
+  #[tracing::instrument(skip_all)]
   async fn outgoing_calls(
     &self,
     params: CallHierarchyOutgoingCallsParams,
@@ -2507,6 +2540,7 @@ impl Inner {
     Ok(Some(resolved_items))
   }
 
+  #[tracing::instrument(skip_all)]
   async fn prepare_call_hierarchy(
     &self,
     params: CallHierarchyPrepareParams,
@@ -2570,6 +2604,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn rename(
     &self,
     params: RenameParams,
@@ -2613,6 +2648,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn selection_range(
     &self,
     params: SelectionRangeParams,
@@ -2650,6 +2686,7 @@ impl Inner {
     Ok(Some(selection_ranges))
   }
 
+  #[tracing::instrument(skip_all)]
   async fn semantic_tokens_full(
     &self,
     params: SemanticTokensParams,
@@ -2687,6 +2724,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn semantic_tokens_range(
     &self,
     params: SemanticTokensRangeParams,
@@ -2725,6 +2763,7 @@ impl Inner {
     Ok(response)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn signature_help(
     &self,
     params: SignatureHelpParams,
@@ -2776,6 +2815,7 @@ impl Inner {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn will_rename_files(
     &self,
     params: RenameFilesParams,
@@ -2824,6 +2864,7 @@ impl Inner {
     file_text_changes_to_workspace_edit(&changes, self)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn symbol(
     &self,
     params: WorkspaceSymbolParams,
@@ -2895,6 +2936,7 @@ impl Inner {
 
 #[tower_lsp::async_trait]
 impl tower_lsp::LanguageServer for LanguageServer {
+  #[tracing::instrument(skip_all)]
   async fn execute_command(
     &self,
     params: ExecuteCommandParams,
@@ -2921,6 +2963,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn initialize(
     &self,
     params: InitializeParams,
@@ -2930,6 +2973,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     language_server.initialize(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn initialized(&self, _: InitializedParams) {
     let mut registrations = Vec::with_capacity(2);
     let (client, http_client) = {
@@ -3064,6 +3108,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.write().await.shutdown()
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_open(&self, params: DidOpenTextDocumentParams) {
     if params.text_document.uri.scheme() == "deno" {
       // we can ignore virtual text documents opening, as they don't need to
@@ -3084,11 +3129,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
       inner.send_testing_update();
     }
   }
-
+  #[tracing::instrument(skip_all)]
   async fn did_change(&self, params: DidChangeTextDocumentParams) {
     self.0.write().await.did_change(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
     let uri = &params.text_document.uri;
     let specifier = {
@@ -3115,10 +3161,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_close(&self, params: DidCloseTextDocumentParams) {
     self.0.write().await.did_close(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change_configuration(
     &self,
     params: DidChangeConfigurationParams,
@@ -3137,6 +3185,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     inner.performance.measure(mark);
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change_watched_files(
     &self,
     params: DidChangeWatchedFilesParams,
@@ -3144,6 +3193,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.write().await.did_change_watched_files(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn did_change_workspace_folders(
     &self,
     params: DidChangeWorkspaceFoldersParams,
@@ -3169,6 +3219,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     performance.measure(mark);
   }
 
+  #[tracing::instrument(skip_all)]
   async fn document_symbol(
     &self,
     params: DocumentSymbolParams,
@@ -3176,6 +3227,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.document_symbol(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn formatting(
     &self,
     params: DocumentFormattingParams,
@@ -3183,10 +3235,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.formatting(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     self.0.read().await.hover(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn inlay_hint(
     &self,
     params: InlayHintParams,
@@ -3194,6 +3248,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.inlay_hint(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_action(
     &self,
     params: CodeActionParams,
@@ -3201,6 +3256,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.code_action(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_action_resolve(
     &self,
     params: CodeAction,
@@ -3208,6 +3264,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.code_action_resolve(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_lens(
     &self,
     params: CodeLensParams,
@@ -3215,10 +3272,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.code_lens(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn code_lens_resolve(&self, params: CodeLens) -> LspResult<CodeLens> {
     self.0.read().await.code_lens_resolve(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn document_highlight(
     &self,
     params: DocumentHighlightParams,
@@ -3226,6 +3285,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.document_highlight(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn references(
     &self,
     params: ReferenceParams,
@@ -3233,6 +3293,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.references(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_definition(
     &self,
     params: GotoDefinitionParams,
@@ -3240,6 +3301,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.goto_definition(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_type_definition(
     &self,
     params: GotoTypeDefinitionParams,
@@ -3247,6 +3309,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.goto_type_definition(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn completion(
     &self,
     params: CompletionParams,
@@ -3254,6 +3317,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.completion(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn completion_resolve(
     &self,
     params: CompletionItem,
@@ -3261,6 +3325,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.completion_resolve(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn goto_implementation(
     &self,
     params: GotoImplementationParams,
@@ -3268,6 +3333,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.goto_implementation(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn folding_range(
     &self,
     params: FoldingRangeParams,
@@ -3275,6 +3341,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.folding_range(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn incoming_calls(
     &self,
     params: CallHierarchyIncomingCallsParams,
@@ -3282,6 +3349,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.incoming_calls(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn outgoing_calls(
     &self,
     params: CallHierarchyOutgoingCallsParams,
@@ -3289,6 +3357,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.outgoing_calls(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn prepare_call_hierarchy(
     &self,
     params: CallHierarchyPrepareParams,
@@ -3296,6 +3365,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.prepare_call_hierarchy(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn rename(
     &self,
     params: RenameParams,
@@ -3303,6 +3373,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.rename(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn selection_range(
     &self,
     params: SelectionRangeParams,
@@ -3310,6 +3381,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.selection_range(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn semantic_tokens_full(
     &self,
     params: SemanticTokensParams,
@@ -3317,6 +3389,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.semantic_tokens_full(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn semantic_tokens_range(
     &self,
     params: SemanticTokensRangeParams,
@@ -3324,6 +3397,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.semantic_tokens_range(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn signature_help(
     &self,
     params: SignatureHelpParams,
@@ -3331,6 +3405,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.signature_help(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn will_rename_files(
     &self,
     params: RenameFilesParams,
@@ -3338,6 +3413,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.read().await.will_rename_files(params).await
   }
 
+  #[tracing::instrument(skip_all)]
   async fn symbol(
     &self,
     params: WorkspaceSymbolParams,
@@ -3410,6 +3486,7 @@ impl Inner {
     }))
   }
 
+  #[tracing::instrument(skip_all)]
   async fn post_cache(&mut self, mark: PerformanceMark) {
     // Now that we have dependencies loaded, we need to re-analyze all the files.
     // For that we're invalidating all the existing diagnostics and restarting
@@ -3460,6 +3537,7 @@ impl Inner {
     Ok(result)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn inlay_hint(
     &self,
     params: InlayHintParams,
@@ -3506,6 +3584,7 @@ impl Inner {
     Ok(maybe_inlay_hints)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn reload_import_registries(&mut self) -> LspResult<Option<Value>> {
     remove_dir_all_if_exists(&self.module_registries_location)
       .await

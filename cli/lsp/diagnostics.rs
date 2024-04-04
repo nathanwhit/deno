@@ -447,6 +447,12 @@ impl DiagnosticsServer {
             // channel has closed
             None => break,
             Some(message) => {
+              let sp = tracing::span!(
+                tracing::Level::INFO,
+                "diagnostics_server_loop_turn",
+                ?message
+              );
+              let _e = sp.enter();
               let message = match message {
                 ChannelMessage::Update(message) => message,
                 ChannelMessage::Clear => {
@@ -651,6 +657,7 @@ impl DiagnosticsServer {
     self.batch_counter.get()
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn update(
     &self,
     message: DiagnosticServerUpdateMessage,
@@ -1025,6 +1032,7 @@ impl DenoDiagnostic {
 
   /// A "static" method which for a diagnostic that originated from the
   /// structure returns a code action which can resolve the diagnostic.
+  #[tracing::instrument]
   pub fn get_code_action(
     specifier: &ModuleSpecifier,
     diagnostic: &lsp::Diagnostic,
@@ -1291,6 +1299,7 @@ fn relative_specifier(specifier: &lsp::Url, referrer: &lsp::Url) -> String {
   }
 }
 
+#[tracing::instrument(skip_all)]
 fn diagnose_resolution(
   snapshot: &language_server::StateSnapshot,
   dependency_key: &str,
@@ -1429,6 +1438,7 @@ fn diagnose_resolution(
 /// Generate diagnostics related to a dependency. The dependency is analyzed to
 /// determine if it can be remapped to the active import map as well as surface
 /// any diagnostics related to the resolved code or type dependency.
+#[tracing::instrument(skip(snapshot))]
 fn diagnose_dependency(
   diagnostics: &mut Vec<lsp::Diagnostic>,
   snapshot: &language_server::StateSnapshot,
@@ -1524,6 +1534,7 @@ fn diagnose_dependency(
 /// Generate diagnostics that come from Deno module resolution logic (like
 /// dependencies) or other Deno specific diagnostics, like the ability to use
 /// an import map to shorten an URL.
+#[tracing::instrument(skip_all)]
 fn generate_deno_diagnostics(
   snapshot: &language_server::StateSnapshot,
   config: &Config,

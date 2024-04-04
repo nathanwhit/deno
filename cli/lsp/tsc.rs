@@ -406,6 +406,7 @@ impl TsServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_diagnostics(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -430,7 +431,7 @@ impl TsServer {
     }
     Ok(diagnostics_map)
   }
-
+  
   pub async fn cleanup_semantic_cache(&self, snapshot: Arc<StateSnapshot>) {
     let req = TscRequest::CleanupSemanticCache;
     self
@@ -443,6 +444,7 @@ impl TsServer {
       .ok();
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn find_references(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -468,6 +470,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_navigation_tree(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -479,6 +482,7 @@ impl TsServer {
     self.request(snapshot, req).await
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_supported_code_fixes(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -490,6 +494,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_quick_info(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -506,6 +511,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_code_fixes(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -545,6 +551,7 @@ impl TsServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_applicable_refactors(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -572,6 +579,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_combined_code_fix(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -602,6 +610,7 @@ impl TsServer {
   }
 
   #[allow(clippy::too_many_arguments)]
+  #[tracing::instrument(skip_all)]
   pub async fn get_edits_for_refactor(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -633,6 +642,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_edits_for_file_rename(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -666,6 +676,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_document_highlights(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -687,6 +698,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_definition(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -712,6 +724,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_type_definition(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -737,6 +750,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_completions(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -760,6 +774,7 @@ impl TsServer {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_completion_details(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -785,6 +800,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_implementations(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -810,6 +826,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_outlining_spans(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -824,6 +841,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn provide_call_hierarchy_incoming_calls(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -849,6 +867,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn provide_call_hierarchy_outgoing_calls(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -874,6 +893,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn prepare_call_hierarchy(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -907,6 +927,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn find_rename_locations(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -935,6 +956,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_smart_selection_range(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -951,6 +973,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_encoded_semantic_classifications(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -971,6 +994,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_signature_help_items(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -989,6 +1013,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn get_navigate_to_items(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -1017,6 +1042,7 @@ impl TsServer {
       })
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn provide_inlay_hints(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -1035,6 +1061,7 @@ impl TsServer {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   async fn request<R>(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -1053,6 +1080,7 @@ impl TsServer {
     r
   }
 
+  #[tracing::instrument(skip_all)]
   async fn request_with_cancellation<R>(
     &self,
     snapshot: Arc<StateSnapshot>,

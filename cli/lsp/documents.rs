@@ -356,6 +356,7 @@ impl Document {
     })
   }
 
+  #[tracing::instrument(skip_all)]
   fn with_new_config(
     &self,
     resolver: Arc<LspResolver>,
@@ -585,6 +586,7 @@ impl Document {
     self.maybe_fs_version.as_deref()
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn script_version(&self) -> String {
     match (self.maybe_fs_version(), self.maybe_lsp_version()) {
       (None, None) => "1".to_string(),
@@ -730,6 +732,7 @@ impl RedirectResolver {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn resolve(
     &self,
     specifier: &ModuleSpecifier,
@@ -781,6 +784,7 @@ struct FileSystemDocuments {
 }
 
 impl FileSystemDocuments {
+  #[tracing::instrument(skip_all)]
   pub fn get(
     &self,
     specifier: &ModuleSpecifier,
@@ -960,6 +964,7 @@ impl Documents {
     self.config = Arc::new(config.clone());
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn module_graph_imports(&self) -> impl Iterator<Item = &ModuleSpecifier> {
     self
       .imports
@@ -972,6 +977,7 @@ impl Documents {
   /// requests for information from the document will come from the in-memory
   /// representation received from the language server client, versus reading
   /// information from the disk.
+  #[tracing::instrument(skip_all)]
   pub fn open(
     &mut self,
     specifier: ModuleSpecifier,
@@ -1002,6 +1008,7 @@ impl Documents {
   }
 
   /// Apply language server content changes to an open document.
+  #[tracing::instrument(skip_all)]
   pub fn change(
     &mut self,
     specifier: &ModuleSpecifier,
@@ -1026,6 +1033,7 @@ impl Documents {
     Ok(doc)
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn save(&mut self, specifier: &ModuleSpecifier) {
     let doc = self
       .open_docs
@@ -1043,6 +1051,7 @@ impl Documents {
   /// Close an open document, this essentially clears any editor state that is
   /// being held, and the document store will revert to the file system if
   /// information about the document is required.
+  #[tracing::instrument(skip_all)]
   pub fn close(&mut self, specifier: &ModuleSpecifier) {
     if let Some(document) = self.open_docs.remove(specifier) {
       let document = document.closed(&self.cache);
@@ -1062,6 +1071,7 @@ impl Documents {
 
   /// Return `true` if the provided specifier can be resolved to a document,
   /// otherwise `false`.
+  #[tracing::instrument(skip_all)]
   pub fn contains_import(
     &self,
     specifier: &str,
@@ -1087,6 +1097,7 @@ impl Documents {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn resolve_specifier(
     &self,
     specifier: &ModuleSpecifier,
@@ -1110,6 +1121,7 @@ impl Documents {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   fn resolve_unstable_sloppy_import<'a>(
     &self,
     specifier: &'a ModuleSpecifier,
@@ -1139,6 +1151,7 @@ impl Documents {
   }
 
   /// Return `true` if the specifier can be resolved to a document.
+  #[tracing::instrument(skip_all)]
   pub fn exists(&self, specifier: &ModuleSpecifier) -> bool {
     let specifier = self.resolve_specifier(specifier);
     if let Some(specifier) = specifier {
@@ -1161,6 +1174,7 @@ impl Documents {
   }
 
   /// Returns a collection of npm package requirements.
+  #[tracing::instrument(skip_all)]
   pub fn npm_package_reqs(&mut self) -> Arc<Vec<PackageReq>> {
     self.calculate_npm_reqs_if_dirty();
     self.npm_specifier_reqs.clone()
@@ -1241,6 +1255,7 @@ impl Documents {
   /// For a given set of string specifiers, resolve each one from the graph,
   /// for a given referrer. This is used to provide resolution information to
   /// tsc when type checking.
+  #[tracing::instrument(skip_all)]
   pub fn resolve(
     &self,
     specifiers: &[String],
@@ -1326,6 +1341,7 @@ impl Documents {
     self.lockfile = lockfile;
   }
 
+  #[tracing::instrument(skip_all)]
   pub fn update_config(
     &mut self,
     config: &Config,
@@ -1489,6 +1505,7 @@ impl Documents {
     self.dirty = false;
   }
 
+  #[tracing::instrument(skip_all)]
   fn resolve_dependency(
     &self,
     specifier: &ModuleSpecifier,
@@ -1520,6 +1537,7 @@ impl Documents {
   /// Iterate through any "imported" modules, checking to see if a dependency
   /// is available. This is used to provide "global" imports like the JSX import
   /// source.
+  #[tracing::instrument(skip_all)]
   fn resolve_imports_dependency(&self, specifier: &str) -> Option<&Resolution> {
     for graph_imports in self.imports.values() {
       let maybe_dep = graph_imports.dependencies.get(specifier);
@@ -1556,6 +1574,7 @@ pub struct OpenDocumentsGraphLoader<'a> {
 }
 
 impl<'a> OpenDocumentsGraphLoader<'a> {
+  #[tracing::instrument(skip_all)]
   fn load_from_docs(
     &self,
     specifier: &ModuleSpecifier,
@@ -1575,6 +1594,7 @@ impl<'a> OpenDocumentsGraphLoader<'a> {
     None
   }
 
+  #[tracing::instrument(skip_all)]
   fn resolve_unstable_sloppy_import<'b>(
     &self,
     specifier: &'b ModuleSpecifier,
@@ -1603,6 +1623,7 @@ impl<'a> OpenDocumentsGraphLoader<'a> {
 }
 
 impl<'a> deno_graph::source::Loader for OpenDocumentsGraphLoader<'a> {
+  #[tracing::instrument(skip_all)]
   fn load(
     &self,
     specifier: &ModuleSpecifier,
@@ -1622,6 +1643,7 @@ impl<'a> deno_graph::source::Loader for OpenDocumentsGraphLoader<'a> {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   fn cache_module_info(
     &self,
     specifier: &deno_ast::ModuleSpecifier,
@@ -1634,6 +1656,7 @@ impl<'a> deno_graph::source::Loader for OpenDocumentsGraphLoader<'a> {
   }
 }
 
+#[tracing::instrument(skip_all)]
 fn parse_and_analyze_module(
   specifier: &ModuleSpecifier,
   text_info: SourceTextInfo,
@@ -1647,6 +1670,7 @@ fn parse_and_analyze_module(
   (Some(parsed_source_result), Some(module_result))
 }
 
+#[tracing::instrument(skip_all)]
 fn parse_source(
   specifier: &ModuleSpecifier,
   text_info: SourceTextInfo,
@@ -1662,6 +1686,7 @@ fn parse_source(
   })
 }
 
+#[tracing::instrument(skip_all)]
 fn analyze_module(
   specifier: &ModuleSpecifier,
   parsed_source_result: &ParsedSourceResult,
