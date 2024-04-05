@@ -431,7 +431,7 @@ impl TsServer {
     }
     Ok(diagnostics_map)
   }
-  
+
   pub async fn cleanup_semantic_cache(&self, snapshot: Arc<StateSnapshot>) {
     let req = TscRequest::CleanupSemanticCache;
     self
@@ -4016,12 +4016,14 @@ impl State {
   }
 }
 
+#[tracing::instrument(skip(state))]
 #[op2(fast)]
 fn op_is_cancelled(state: &mut OpState) -> bool {
   let state = state.borrow_mut::<State>();
   state.token.is_cancelled()
 }
 
+#[tracing::instrument(skip(state))]
 #[op2(fast)]
 fn op_is_node_file(state: &mut OpState, #[string] path: String) -> bool {
   let state = state.borrow::<State>();
@@ -4043,6 +4045,7 @@ struct LoadResponse {
   is_cjs: bool,
 }
 
+#[tracing::instrument(skip(scope, state))]
 #[op2]
 fn op_load<'s>(
   scope: &'s mut v8::HandleScope,
@@ -4091,6 +4094,7 @@ fn op_release(
   Ok(())
 }
 
+#[tracing::instrument(skip(scope, state))]
 #[op2]
 #[serde]
 fn op_resolve(
@@ -4128,12 +4132,14 @@ fn op_resolve_inner(
   Ok(specifiers)
 }
 
+#[tracing::instrument(skip_all)]
 #[op2(fast)]
 fn op_respond(state: &mut OpState, #[string] response: String) {
   let state = state.borrow_mut::<State>();
   state.response = Some(response);
 }
 
+#[tracing::instrument(skip_all)]
 #[op2]
 #[serde]
 fn op_script_names(state: &mut OpState) -> Vec<String> {
@@ -4191,6 +4197,7 @@ fn op_script_names(state: &mut OpState) -> Vec<String> {
   r
 }
 
+#[tracing::instrument(skip(state))]
 #[op2]
 #[string]
 fn op_script_version(
@@ -4205,6 +4212,7 @@ fn op_script_version(
   Ok(r)
 }
 
+#[tracing::instrument(skip_all)]
 #[op2]
 #[serde]
 fn op_ts_config(state: &mut OpState) -> serde_json::Value {
@@ -4215,6 +4223,7 @@ fn op_ts_config(state: &mut OpState) -> serde_json::Value {
   r
 }
 
+#[tracing::instrument(skip_all)]
 #[op2(fast)]
 #[number]
 fn op_project_version(state: &mut OpState) -> usize {
