@@ -121,6 +121,24 @@ impl RootCertStoreProvider for LspRootCertStoreProvider {
 #[derive(Debug, Clone)]
 pub struct LanguageServer(Arc<tokio::sync::RwLock<Inner>>, CancellationToken);
 
+impl LanguageServer {
+  #[tracing::instrument(skip_all)]
+  async fn write(&self) -> tokio::sync::RwLockWriteGuard<Inner> {
+    self.0.write().await
+  }
+
+  #[tracing::instrument(skip_all)]
+  async fn read(&self) -> tokio::sync::RwLockReadGuard<Inner> {
+    self.0.read().await
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct StateNpmSnapshot {
+  pub node_resolver: Arc<CliNodeResolver>,
+  pub npm_resolver: Arc<dyn CliNpmResolver>,
+}
+
 /// Snapshot of the state used by TSC.
 #[derive(Clone, Debug)]
 pub struct StateSnapshot {
@@ -286,7 +304,7 @@ impl LanguageServer {
 
     // do as much as possible in a read, then do a write outside
     let maybe_prepare_cache_result = {
-      let inner = self.0.read().await; // ensure dropped
+      let inner = self.read().await; // ensure dropped
       match inner.prepare_cache(specifiers, referrer, force_global_cache) {
         Ok(maybe_cache_result) => maybe_cache_result,
         Err(err) => {
@@ -317,11 +335,14 @@ impl LanguageServer {
           .client
           .show_message(MessageType::WARNING, err);
       }
-      let mut inner = self.0.write().await;
-      let lockfile = inner.config.tree.root_lockfile().cloned();
-      inner.documents.refresh_lockfile(lockfile);
-      inner.refresh_npm_specifiers().await;
-      inner.post_cache(result.mark).await;
+      {
+        let mut inner = self.write().await;
+        let lockfile = inner.config.tree.root_lockfile().cloned();
+        inner.documents.refresh_lockfile(lockfile);
+        inner.refresh_npm_specifiers().await;
+      }
+      // now refresh the data in a read
+      self.0.read().await.post_cache(result.mark).await;
     }
     Ok(Some(json!(true)))
   }
@@ -344,18 +365,18 @@ impl LanguageServer {
   }
 
   pub async fn performance_request(&self) -> LspResult<Option<Value>> {
-    Ok(Some(self.0.read().await.get_performance()))
+    Ok(Some(self.read().await.get_performance()))
   }
 
   pub async fn task_definitions(&self) -> LspResult<Vec<TaskDefinition>> {
-    self.0.read().await.task_definitions()
+    self.read().await.task_definitions()
   }
 
   pub async fn test_run_request(
     &self,
     params: Option<Value>,
   ) -> LspResult<Option<Value>> {
-    let inner = self.0.read().await;
+    let inner = self.read().await;
     if let Some(testing_server) = &inner.maybe_testing_server {
       match params.map(serde_json::from_value) {
         Some(Ok(params)) => {
@@ -375,7 +396,7 @@ impl LanguageServer {
     &self,
     params: Option<Value>,
   ) -> LspResult<Option<Value>> {
-    if let Some(testing_server) = &self.0.read().await.maybe_testing_server {
+    if let Some(testing_server) = &self.read().await.maybe_testing_server {
       match params.map(serde_json::from_value) {
         Some(Ok(params)) => testing_server.run_cancel_request(params),
         Some(Err(err)) => Err(LspError::invalid_params(err.to_string())),
@@ -392,16 +413,14 @@ impl LanguageServer {
   ) -> LspResult<Option<Value>> {
     match params.map(serde_json::from_value) {
       Some(Ok(params)) => Ok(Some(
-        serde_json::to_value(
-          self.0.read().await.virtual_text_document(params)?,
-        )
-        .map_err(|err| {
-          error!(
-            "Failed to serialize virtual_text_document response: {:#}",
-            err
-          );
-          LspError::internal_error()
-        })?,
+        serde_json::to_value(self.read().await.virtual_text_document(params)?)
+          .map_err(|err| {
+            error!(
+              "Failed to serialize virtual_text_document response: {:#}",
+              err
+            );
+            LspError::internal_error()
+          })?,
       )),
       Some(Err(err)) => Err(LspError::invalid_params(err.to_string())),
       None => Err(LspError::invalid_params("Missing parameters")),
@@ -411,7 +430,7 @@ impl LanguageServer {
   #[tracing::instrument(skip_all)]
   pub async fn refresh_configuration(&self) {
     let (client, folders, capable) = {
-      let ls = self.0.read().await;
+      let ls = self.read().await;
       (
         ls.client.clone(),
         ls.config.workspace_folders.clone(),
@@ -439,7 +458,7 @@ impl LanguageServer {
         for (folder_uri, _) in &folders {
           folder_settings.push((folder_uri.clone(), configs.next().unwrap()));
         }
-        let mut ls = self.0.write().await;
+        let mut ls = self.write().await;
         ls.config.set_workspace_settings(unscoped, folder_settings);
       }
     }
@@ -2957,7 +2976,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
         .cache(specifiers, referrer, options.force_global_cache)
         .await
     } else if params.command == "deno.reloadImportRegistries" {
-      self.0.write().await.reload_import_registries().await
+      self.write().await.reload_import_registries().await
     } else {
       Ok(None)
     }
@@ -2968,7 +2987,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: InitializeParams,
   ) -> LspResult<InitializeResult> {
-    let mut language_server = self.0.write().await;
+    let mut language_server = self.write().await;
     language_server.diagnostics_server.start();
     language_server.initialize(params).await
   }
@@ -2977,7 +2996,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
   async fn initialized(&self, _: InitializedParams) {
     let mut registrations = Vec::with_capacity(2);
     let (client, http_client) = {
-      let mut ls = self.0.write().await;
+      let mut ls = self.write().await;
       if ls
         .config
         .client_capabilities
@@ -3070,7 +3089,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.refresh_configuration().await;
 
     {
-      let mut ls = self.0.write().await;
+      let mut ls = self.write().await;
       init_log_file(ls.config.log_file());
       ls.refresh_documents_config().await;
       ls.diagnostics_server.invalidate_all();
@@ -3105,7 +3124,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
   async fn shutdown(&self) -> LspResult<()> {
     self.1.cancel();
-    self.0.write().await.shutdown()
+    self.write().await.shutdown()
   }
 
   #[tracing::instrument(skip_all)]
@@ -3117,7 +3136,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
       return;
     }
 
-    let mut inner = self.0.write().await;
+    let mut inner = self.write().await;
     let specifier = inner
       .url_map
       .normalize_url(&params.text_document.uri, LspUrlKind::File);
@@ -3131,14 +3150,14 @@ impl tower_lsp::LanguageServer for LanguageServer {
   }
   #[tracing::instrument(skip_all)]
   async fn did_change(&self, params: DidChangeTextDocumentParams) {
-    self.0.write().await.did_change(params).await
+    self.write().await.did_change(params).await
   }
 
   #[tracing::instrument(skip_all)]
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
     let uri = &params.text_document.uri;
     let specifier = {
-      let mut inner = self.0.write().await;
+      let mut inner = self.write().await;
       let specifier = inner.url_map.normalize_url(uri, LspUrlKind::File);
       inner.documents.save(&specifier);
       if !inner
@@ -3163,7 +3182,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
   #[tracing::instrument(skip_all)]
   async fn did_close(&self, params: DidCloseTextDocumentParams) {
-    self.0.write().await.did_close(params).await
+    self.write().await.did_close(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3172,7 +3191,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     params: DidChangeConfigurationParams,
   ) {
     let mark = {
-      let inner = self.0.read().await;
+      let inner = self.read().await;
       inner
         .performance
         .mark_with_args("lsp.did_change_configuration", &params)
@@ -3180,7 +3199,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
     self.refresh_configuration().await;
 
-    let mut inner = self.0.write().await;
+    let mut inner = self.write().await;
     inner.did_change_configuration(params).await;
     inner.performance.measure(mark);
   }
@@ -3190,7 +3209,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: DidChangeWatchedFilesParams,
   ) {
-    self.0.write().await.did_change_watched_files(params).await
+    self.write().await.did_change_watched_files(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3199,7 +3218,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     params: DidChangeWorkspaceFoldersParams,
   ) {
     let (performance, mark) = {
-      let mut ls = self.0.write().await;
+      let mut ls = self.write().await;
       let mark = ls
         .performance
         .mark_with_args("lsp.did_change_workspace_folders", &params);
@@ -3209,7 +3228,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
     self.refresh_configuration().await;
     {
-      let mut ls = self.0.write().await;
+      let mut ls = self.write().await;
       ls.refresh_workspace_files();
       ls.refresh_config_tree().await;
       ls.refresh_documents_config().await;
@@ -3224,7 +3243,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: DocumentSymbolParams,
   ) -> LspResult<Option<DocumentSymbolResponse>> {
-    self.0.read().await.document_symbol(params).await
+    self.read().await.document_symbol(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3232,12 +3251,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: DocumentFormattingParams,
   ) -> LspResult<Option<Vec<TextEdit>>> {
-    self.0.read().await.formatting(params).await
+    self.read().await.formatting(params).await
   }
 
   #[tracing::instrument(skip_all)]
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
-    self.0.read().await.hover(params).await
+    self.read().await.hover(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3245,7 +3264,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: InlayHintParams,
   ) -> LspResult<Option<Vec<InlayHint>>> {
-    self.0.read().await.inlay_hint(params).await
+    self.read().await.inlay_hint(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3253,7 +3272,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CodeActionParams,
   ) -> LspResult<Option<CodeActionResponse>> {
-    self.0.read().await.code_action(params).await
+    self.read().await.code_action(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3261,7 +3280,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CodeAction,
   ) -> LspResult<CodeAction> {
-    self.0.read().await.code_action_resolve(params).await
+    self.read().await.code_action_resolve(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3269,12 +3288,12 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CodeLensParams,
   ) -> LspResult<Option<Vec<CodeLens>>> {
-    self.0.read().await.code_lens(params).await
+    self.read().await.code_lens(params).await
   }
 
   #[tracing::instrument(skip_all)]
   async fn code_lens_resolve(&self, params: CodeLens) -> LspResult<CodeLens> {
-    self.0.read().await.code_lens_resolve(params).await
+    self.read().await.code_lens_resolve(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3282,7 +3301,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: DocumentHighlightParams,
   ) -> LspResult<Option<Vec<DocumentHighlight>>> {
-    self.0.read().await.document_highlight(params).await
+    self.read().await.document_highlight(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3290,7 +3309,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: ReferenceParams,
   ) -> LspResult<Option<Vec<Location>>> {
-    self.0.read().await.references(params).await
+    self.read().await.references(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3298,7 +3317,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: GotoDefinitionParams,
   ) -> LspResult<Option<GotoDefinitionResponse>> {
-    self.0.read().await.goto_definition(params).await
+    self.read().await.goto_definition(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3306,7 +3325,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: GotoTypeDefinitionParams,
   ) -> LspResult<Option<GotoTypeDefinitionResponse>> {
-    self.0.read().await.goto_type_definition(params).await
+    self.read().await.goto_type_definition(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3314,7 +3333,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CompletionParams,
   ) -> LspResult<Option<CompletionResponse>> {
-    self.0.read().await.completion(params).await
+    self.read().await.completion(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3322,7 +3341,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CompletionItem,
   ) -> LspResult<CompletionItem> {
-    self.0.read().await.completion_resolve(params).await
+    self.read().await.completion_resolve(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3330,7 +3349,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: GotoImplementationParams,
   ) -> LspResult<Option<GotoImplementationResponse>> {
-    self.0.read().await.goto_implementation(params).await
+    self.read().await.goto_implementation(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3338,7 +3357,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: FoldingRangeParams,
   ) -> LspResult<Option<Vec<FoldingRange>>> {
-    self.0.read().await.folding_range(params).await
+    self.read().await.folding_range(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3346,7 +3365,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CallHierarchyIncomingCallsParams,
   ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
-    self.0.read().await.incoming_calls(params).await
+    self.read().await.incoming_calls(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3354,7 +3373,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CallHierarchyOutgoingCallsParams,
   ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
-    self.0.read().await.outgoing_calls(params).await
+    self.read().await.outgoing_calls(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3362,7 +3381,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: CallHierarchyPrepareParams,
   ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
-    self.0.read().await.prepare_call_hierarchy(params).await
+    self.read().await.prepare_call_hierarchy(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3370,7 +3389,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: RenameParams,
   ) -> LspResult<Option<WorkspaceEdit>> {
-    self.0.read().await.rename(params).await
+    self.read().await.rename(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3378,7 +3397,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: SelectionRangeParams,
   ) -> LspResult<Option<Vec<SelectionRange>>> {
-    self.0.read().await.selection_range(params).await
+    self.read().await.selection_range(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3386,7 +3405,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: SemanticTokensParams,
   ) -> LspResult<Option<SemanticTokensResult>> {
-    self.0.read().await.semantic_tokens_full(params).await
+    self.read().await.semantic_tokens_full(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3394,7 +3413,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: SemanticTokensRangeParams,
   ) -> LspResult<Option<SemanticTokensRangeResult>> {
-    self.0.read().await.semantic_tokens_range(params).await
+    self.read().await.semantic_tokens_range(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3402,7 +3421,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: SignatureHelpParams,
   ) -> LspResult<Option<SignatureHelp>> {
-    self.0.read().await.signature_help(params).await
+    self.read().await.signature_help(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3410,7 +3429,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: RenameFilesParams,
   ) -> LspResult<Option<WorkspaceEdit>> {
-    self.0.read().await.will_rename_files(params).await
+    self.read().await.will_rename_files(params).await
   }
 
   #[tracing::instrument(skip_all)]
@@ -3418,7 +3437,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     &self,
     params: WorkspaceSymbolParams,
   ) -> LspResult<Option<Vec<SymbolInformation>>> {
-    self.0.read().await.symbol(params).await
+    self.read().await.symbol(params).await
   }
 }
 
