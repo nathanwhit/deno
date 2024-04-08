@@ -293,8 +293,10 @@ pub struct Document {
 }
 
 impl Document {
-  /// Open documents should have `maybe_lsp_version.is_some()`.
-  #[allow(clippy::too_many_arguments)]
+  #[tracing::instrument(
+    level = "debug",
+    skip(resolver, maybe_headers, config)
+  )]
   fn new(
     specifier: ModuleSpecifier,
     content: Arc<str>,
@@ -784,7 +786,7 @@ struct FileSystemDocuments {
 }
 
 impl FileSystemDocuments {
-  #[tracing::instrument(skip_all)]
+  #[tracing::instrument(level = "debug", skip_all)]
   pub fn get(
     &self,
     specifier: &ModuleSpecifier,
@@ -815,6 +817,7 @@ impl FileSystemDocuments {
 
   /// Adds or updates a document by reading the document from the file system
   /// returning the document.
+  #[tracing::instrument(level = "debug", skip_all)]
   fn refresh_document(
     &self,
     specifier: &ModuleSpecifier,
@@ -1670,7 +1673,7 @@ fn parse_and_analyze_module(
   (Some(parsed_source_result), Some(module_result))
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn parse_source(
   specifier: &ModuleSpecifier,
   text_info: SourceTextInfo,
@@ -1686,7 +1689,7 @@ fn parse_source(
   })
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn analyze_module(
   specifier: &ModuleSpecifier,
   parsed_source_result: &ParsedSourceResult,
