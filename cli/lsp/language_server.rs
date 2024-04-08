@@ -1108,7 +1108,7 @@ impl Inner {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
+  #[tracing::instrument(skip(self, params))]
   fn did_open(
     &mut self,
     specifier: &ModuleSpecifier,
@@ -1183,7 +1183,7 @@ impl Inner {
     }
   }
 
-  #[tracing::instrument(skip_all)]
+  #[tracing::instrument(skip(self))]
   async fn did_close(&mut self, params: DidCloseTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_close", &params);
     self.diagnostics_state.clear(&params.text_document.uri);
@@ -1246,7 +1246,7 @@ impl Inner {
     self.send_testing_update();
   }
 
-  #[tracing::instrument(skip_all)]
+  #[tracing::instrument(skip(self))]
   async fn did_change_watched_files(
     &mut self,
     params: DidChangeWatchedFilesParams,
@@ -3153,7 +3153,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.write().await.did_change(params).await
   }
 
-  #[tracing::instrument(skip_all)]
+  #[tracing::instrument(skip_all, fields(uri=%params.text_document.uri))]
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
     let uri = &params.text_document.uri;
     let specifier = {
