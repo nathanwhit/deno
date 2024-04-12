@@ -4093,7 +4093,6 @@ fn op_release(
   Ok(())
 }
 
-#[tracing::instrument(skip(scope, state))]
 #[op2]
 #[serde]
 fn op_resolve(
