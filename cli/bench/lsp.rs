@@ -8,12 +8,16 @@ use deno_core::url::Url;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
+use test_util::lsp::LspClient;
 use test_util::lsp::LspClientBuilder;
+use test_util::root_path;
 use tower_lsp::lsp_types as lsp;
 
 static FIXTURE_CODE_LENS_TS: &str = include_str!("testdata/code_lens.ts");
 static FIXTURE_DB_TS: &str = include_str!("testdata/db.ts");
 static FIXTURE_DB_MESSAGES: &[u8] = include_bytes!("testdata/db_messages.json");
+static FIXTURE_DECO_MESSAGES: &[u8] =
+  include_bytes!("testdata/apps/apps_messages.json");
 
 #[derive(Debug, Deserialize)]
 enum FixtureType {
@@ -36,6 +40,58 @@ struct FixtureMessage {
   params: Value,
 }
 
+fn apply_fixtures(
+  client: &mut LspClient,
+  fixtures: impl IntoIterator<Item = FixtureMessage>,
+) {
+  for msg in fixtures {
+    match msg.fixture_type {
+      FixtureType::Action => {
+        client.write_request("textDocument/codeAction", msg.params);
+      }
+      FixtureType::Change => {
+        client.write_notification("textDocument/didChange", msg.params);
+      }
+      FixtureType::Completion => {
+        client.write_request("textDocument/completion", msg.params);
+      }
+      FixtureType::Highlight => {
+        client.write_request("textDocument/documentHighlight", msg.params);
+      }
+      FixtureType::Hover => {
+        client.write_request("textDocument/hover", msg.params);
+      }
+    }
+  }
+}
+
+fn bench_multi_file_edits(deno_exe: &Path) -> Duration {
+  let apps = root_path().join("cli/tests/bench/testdata/apps");
+  let mut client = LspClientBuilder::new()
+    .use_diagnostic_sync(false)
+    .set_root_dir(apps)
+    .deno_exe(deno_exe)
+    .build();
+  client.initialize_default();
+  client.change_configuration(json!({
+    "deno.enable": true,
+    "deno.lint": true,
+    "deno.unstable": true
+  }));
+
+  let messages: Vec<tower_lsp::jsonrpc::Request> =
+    serde_json::from_slice(FIXTURE_DECO_MESSAGES).unwrap();
+
+  for msg in messages {
+    if msg.method().starts_with("textDocument/did") {
+      client.write_notification(msg.method(), msg.params());
+    } else {
+      client.write_request(msg.method(), msg.params());
+    }
+  }
+
+  client.duration()
+}
 /// A benchmark that opens a 8000+ line TypeScript document, adds a function to
 /// the end of the document and does a level of hovering and gets quick fix
 /// code actions.
@@ -69,25 +125,7 @@ fn bench_big_file_edits(deno_exe: &Path) -> Duration {
   let messages: Vec<FixtureMessage> =
     serde_json::from_slice(FIXTURE_DB_MESSAGES).unwrap();
 
-  for msg in messages {
-    match msg.fixture_type {
-      FixtureType::Action => {
-        client.write_request("textDocument/codeAction", msg.params);
-      }
-      FixtureType::Change => {
-        client.write_notification("textDocument/didChange", msg.params);
-      }
-      FixtureType::Completion => {
-        client.write_request("textDocument/completion", msg.params);
-      }
-      FixtureType::Highlight => {
-        client.write_request("textDocument/documentHighlight", msg.params);
-      }
-      FixtureType::Hover => {
-        client.write_request("textDocument/hover", msg.params);
-      }
-    }
-  }
+  apply_fixtures(&mut client, messages);
 
   client.write_request("shutdown", json!(null));
   client.write_notification("exit", json!(null));
@@ -308,6 +346,15 @@ pub fn benchmarks(deno_exe: &Path) -> HashMap<String, i64> {
     (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
   println!("      ({} runs, mean: {}ms)", times.len(), mean);
   exec_times.insert("code_lens".to_string(), mean);
+
+  println!("   - Multi File Edits");
+  let mut times = Vec::new();
+  for _ in 0..5 {
+    times.push(bench_multi_file_edits(deno_exe));
+  }
+  let mean =
+    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  println!("      ({} runs, mean: {}ms)", times.len(), mean);
 
   println!("<- End benchmarking lsp");
 
