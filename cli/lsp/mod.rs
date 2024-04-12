@@ -1,5 +1,7 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
+use std::time::Duration;
+
 use deno_core::error::AnyError;
 use deno_core::unsync::spawn;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +40,46 @@ mod testing;
 mod text;
 mod tsc;
 mod urls;
+
+struct Loggy {
+  inner: tower_lsp::LspService<LanguageServer>,
+  tx: tokio::sync::mpsc::UnboundedSender<tower_lsp::jsonrpc::Request>,
+}
+
+impl tower::Service<tower_lsp::jsonrpc::Request> for Loggy {
+  type Response = <tower_lsp::LspService<LanguageServer> as tower::Service<
+    tower_lsp::jsonrpc::Request,
+  >>::Response;
+  type Error = <tower_lsp::LspService<LanguageServer> as tower::Service<
+    tower_lsp::jsonrpc::Request,
+  >>::Error;
+  type Future = std::pin::Pin<
+    Box<
+      dyn std::future::Future<Output = Result<Self::Response, Self::Error>>
+        + Send
+        + 'static,
+    >,
+  >;
+
+  fn poll_ready(
+    &mut self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Result<(), Self::Error>> {
+    self.inner.poll_ready(cx)
+  }
+
+  fn call(&mut self, req: tower_lsp::jsonrpc::Request) -> Self::Future {
+    let tx = self.tx.clone();
+    let r = req.clone();
+    let fut = self.inner.call(req);
+    let f = async move {
+      let _ = tx.send(r);
+      fut.await
+    };
+
+    Box::pin(f)
+  }
+}
 
 pub async fn start() -> Result<(), AnyError> {
   let stdin = tokio::io::stdin();
@@ -79,6 +121,40 @@ pub async fn start() -> Result<(), AnyError> {
 
   let (service, socket) = builder.finish();
 
+  // let (tx, buf) =
+  //   tokio::sync::mpsc::unbounded_channel::<tower_lsp::jsonrpc::Request>();
+
+  // let svc = Loggy { inner: service, tx };
+  // tokio::spawn({
+  //   let token = token.clone();
+  //   async move {
+  //     let mut buf = buf;
+  //     let mut reqs = Vec::new();
+  //     loop {
+  //       let mut new = false;
+  //       while let Ok(req) = buf.try_recv() {
+  //         reqs.push(req);
+  //         new = true;
+  //       }
+  //       if new {
+  //         tokio::fs::write(
+  //           "./messages.json",
+  //           deno_core::serde_json::to_string(&reqs).unwrap(),
+  //         )
+  //         .await
+  //         .unwrap();
+  //       }
+  //       tokio::select! {
+  //         biased;
+  //         _ = token.cancelled() => {
+  //           break;
+  //         }
+  //         _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+  //       }
+  //     }
+  //   }
+  // });
+
   // TODO(nayeemrmn): This cancellation token is a workaround for
   // https://github.com/denoland/deno/issues/20700. Remove when
   // https://github.com/ebkalderon/tower-lsp/issues/399 is fixed.
@@ -86,6 +162,7 @@ pub async fn start() -> Result<(), AnyError> {
   tokio::select! {
     biased;
     _ = Server::new(stdin, stdout, socket).serve(service) => {}
+    // _ = Server::new(stdin, stdout, socket).serve(svc) => {}
     _ = spawn(async move {
       token.cancelled().await;
       tokio::time::sleep(std::time::Duration::from_secs(8)).await;

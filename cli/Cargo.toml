@@ -151,6 +151,7 @@ uuid = { workspace = true, features = ["serde"] }
 walkdir = "=2.3.2"
 zeromq.workspace = true
 zstd.workspace = true
+tower = "0.4.13"
 
 [target.'cfg(windows)'.dependencies]
 fwdansi.workspace = true

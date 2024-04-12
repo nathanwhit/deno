@@ -66,6 +66,8 @@ fn apply_fixtures(
 }
 
 fn bench_multi_file_edits(deno_exe: &Path) -> Duration {
+  let messages: Vec<tower_lsp::jsonrpc::Request> =
+    serde_json::from_slice(FIXTURE_DECO_MESSAGES).unwrap();
   let apps = root_path().join("cli/tests/bench/testdata/apps");
   let mut client = LspClientBuilder::new()
     .use_diagnostic_sync(false)
@@ -78,9 +80,6 @@ fn bench_multi_file_edits(deno_exe: &Path) -> Duration {
     "deno.lint": true,
     "deno.unstable": true
   }));
-
-  let messages: Vec<tower_lsp::jsonrpc::Request> =
-    serde_json::from_slice(FIXTURE_DECO_MESSAGES).unwrap();
 
   for msg in messages {
     if msg.method().starts_with("textDocument/did") {
@@ -307,45 +306,45 @@ pub fn benchmarks(deno_exe: &Path) -> HashMap<String, i64> {
   println!("-> Start benchmarking lsp");
   let mut exec_times = HashMap::new();
 
-  println!("   - Simple Startup/Shutdown ");
-  let mut times = Vec::new();
-  for _ in 0..10 {
-    times.push(bench_startup_shutdown(deno_exe));
-  }
-  let mean =
-    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  exec_times.insert("startup_shutdown".to_string(), mean);
+  // println!("   - Simple Startup/Shutdown ");
+  // let mut times = Vec::new();
+  // for _ in 0..10 {
+  //   times.push(bench_startup_shutdown(deno_exe));
+  // }
+  // let mean =
+  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  // exec_times.insert("startup_shutdown".to_string(), mean);
 
-  println!("   - Big Document/Several Edits ");
-  let mut times = Vec::new();
-  for _ in 0..5 {
-    times.push(bench_big_file_edits(deno_exe));
-  }
-  let mean =
-    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  exec_times.insert("big_file_edits".to_string(), mean);
+  // println!("   - Big Document/Several Edits ");
+  // let mut times = Vec::new();
+  // for _ in 0..5 {
+  //   times.push(bench_big_file_edits(deno_exe));
+  // }
+  // let mean =
+  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  // exec_times.insert("big_file_edits".to_string(), mean);
 
-  println!("   - Find/Replace");
-  let mut times = Vec::new();
-  for _ in 0..10 {
-    times.push(bench_find_replace(deno_exe));
-  }
-  let mean =
-    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  exec_times.insert("find_replace".to_string(), mean);
+  // println!("   - Find/Replace");
+  // let mut times = Vec::new();
+  // for _ in 0..10 {
+  //   times.push(bench_find_replace(deno_exe));
+  // }
+  // let mean =
+  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  // exec_times.insert("find_replace".to_string(), mean);
 
-  println!("   - Code Lens");
-  let mut times = Vec::new();
-  for _ in 0..10 {
-    times.push(bench_code_lens(deno_exe));
-  }
-  let mean =
-    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  exec_times.insert("code_lens".to_string(), mean);
+  // println!("   - Code Lens");
+  // let mut times = Vec::new();
+  // for _ in 0..10 {
+  //   times.push(bench_code_lens(deno_exe));
+  // }
+  // let mean =
+  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  // exec_times.insert("code_lens".to_string(), mean);
 
   println!("   - Multi File Edits");
   let mut times = Vec::new();
