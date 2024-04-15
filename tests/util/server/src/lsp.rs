@@ -941,6 +941,21 @@ impl LspClient {
     })
   }
 
+  pub fn write_request_no_wait(
+    &mut self,
+    method: impl AsRef<str>,
+    params: impl Serialize,
+  ) {
+    let value = json!({
+      "jsonrpc": "2.0",
+      "id": self.request_id,
+      "method": method.as_ref(),
+      "params": params,
+    });
+    self.write(value);
+    self.request_id += 1;
+  }
+
   fn write(&mut self, value: Value) {
     let value_str = value.to_string();
     let msg = format!(
@@ -1028,6 +1043,13 @@ impl LspClient {
       }
       _ => None,
     })
+  }
+
+  pub fn read_response(&mut self) {
+    self.reader.read_message(|msg| match msg {
+      LspMessage::Response(_, _, _) => Some(()),
+      _ => None,
+    });
   }
 
   pub fn write_response<V>(&mut self, id: u64, result: V)
