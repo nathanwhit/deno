@@ -27,6 +27,7 @@
   "githooks": {
     "pre-commit": "check"
   },
+  "vendor": true,
   "exclude": [
     "static",
     "README.md",
