@@ -11,6 +11,7 @@ use std::time::Duration;
 use test_util::lsp::LspClient;
 use test_util::lsp::LspClientBuilder;
 use test_util::root_path;
+use test_util::PathRef;
 use tower_lsp::lsp_types as lsp;
 
 static FIXTURE_CODE_LENS_TS: &str = include_str!("testdata/code_lens.ts");
@@ -65,32 +66,103 @@ fn apply_fixtures(
   }
 }
 
-fn bench_multi_file_edits(deno_exe: &Path) -> Duration {
-  let messages: Vec<tower_lsp::jsonrpc::Request> =
-    serde_json::from_slice(FIXTURE_DECO_MESSAGES).unwrap();
-  let apps = root_path().join("cli/tests/bench/testdata/apps");
-  let mut client = LspClientBuilder::new()
-    .use_diagnostic_sync(false)
-    .set_root_dir(apps)
-    .deno_exe(deno_exe)
-    .build();
-  client.initialize_default();
-  client.change_configuration(json!({
-    "deno.enable": true,
-    "deno.lint": true,
-    "deno.unstable": true
-  }));
+fn patch_uris<'a>(
+  reqs: impl IntoIterator<Item = &'a mut tower_lsp::jsonrpc::Request>,
+  root: &PathRef,
+) {
+  for req in reqs {
+    let mut params = req.params().unwrap().clone();
+    let new_req = if let Some(doc) = params.get_mut("textDocument") {
+      if let Some(uri_val) = doc.get_mut("uri") {
+        let uri = uri_val.as_str().unwrap();
+        *uri_val =
+          Value::from(uri.replace(
+            "file:///",
+            &format!("file://{}/", root.to_string_lossy()),
+          ));
+      }
+      let builder = tower_lsp::jsonrpc::Request::build(req.method().to_owned());
+      let builder = if let Some(id) = req.id() {
+        builder.id(id.clone())
+      } else {
+        builder
+      };
 
-  for msg in messages {
-    if msg.method().starts_with("textDocument/did") {
-      client.write_notification(msg.method(), msg.params());
+      Some(builder.params(params).finish())
     } else {
-      client.write_request(msg.method(), msg.params());
+      None
+    };
+
+    if let Some(new_req) = new_req {
+      *req = new_req;
     }
   }
-
-  client.duration()
 }
+
+fn bench_multi_file_edits(deno_exe: &Path) -> Duration {
+  let re = lazy_regex::regex!(r"Documents in memory: (\d+)");
+  let mut messages: Vec<tower_lsp::jsonrpc::Request> =
+    serde_json::from_slice(FIXTURE_DECO_MESSAGES).unwrap();
+  let apps = root_path().join("cli/bench/testdata/apps");
+
+  patch_uris(&mut messages, &apps);
+
+  let mut client = LspClientBuilder::new()
+    .use_diagnostic_sync(false)
+    .set_root_dir(apps.clone())
+    .deno_exe(deno_exe)
+    .build();
+  client.initialize_with_config(
+    |c| {
+      c.set_workspace_folders(vec![lsp_types::WorkspaceFolder {
+        uri: Url::from_file_path(&apps).unwrap(),
+        name: "apps".to_string(),
+      }]);
+      c.set_deno_enable(true);
+      c.set_unstable(true);
+      c.set_preload_limit(1000);
+      c.set_config(apps.join("deno.json").as_path().to_string_lossy());
+    },
+    json!({
+      "deno.config": apps.join("deno.json").as_path().to_string_lossy()
+    }),
+  );
+  let start = std::time::Instant::now();
+
+  let mut reqs = 0;
+  for msg in messages {
+    if msg.id().is_none() {
+      client.write_notification(msg.method(), msg.params());
+    } else {
+      reqs += 1;
+      client.write_request_no_wait(msg.method(), msg.params());
+    }
+  }
+  for _ in 0..reqs {
+    let _ = client.read_response();
+  }
+
+  let end = start.elapsed();
+
+  let res = client.write_request(
+    "deno/virtualTextDocument",
+    json!({
+      "textDocument": {
+        "uri": "deno:/status.md"
+      }
+    }),
+  );
+  let res = res.as_str().unwrap().to_string();
+  assert!(res.starts_with("# Deno Language Server Status"));
+  let captures = re.captures(&res).unwrap();
+  let count = captures.get(1).unwrap().as_str().parse::<usize>().unwrap();
+  // eprintln!("{res}");
+  assert!(count > 1000, "count: {}", count);
+  client.shutdown();
+
+  end
+}
+
 /// A benchmark that opens a 8000+ line TypeScript document, adds a function to
 /// the end of the document and does a level of hovering and gets quick fix
 /// code actions.
@@ -306,47 +378,47 @@ pub fn benchmarks(deno_exe: &Path) -> HashMap<String, i64> {
   println!("-> Start benchmarking lsp");
   let mut exec_times = HashMap::new();
 
-  // println!("   - Simple Startup/Shutdown ");
-  // let mut times = Vec::new();
-  // for _ in 0..10 {
-  //   times.push(bench_startup_shutdown(deno_exe));
-  // }
-  // let mean =
-  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  // exec_times.insert("startup_shutdown".to_string(), mean);
+  println!("   - Simple Startup/Shutdown ");
+  let mut times = Vec::new();
+  for _ in 0..10 {
+    times.push(bench_startup_shutdown(deno_exe));
+  }
+  let mean =
+    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  exec_times.insert("startup_shutdown".to_string(), mean);
 
-  // println!("   - Big Document/Several Edits ");
-  // let mut times = Vec::new();
-  // for _ in 0..5 {
-  //   times.push(bench_big_file_edits(deno_exe));
-  // }
-  // let mean =
-  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  // exec_times.insert("big_file_edits".to_string(), mean);
+  println!("   - Big Document/Several Edits ");
+  let mut times = Vec::new();
+  for _ in 0..5 {
+    times.push(bench_big_file_edits(deno_exe));
+  }
+  let mean =
+    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  exec_times.insert("big_file_edits".to_string(), mean);
 
-  // println!("   - Find/Replace");
-  // let mut times = Vec::new();
-  // for _ in 0..10 {
-  //   times.push(bench_find_replace(deno_exe));
-  // }
-  // let mean =
-  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  // exec_times.insert("find_replace".to_string(), mean);
+  println!("   - Find/Replace");
+  let mut times = Vec::new();
+  for _ in 0..10 {
+    times.push(bench_find_replace(deno_exe));
+  }
+  let mean =
+    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  exec_times.insert("find_replace".to_string(), mean);
 
-  // println!("   - Code Lens");
-  // let mut times = Vec::new();
-  // for _ in 0..10 {
-  //   times.push(bench_code_lens(deno_exe));
-  // }
-  // let mean =
-  //   (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
-  // println!("      ({} runs, mean: {}ms)", times.len(), mean);
-  // exec_times.insert("code_lens".to_string(), mean);
+  println!("   - Code Lens");
+  let mut times = Vec::new();
+  for _ in 0..10 {
+    times.push(bench_code_lens(deno_exe));
+  }
+  let mean =
+    (times.iter().sum::<Duration>() / times.len() as u32).as_millis() as i64;
+  println!("      ({} runs, mean: {}ms)", times.len(), mean);
+  exec_times.insert("code_lens".to_string(), mean);
 
-  println!("   - Multi File Edits");
+  println!("   - Large Repo Multiple Edits");
   let mut times = Vec::new();
   for _ in 0..5 {
     times.push(bench_multi_file_edits(deno_exe));
