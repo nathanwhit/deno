@@ -434,7 +434,7 @@ async fn main() -> Result<()> {
   let deno_exe = if let Ok(p) = std::env::var("DENO_BENCH_EXE") {
     PathBuf::from(p)
   } else {
-    test_util::root_path().join("deno-a64a25702").to_path_buf()
+    test_util::deno_exe_path().to_path_buf()
   };
   env::set_current_dir(test_util::root_path())?;
 
