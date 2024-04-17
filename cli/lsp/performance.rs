@@ -96,6 +96,10 @@ impl Default for Performance {
   }
 }
 
+fn debug_marks_enabled() -> bool {
+  super::logging::lsp_debug_enabled() || super::logging::lsp_log_file_enabled()
+}
+
 impl Performance {
   /// Return the count and average duration of a measurement identified by name.
   #[cfg(test)]
@@ -182,20 +186,23 @@ impl Performance {
         .or_insert((0, 0.0));
       measurement.0 += 1;
     }
-    let msg = if let Some(args) = maybe_args {
-      json!({
-        "type": "mark",
-        "name": name,
-        "count": count,
-        "args": args,
-      })
-    } else {
-      json!({
-        "type": "mark",
-        "name": name,
-      })
-    };
-    lsp_debug!("{},", msg);
+    // only serialize the msg if we're going to log it
+    if debug_marks_enabled() {
+      let msg = if let Some(args) = maybe_args {
+        json!({
+          "type": "mark",
+          "name": name,
+          "count": count,
+          "args": args,
+        })
+      } else {
+        json!({
+          "type": "mark",
+          "name": name,
+        })
+      };
+      lsp_debug!("{},", msg);
+    }
     PerformanceMark {
       name: name.to_string(),
       count: *count,
