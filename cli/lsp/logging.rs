@@ -82,20 +82,24 @@ pub fn write_line_to_log_file(s: &str) {
 }
 
 pub fn set_lsp_debug_flag(value: bool) {
-  LSP_DEBUG_FLAG.store(value, Ordering::SeqCst)
+  LSP_DEBUG_FLAG.store(value, Ordering::Relaxed)
 }
 
 pub fn lsp_debug_enabled() -> bool {
-  LSP_DEBUG_FLAG.load(Ordering::SeqCst)
+  LSP_DEBUG_FLAG.load(Ordering::Relaxed)
+}
+
+pub fn lsp_log_file_enabled() -> bool {
+  LOG_FILE.enabled.load(Ordering::Relaxed)
 }
 
 /// Change the lsp to log at the provided level.
 pub fn set_lsp_log_level(level: log::Level) {
-  LSP_LOG_LEVEL.store(level as usize, Ordering::SeqCst)
+  LSP_LOG_LEVEL.store(level as usize, Ordering::Relaxed)
 }
 
 pub fn lsp_log_level() -> log::Level {
-  let level = LSP_LOG_LEVEL.load(Ordering::SeqCst);
+  let level = LSP_LOG_LEVEL.load(Ordering::Relaxed);
   // TODO(bartlomieju):
   #[allow(clippy::undocumented_unsafe_blocks)]
   unsafe {
@@ -105,11 +109,11 @@ pub fn lsp_log_level() -> log::Level {
 
 /// Change the lsp to warn at the provided level.
 pub fn set_lsp_warn_level(level: log::Level) {
-  LSP_WARN_LEVEL.store(level as usize, Ordering::SeqCst)
+  LSP_WARN_LEVEL.store(level as usize, Ordering::Relaxed)
 }
 
 pub fn lsp_warn_level() -> log::Level {
-  let level = LSP_LOG_LEVEL.load(Ordering::SeqCst);
+  let level = LSP_LOG_LEVEL.load(Ordering::Relaxed);
   // TODO(bartlomieju):
   #[allow(clippy::undocumented_unsafe_blocks)]
   unsafe {
@@ -152,10 +156,14 @@ macro_rules! lsp_warn {
 macro_rules! lsp_debug {
   ($($arg:tt)+) => (
     {
-      let s = std::format!($($arg)+);
-      $crate::lsp::logging::write_line_to_log_file(&s);
-      if $crate::lsp::logging::lsp_debug_enabled() {
-        log::debug!("{}", s)
+      let debug_enabled = $crate::lsp::logging::lsp_debug_enabled();
+      let log_file = $crate::lsp::logging::lsp_log_file_enabled();
+      if debug_enabled || log_file {
+        let s = std::format!($($arg)+);
+        $crate::lsp::logging::write_line_to_log_file(&s);
+        if debug_enabled {
+          log::debug!("{}", s)
+        }
       }
     }
   )
