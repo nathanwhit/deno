@@ -546,7 +546,7 @@ impl WebWorker {
       compiled_wasm_module_store: options.compiled_wasm_module_store.clone(),
       extensions,
       extension_transpiler: Some(Rc::new(|specifier, source| {
-        maybe_transpile_source(specifier, source)
+        maybe_transpile_source(specifier, source, true)
       })),
       inspector: options.maybe_inspector_server.is_some(),
       feature_checker: Some(options.feature_checker.clone()),

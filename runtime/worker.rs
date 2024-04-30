@@ -533,7 +533,7 @@ impl MainWorker {
       compiled_wasm_module_store: options.compiled_wasm_module_store.clone(),
       extensions,
       extension_transpiler: Some(Rc::new(|specifier, source| {
-        maybe_transpile_source(specifier, source)
+        maybe_transpile_source(specifier, source, false)
       })),
       inspector: options.maybe_inspector_server.is_some(),
       is_main: true,

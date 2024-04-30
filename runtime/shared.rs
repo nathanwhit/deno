@@ -5,12 +5,15 @@ use deno_ast::MediaType;
 use deno_ast::ParseParams;
 use deno_ast::SourceMapOption;
 use deno_ast::SourceTextInfo;
+use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
 use deno_core::extension;
 use deno_core::Extension;
+use deno_core::FastString;
 use deno_core::ModuleCodeString;
 use deno_core::ModuleName;
 use deno_core::SourceMapData;
+use std::io::Write;
 use std::path::Path;
 
 extension!(runtime,
@@ -65,9 +68,45 @@ extension!(runtime,
   }
 );
 
+fn minify(
+  input: impl AsRef<str> + Send + Sync,
+) -> Result<FastString, AnyError> {
+  let mut child = std::process::Command::new("deno")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .args([
+      "run",
+      "--allow-read",
+      "npm:terser",
+      "--compress",
+      "--mangle",
+      "--module",
+      "--format",
+      "ascii_only=true",
+    ])
+    .spawn()?;
+  let mut stdin = child.stdin.take().unwrap();
+  let input = input.as_ref();
+  let output = std::thread::scope(|s| {
+    s.spawn(move || {
+      stdin.write_all(input.as_bytes()).unwrap();
+    });
+
+    child.wait_with_output()
+  })?;
+
+  if !output.status.success() {
+    return Err(anyhow!("Failed"));
+  }
+
+  Ok(FastString::from(String::from_utf8(output.stdout)?))
+}
+
 pub fn maybe_transpile_source(
   name: ModuleName,
   source: ModuleCodeString,
+  snapshotting: bool,
 ) -> Result<(ModuleCodeString, Option<SourceMapData>), AnyError> {
   // Always transpile `node:` built-in modules, since they might be TypeScript.
   let media_type = if name.starts_with("node:") {
@@ -76,10 +115,18 @@ pub fn maybe_transpile_source(
     MediaType::from_path(Path::new(&name))
   };
 
+  let maybe_minify = |source: FastString| {
+    if snapshotting {
+      minify(source)
+    } else {
+      Ok(source)
+    }
+  };
+
   match media_type {
     MediaType::TypeScript => {}
-    MediaType::JavaScript => return Ok((source, None)),
-    MediaType::Mjs => return Ok((source, None)),
+    MediaType::JavaScript => return Ok((maybe_minify(source)?, None)),
+    MediaType::Mjs => return Ok((maybe_minify(source)?, None)),
     _ => panic!(
       "Unsupported media type for snapshotting {media_type:?} for file {}",
       name
@@ -115,5 +162,11 @@ pub fn maybe_transpile_source(
     .source_map
     .map(|sm| sm.into_bytes().into());
 
-  Ok((transpiled_source.text.into(), maybe_source_map))
+  let minified = if snapshotting {
+    minify(transpiled_source.text)?
+  } else {
+    transpiled_source.text.into()
+  };
+
+  Ok((minified, maybe_source_map))
 }
