@@ -1079,7 +1079,7 @@ impl TsServer {
     r
   }
 
-  #[tracing::instrument(skip(self, snapshot, token))]
+  #[tracing::instrument(skip(self, snapshot, token, req))]
   async fn request_with_cancellation<R>(
     &self,
     snapshot: Arc<StateSnapshot>,

@@ -133,12 +133,6 @@ impl LanguageServer {
   }
 }
 
-#[derive(Clone, Debug)]
-pub struct StateNpmSnapshot {
-  pub node_resolver: Arc<CliNodeResolver>,
-  pub npm_resolver: Arc<dyn CliNpmResolver>,
-}
-
 /// Snapshot of the state used by TSC.
 #[derive(Clone, Debug)]
 pub struct StateSnapshot {
@@ -250,7 +244,6 @@ impl LanguageServer {
 
   /// Similar to `deno cache` on the command line, where modules will be cached
   /// in the Deno cache, including any of their dependencies.
-  #[tracing::instrument(skip_all)]
   pub async fn cache(
     &self,
     specifiers: Vec<ModuleSpecifier>,
@@ -335,14 +328,11 @@ impl LanguageServer {
           .client
           .show_message(MessageType::WARNING, err);
       }
-      {
-        let mut inner = self.write().await;
-        let lockfile = inner.config.tree.root_lockfile().cloned();
-        inner.documents.refresh_lockfile(lockfile);
-        inner.refresh_npm_specifiers().await;
-      }
-      // now refresh the data in a read
-      self.0.read().await.post_cache(result.mark).await;
+      let mut inner = self.write().await;
+      let lockfile = inner.config.tree.root_lockfile().cloned();
+      inner.documents.refresh_lockfile(lockfile);
+      inner.refresh_npm_specifiers().await;
+      inner.post_cache(result.mark).await;
     }
     Ok(Some(json!(true)))
   }
