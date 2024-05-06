@@ -8,6 +8,7 @@ pub mod sqlite;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use deno_core::futures::StreamExt;
 use deno_core::op2;
 use deno_core::serde_v8::AnyValue;
 use deno_core::serde_v8::BigInt;
+use deno_core::v8;
 use deno_core::AsyncRefCell;
 use deno_core::ByteString;
 use deno_core::CancelFuture;
@@ -152,29 +154,95 @@ where
   Ok(rid)
 }
 
-type KvKey = Vec<AnyValue>;
+// array of `v8::Value`
+type KvKey<'a> = v8::Local<'a, v8::Array>;
 
-fn key_part_from_v8(value: AnyValue) -> KeyPart {
-  match value {
-    AnyValue::Bool(false) => KeyPart::False,
-    AnyValue::Bool(true) => KeyPart::True,
-    AnyValue::Number(n) => KeyPart::Float(n),
-    AnyValue::BigInt(n) => KeyPart::Int(n),
-    AnyValue::String(s) => KeyPart::String(s),
-    AnyValue::V8Buffer(buf) => KeyPart::Bytes(buf.to_vec()),
-    AnyValue::RustBuffer(_) => unreachable!(),
+fn key_part_from_v8<'s>(
+  value: v8::Local<'s, v8::Value>,
+  scope: &mut v8::HandleScope<'s>,
+) -> Result<KeyPart, AnyError> {
+  if value.is_boolean() {
+    if value.boolean_value(scope) {
+      Ok(KeyPart::True)
+    } else {
+      Ok(KeyPart::False)
+    }
+  } else if value.is_number() {
+    Ok(KeyPart::Float(value.number_value(scope).unwrap()))
+  } else if value.is_big_int() {
+    todo!()
+  } else if value.is_string() {
+    Ok(KeyPart::String(deno_core::serde_v8::to_utf8(
+      v8::Local::<v8::String>::try_from(value)?,
+      scope,
+    )))
+  } else if value.is_array_buffer() {
+    Ok(KeyPart::Bytes(
+      deno_core::serde_v8::from_v8::<JsBuffer>(scope, value)?.to_vec(),
+    ))
+  } else {
+    unreachable!()
   }
 }
 
-fn key_part_to_v8(value: KeyPart) -> AnyValue {
+fn key_part_to_v8<'s>(
+  value: &KeyPart,
+  scope: &mut v8::HandleScope<'s>,
+) -> Result<v8::Local<'s, v8::Value>, AnyError> {
   match value {
-    KeyPart::False => AnyValue::Bool(false),
-    KeyPart::True => AnyValue::Bool(true),
-    KeyPart::Float(n) => AnyValue::Number(n),
-    KeyPart::Int(n) => AnyValue::BigInt(n),
-    KeyPart::String(s) => AnyValue::String(s),
-    KeyPart::Bytes(buf) => AnyValue::RustBuffer(buf.into()),
+    KeyPart::False => Ok(v8::Boolean::new(scope, false).into()),
+    KeyPart::True => Ok(v8::Boolean::new(scope, true).into()),
+    KeyPart::Float(n) => Ok(v8::Number::new(scope, *n).into()),
+    KeyPart::Int(n) => {
+      let (sign, words) = n.to_u64_digits();
+      let sign_bit = sign == num_bigint::Sign::Minus;
+      Ok(
+        v8::BigInt::new_from_words(scope, sign_bit, &words)
+          .unwrap()
+          .into(),
+      )
+    }
+    KeyPart::String(s) => {
+      v8::String::new(scope, &s).map(Into::into).ok_or_else(|| {
+        anyhow::anyhow!(
+          "Cannot allocate String: buffer exceeds maximum length."
+        )
+      })
+    }
+    KeyPart::Bytes(buf) => {
+      let buf = buf.into_boxed_slice();
+      if buf.is_empty() {
+        let ab = v8::ArrayBuffer::new(scope, 0);
+        return Ok(
+          v8::Uint8Array::new(scope, ab, 0, 0)
+            .expect("Failed to create Uint8Array")
+            .into(),
+        );
+      }
+      let buf_len: usize = buf.len();
+      let backing_store =
+        v8::ArrayBuffer::new_backing_store_from_boxed_slice(buf);
+      let backing_store_shared = backing_store.make_shared();
+      let ab =
+        v8::ArrayBuffer::with_backing_store(scope, &backing_store_shared);
+      Ok(
+        v8::Uint8Array::new(scope, ab, 0, buf_len)
+          .expect("Failed to create Uint8Array")
+          .into(),
+      )
+    }
   }
+}
+
+fn key_parts_to_v8<'s>(
+  parts: &[KeyPart],
+  scope: &mut v8::HandleScope<'s>,
+) -> Result<KvKey<'s>, AnyError> {
+  let parts = parts
+    .iter()
+    .map(|part| key_part_to_v8(part, scope))
+    .collect::<Result<Vec<_>, _>>()?;
+  Ok(v8::Array::new_with_elements(scope, &parts).into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,26 +284,44 @@ impl From<KvValue> for ToV8Value {
   }
 }
 
-#[derive(Serialize)]
-struct ToV8KvEntry {
-  key: KvKey,
+struct ToV8KvEntry<'a> {
+  key: KvKey<'a>,
   value: ToV8Value,
   versionstamp: ByteString,
 }
 
-impl TryFrom<KvEntry> for ToV8KvEntry {
-  type Error = AnyError;
-  fn try_from(entry: KvEntry) -> Result<Self, AnyError> {
-    Ok(ToV8KvEntry {
-      key: decode_key(&entry.key)?
-        .0
-        .into_iter()
-        .map(key_part_to_v8)
-        .collect(),
-      value: entry.value.into(),
-      versionstamp: faster_hex::hex_string(&entry.versionstamp).into(),
-    })
-  }
+// impl<'a> TryFrom<KvEntry> for ToV8KvEntry<'a> {
+//   type Error = AnyError;
+//   fn try_from(entry: KvEntry) -> Result<Self, AnyError> {
+//     Ok(ToV8KvEntry {
+//       key: decode_key(&entry.key)?.0,
+//       value: entry.value.into(),
+//       versionstamp: faster_hex::hex_string(&entry.versionstamp).into(),
+//     })
+//   }
+// }
+
+fn to_v8_kv_entry<'a>(
+  entry: &ToV8KvEntry,
+  scope: &mut v8::HandleScope<'a>,
+) -> Result<v8::Local<'a, v8::Value>, AnyError> {
+  let key = deno_core::ascii_str!("key").v8_string(scope).into();
+  let value = deno_core::ascii_str!("value").v8_string(scope).into();
+  let versionstamp = deno_core::ascii_str!("versionstamp")
+    .v8_string(scope)
+    .into();
+  let key_v = entry.key.into();
+  let value_v = deno_core::serde_v8::to_v8(scope, &entry.value)?;
+  let versionstamp_v = deno_core::serde_v8::to_v8(scope, &entry.versionstamp)?;
+  let null = v8::null(scope).into();
+
+  let obj = v8::Object::with_prototype_and_properties(
+    scope,
+    null,
+    &[key, value, versionstamp],
+    &[key_v, value_v, versionstamp_v],
+  );
+  Ok(obj.into())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -266,7 +352,8 @@ type SnapshotReadRange = (
 
 #[op2(async)]
 #[serde]
-async fn op_kv_snapshot_read<DBH>(
+async fn op_kv_snapshot_read<'scope, DBH>(
+  scope: &mut v8::HandleScope<'scope>,
   state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
   #[serde] ranges: Vec<SnapshotReadRange>,
@@ -294,7 +381,7 @@ where
   let read_ranges = ranges
     .into_iter()
     .map(|(prefix, start, end, limit, reverse, cursor)| {
-      let selector = RawSelector::from_tuple(prefix, start, end)?;
+      let selector = RawSelector::from_tuple(prefix, start, end, scope)?;
 
       let (start, end) =
         decode_selector_and_cursor(&selector, reverse, cursor.as_ref())?;
@@ -384,6 +471,7 @@ where
 #[op2]
 #[smi]
 fn op_kv_watch<DBH>(
+  scope: &mut v8::HandleScope,
   state: &mut OpState,
   #[smi] rid: ResourceId,
   #[serde] keys: Vec<KvKey>,
@@ -402,8 +490,8 @@ where
 
   let keys: Vec<Vec<u8>> = keys
     .into_iter()
-    .map(encode_v8_key)
-    .collect::<std::io::Result<_>>()?;
+    .map(|k| encode_v8_key(k, scope))
+    .collect::<Result<_, _>>()?;
 
   for k in &keys {
     check_read_key_size(k)?;
@@ -420,19 +508,41 @@ where
   Ok(rid)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase", untagged)]
-enum WatchEntry {
-  Changed(Option<ToV8KvEntry>),
+enum WatchEntry<'a> {
+  Changed(Option<ToV8KvEntry<'a>>),
   Unchanged,
 }
 
+#[derive(Serialize)]
+struct Foo(Option<i32>);
+
+fn watch_entry_to_v8<'a>(
+  entry: &WatchEntry,
+  scope: &mut v8::HandleScope<'a>,
+) -> Result<v8::Local<'a, v8::Value>, AnyError> {
+  Ok(match entry {
+    WatchEntry::Changed(Some(entry)) => to_v8_kv_entry(entry, scope)?,
+    WatchEntry::Changed(None) | WatchEntry::Unchanged => v8::null(scope).into(),
+  })
+}
+
+fn watch_entries_to_v8<'a>(
+  entries: &[WatchEntry<'a>],
+  scope: &mut v8::HandleScope<'a>,
+) -> Result<v8::Local<'a, v8::Value>, AnyError> {
+  let entries = entries
+    .iter()
+    .map(|entry| watch_entry_to_v8(entry, scope))
+    .collect::<Result<Vec<_>, _>>()?;
+  Ok(v8::Array::new_with_elements(scope, &entries).into())
+}
+
 #[op2(async)]
-#[serde]
-async fn op_kv_watch_next(
+async fn op_kv_watch_next<'a>(
+  scope: &mut v8::HandleScope<'a>,
   state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
-) -> Result<Option<Vec<WatchEntry>>, AnyError> {
+) -> Result<Option<v8::Local<'a, v8::Value>>, AnyError> {
   let resource = {
     let state = state.borrow();
     let resource = state.resource_table.get::<DatabaseWatcherResource>(rid)?;
@@ -472,9 +582,9 @@ async fn op_kv_watch_next(
         WatchKeyOutput::Unchanged => WatchEntry::Unchanged,
       })
     })
-    .collect::<Result<_, anyhow::Error>>()?;
+    .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-  Ok(Some(entries))
+  Ok(Some(watch_entries_to_v8(&entries, scope)?))
 }
 
 #[op2(async)]
@@ -504,9 +614,48 @@ where
   Ok(())
 }
 
-type V8KvCheck = (KvKey, Option<ByteString>);
+type V8KvCheck<'a> = (KvKey<'a>, Option<ByteString>);
 
-fn check_from_v8(value: V8KvCheck) -> Result<Check, AnyError> {
+fn try_cast<'a, T, S>(
+  local: v8::Local<'a, T>,
+) -> Result<v8::Local<'a, S>, AnyError>
+where
+  v8::Local<'a, S>: TryFrom<v8::Local<'a, T>>,
+  <v8::Local<'a, S> as TryFrom<v8::Local<'a, T>>>::Error:
+    std::error::Error + Send + Sync,
+{
+  Ok(v8::Local::<S>::try_from(local)?)
+}
+
+fn get_index<'a, T>(
+  array: &v8::Object,
+  index: u32,
+  scope: &mut v8::HandleScope,
+) -> Result<v8::Local<'a, T>, AnyError>
+where
+  v8::Local<'a, T>: TryFrom<v8::Local<'a, v8::Value>>,
+  <v8::Local<'a, T> as TryFrom<v8::Local<'a, v8::Value>>>::Error:
+    std::error::Error + Send + Sync,
+{
+  let value = array
+    .get_index(scope, index)
+    .ok_or_else(|| type_error(format!("expected value at index {index}")))?;
+
+  try_cast(value)
+}
+
+fn check_from_v8<'a>(
+  value: v8::Local<'a, v8::Array>,
+  scope: &mut v8::HandleScope<'a>,
+) -> Result<Check, AnyError> {
+  let kv_key = get_index::<v8::Array>(&value, 0, scope)?;
+
+  let kv_key = value
+    .get_index(scope, 1)
+    .ok_or_else(|| type_error("missing value"))?;
+
+  let versionstamp = get_index::<v8::Value>(&value, 1, scope)?;
+
   let versionstamp = match value.1 {
     Some(data) => {
       let mut out = [0u8; 10];
@@ -520,17 +669,18 @@ fn check_from_v8(value: V8KvCheck) -> Result<Check, AnyError> {
     None => None,
   };
   Ok(Check {
-    key: encode_v8_key(value.0)?,
+    key: encode_v8_key(kv_key, scope)?,
     versionstamp,
   })
 }
 
-type V8KvMutation = (KvKey, String, Option<FromV8Value>, Option<u64>);
+type V8KvMutation<'a> = (KvKey<'a>, String, Option<FromV8Value>, Option<u64>);
 
 fn mutation_from_v8(
   (value, current_timstamp): (V8KvMutation, DateTime<Utc>),
+  scope: &mut v8::HandleScope,
 ) -> Result<Mutation, AnyError> {
-  let key = encode_v8_key(value.0)?;
+  let key = encode_v8_key(value.0, scope)?;
   let kind = match (value.1.as_str(), value.2) {
     ("set", Some(value)) => MutationKind::Set(value.try_into()?),
     ("delete", None) => MutationKind::Delete,
@@ -566,6 +716,7 @@ type V8Enqueue = (JsBuffer, u64, Vec<KvKey>, Option<Vec<u32>>);
 fn enqueue_from_v8(
   value: V8Enqueue,
   current_timestamp: DateTime<Utc>,
+  scope: &mut v8::HandleScope,
 ) -> Result<Enqueue, AnyError> {
   Ok(Enqueue {
     payload: value.0.to_vec(),
@@ -574,14 +725,17 @@ fn enqueue_from_v8(
     keys_if_undelivered: value
       .2
       .into_iter()
-      .map(encode_v8_key)
-      .collect::<std::io::Result<_>>()?,
+      .map(|k| encode_v8_key(k, scope))
+      .collect::<Result<_, _>>()?,
     backoff_schedule: value.3,
   })
 }
 
-fn encode_v8_key(key: KvKey) -> Result<Vec<u8>, std::io::Error> {
-  encode_key(&Key(key.into_iter().map(key_part_from_v8).collect()))
+fn encode_v8_key<'s>(
+  key: KvKey,
+  scope: &mut v8::HandleScope<'s>,
+) -> Result<Vec<u8>, AnyError> {
+  encode_key(&Key(key)).map_err(Into::into)
 }
 
 enum RawSelector {
@@ -601,10 +755,11 @@ impl RawSelector {
     prefix: Option<KvKey>,
     start: Option<KvKey>,
     end: Option<KvKey>,
+    scope: &mut v8::HandleScope,
   ) -> Result<Self, AnyError> {
-    let prefix = prefix.map(encode_v8_key).transpose()?;
-    let start = start.map(encode_v8_key).transpose()?;
-    let end = end.map(encode_v8_key).transpose()?;
+    let prefix = prefix.map(|k| encode_v8_key(k, scope)).transpose()?;
+    let start = start.map(|k| encode_v8_key(k, scope)).transpose()?;
+    let end = end.map(|k| encode_v8_key(k, scope)).transpose()?;
 
     match (prefix, start, end) {
       (Some(prefix), None, None) => Ok(Self::Prefixed {
@@ -765,11 +920,13 @@ fn decode_selector_and_cursor(
 
 #[op2(async)]
 #[string]
-async fn op_kv_atomic_write<DBH>(
+async fn op_kv_atomic_write<'scope, DBH>(
+  scope: &mut v8::HandleScope<'scope>,
   state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
-  #[serde] checks: Vec<V8KvCheck>,
-  #[serde] mutations: Vec<V8KvMutation>,
+  // [any[], bytestring ? undefined][]
+  #[serde] checks: v8::Local<v8::Array>,
+  #[serde] mutations: v8::Local<v8::Array>,
   #[serde] enqueues: Vec<V8Enqueue>,
 ) -> Result<Option<String>, AnyError>
 where
@@ -796,17 +953,17 @@ where
 
   let checks = checks
     .into_iter()
-    .map(check_from_v8)
+    .map(|v| check_from_v8(v, scope))
     .collect::<Result<Vec<Check>, AnyError>>()
     .with_context(|| "invalid check")?;
   let mutations = mutations
     .into_iter()
-    .map(|mutation| mutation_from_v8((mutation, current_timestamp)))
+    .map(|mutation| mutation_from_v8((mutation, current_timestamp), scope))
     .collect::<Result<Vec<Mutation>, AnyError>>()
     .with_context(|| "invalid mutation")?;
   let enqueues = enqueues
     .into_iter()
-    .map(|e| enqueue_from_v8(e, current_timestamp))
+    .map(|e| enqueue_from_v8(e, current_timestamp, scope))
     .collect::<Result<Vec<Enqueue>, AnyError>>()
     .with_context(|| "invalid enqueue")?;
 
@@ -867,16 +1024,21 @@ where
 }
 
 // (prefix, start, end)
-type EncodeCursorRangeSelector = (Option<KvKey>, Option<KvKey>, Option<KvKey>);
+type EncodeCursorRangeSelector<'a> =
+  (Option<KvKey<'a>>, Option<KvKey<'a>>, Option<KvKey<'a>>);
 
 #[op2]
 #[string]
-fn op_kv_encode_cursor(
-  #[serde] (prefix, start, end): EncodeCursorRangeSelector,
-  #[serde] boundary_key: KvKey,
+fn op_kv_encode_cursor<'a>(
+  scope: &mut v8::HandleScope<'a>,
+  // (prefix, start, end)
+  prefix: Option<v8::Local<'a, v8::Array>>,
+  start: Option<v8::Local<'a, v8::Array>>,
+  end: Option<v8::Local<'a, v8::Array>>,
+  boundary_key: v8::Local<'a, v8::Array>,
 ) -> Result<String, AnyError> {
-  let selector = RawSelector::from_tuple(prefix, start, end)?;
-  let boundary_key = encode_v8_key(boundary_key)?;
+  let selector = RawSelector::from_tuple(prefix, start, end, scope)?;
+  let boundary_key = encode_v8_key(boundary_key, scope)?;
   let cursor = encode_cursor(&selector, &boundary_key)?;
   Ok(cursor)
 }
