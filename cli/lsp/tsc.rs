@@ -4069,12 +4069,40 @@ struct LoadResponse {
   is_cjs: bool,
 }
 
+fn maybe_load_init(
+  _state: &mut OpState,
+  _specifier: &str,
+) -> Result<Option<LoadResponse>, AnyError> {
+  #[cfg(feature = "__runtime_js_sources")]
+  {
+    let state = _state.borrow_mut::<crate::tsc::init::TscInitState>();
+
+    let loaded = crate::tsc::init::load(&state, _specifier)?;
+
+    Ok(loaded.map(|l| LoadResponse {
+      data: l.data.into(),
+      script_kind: l.script_kind,
+      is_cjs: false,
+      version: Some(l.version),
+    }))
+  }
+
+  #[cfg(not(feature = "__runtime_js_sources"))]
+  {
+    Ok(None)
+  }
+}
+
 #[op2]
 fn op_load<'s>(
   scope: &'s mut v8::HandleScope,
   state: &mut OpState,
   #[string] specifier: &str,
 ) -> Result<v8::Local<'s, v8::Value>, AnyError> {
+  if let Some(loaded) = maybe_load_init(state, specifier)? {
+    return Ok(serde_v8::to_v8(scope, loaded)?);
+  }
+
   let state = state.borrow_mut::<State>();
   let mark = state
     .performance
@@ -4366,6 +4394,54 @@ impl TscRuntime {
   }
 }
 
+#[cfg(feature = "__runtime_js_sources")]
+#[op2]
+#[serde]
+fn op_build_info(state: &mut OpState) -> crate::tsc::init::BuildInfoResponse {
+  let state = state.borrow::<crate::tsc::init::TscInitState>();
+  crate::tsc::init::build_info(state)
+}
+
+fn init_tsc_runtime(
+  request_rx: UnboundedReceiver<Request>,
+  performance: Arc<Performance>,
+  specifier_map: Arc<TscSpecifierMap>,
+  has_inspector_server: bool,
+) -> JsRuntime {
+  #[cfg(feature = "__runtime_js_sources")]
+  {
+    let init_state = crate::tsc::init::TscInitState::new(std::path::Path::new(
+      env!("CARGO_MANIFEST_DIR"),
+    ));
+    JsRuntime::new(RuntimeOptions {
+      extensions: vec![deno_tsc::init_ops_and_esm(
+        performance,
+        specifier_map,
+        request_rx,
+        init_state,
+      )],
+      is_main: true,
+      startup_snapshot: None,
+      inspector: has_inspector_server,
+      ..Default::default()
+    })
+  }
+  #[cfg(not(feature = "__runtime_js_sources"))]
+  {
+    JsRuntime::new(RuntimeOptions {
+      extensions: vec![deno_tsc::init_ops(
+        performance,
+        specifier_map,
+        request_rx,
+      )],
+      is_main: true,
+      startup_snapshot: Some(tsc::compiler_snapshot()),
+      inspector: has_inspector_server,
+      ..Default::default()
+    })
+  }
+}
+
 fn run_tsc_thread(
   request_rx: UnboundedReceiver<Request>,
   performance: Arc<Performance>,
@@ -4376,16 +4452,12 @@ fn run_tsc_thread(
   // Create and setup a JsRuntime based on a snapshot. It is expected that the
   // supplied snapshot is an isolate that contains the TypeScript language
   // server.
-  let mut tsc_runtime = JsRuntime::new(RuntimeOptions {
-    extensions: vec![deno_tsc::init_ops(
-      performance,
-      specifier_map,
-      request_rx,
-    )],
-    startup_snapshot: Some(tsc::compiler_snapshot()),
-    inspector: has_inspector_server,
-    ..Default::default()
-  });
+  let mut tsc_runtime = init_tsc_runtime(
+    request_rx,
+    performance,
+    specifier_map,
+    has_inspector_server,
+  );
 
   if let Some(server) = maybe_inspector_server {
     server.register_inspector(
@@ -4452,6 +4524,45 @@ fn run_tsc_thread(
   runtime.block_on(tsc_future)
 }
 
+#[cfg(feature = "__runtime_js_sources")]
+deno_core::extension!(deno_tsc,
+  ops = [
+    op_is_cancelled,
+    op_is_node_file,
+    op_load,
+    op_release,
+    op_resolve,
+    op_respond,
+    op_script_names,
+    op_script_version,
+    op_ts_config,
+    op_project_version,
+    op_poll_requests,
+    op_build_info,
+  ],
+  js = [
+    dir "tsc",
+    "00_typescript.js",
+    "99_main_compiler.js",
+  ],
+  options = {
+    performance: Arc<Performance>,
+    specifier_map: Arc<TscSpecifierMap>,
+    request_rx: UnboundedReceiver<Request>,
+    init_state: crate::tsc::init::TscInitState,
+  },
+  state = |state, options| {
+    state.put(State::new(
+      Default::default(),
+      options.specifier_map,
+      options.performance,
+      options.request_rx,
+    ));
+    state.put(options.init_state);
+  },
+);
+
+#[cfg(not(feature = "__runtime_js_sources"))]
 deno_core::extension!(deno_tsc,
   ops = [
     op_is_cancelled,
