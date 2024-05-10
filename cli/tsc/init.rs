@@ -130,13 +130,6 @@ impl TscInitState {
     ];
 
     let path_dts = cwd.join("tsc/dts");
-    // ensure we invalidate the build properly.
-    for name in libs.iter() {
-      println!(
-        "cargo:rerun-if-changed={}",
-        path_dts.join(format!("lib.{name}.d.ts")).display()
-      );
-    }
 
     // create a copy of the vector that includes any op crate libs to be passed
     // to the JavaScript compiler to build into the snapshot
