@@ -4073,7 +4073,7 @@ fn maybe_load_init(
   _state: &mut OpState,
   _specifier: &str,
 ) -> Result<Option<LoadResponse>, AnyError> {
-  #[cfg(feature = "__runtime_js_sources")]
+  #[cfg(feature = "__lsp_runtime_js_sources")]
   {
     let state = _state.borrow_mut::<crate::tsc::init::TscInitState>();
 
@@ -4087,7 +4087,7 @@ fn maybe_load_init(
     }))
   }
 
-  #[cfg(not(feature = "__runtime_js_sources"))]
+  #[cfg(not(feature = "__lsp_runtime_js_sources"))]
   {
     Ok(None)
   }
@@ -4394,7 +4394,7 @@ impl TscRuntime {
   }
 }
 
-#[cfg(feature = "__runtime_js_sources")]
+#[cfg(feature = "__lsp_runtime_js_sources")]
 #[op2]
 #[serde]
 fn op_build_info(state: &mut OpState) -> crate::tsc::init::BuildInfoResponse {
@@ -4408,7 +4408,7 @@ fn init_tsc_runtime(
   specifier_map: Arc<TscSpecifierMap>,
   has_inspector_server: bool,
 ) -> JsRuntime {
-  #[cfg(feature = "__runtime_js_sources")]
+  #[cfg(feature = "__lsp_runtime_js_sources")]
   {
     let init_state = crate::tsc::init::TscInitState::new(std::path::Path::new(
       env!("CARGO_MANIFEST_DIR"),
@@ -4426,7 +4426,7 @@ fn init_tsc_runtime(
       ..Default::default()
     })
   }
-  #[cfg(not(feature = "__runtime_js_sources"))]
+  #[cfg(not(feature = "__lsp_runtime_js_sources"))]
   {
     JsRuntime::new(RuntimeOptions {
       extensions: vec![deno_tsc::init_ops(
@@ -4524,7 +4524,7 @@ fn run_tsc_thread(
   runtime.block_on(tsc_future)
 }
 
-#[cfg(feature = "__runtime_js_sources")]
+#[cfg(feature = "__lsp_runtime_js_sources")]
 deno_core::extension!(deno_tsc,
   ops = [
     op_is_cancelled,
@@ -4562,7 +4562,7 @@ deno_core::extension!(deno_tsc,
   },
 );
 
-#[cfg(not(feature = "__runtime_js_sources"))]
+#[cfg(not(feature = "__lsp_runtime_js_sources"))]
 deno_core::extension!(deno_tsc,
   ops = [
     op_is_cancelled,

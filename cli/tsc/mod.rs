@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 mod diagnostics;
 
-#[cfg(feature = "__runtime_js_sources")]
+#[cfg(feature = "__lsp_runtime_js_sources")]
 pub(crate) mod init;
 
 pub use self::diagnostics::Diagnostic;
