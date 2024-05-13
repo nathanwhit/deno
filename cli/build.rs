@@ -82,6 +82,7 @@ mod ts {
     },
   );
 
+  #[cfg(not(feature = "__lsp_runtime_js_sources"))]
   pub fn create_compiler_snapshot(snapshot_path: PathBuf, cwd: &Path) {
     let init_state = init::TscInitState::new(cwd);
     // ensure we invalidate the build properly.
@@ -288,6 +289,7 @@ fn main() {
   let o = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
   let compiler_snapshot_path = o.join("COMPILER_SNAPSHOT.bin");
+  #[cfg(not(feature = "__lsp_runtime_js_sources"))]
   ts::create_compiler_snapshot(compiler_snapshot_path, &c);
 
   #[cfg(not(feature = "__runtime_js_sources"))]

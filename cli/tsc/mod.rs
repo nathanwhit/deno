@@ -54,6 +54,7 @@ pub use self::diagnostics::DiagnosticCategory;
 pub use self::diagnostics::Diagnostics;
 pub use self::diagnostics::Position;
 
+#[cfg(not(feature = "__lsp_runtime_js_sources"))]
 pub static COMPILER_SNAPSHOT: Lazy<Box<[u8]>> = Lazy::new(
   #[cold]
   #[inline(never)]
@@ -78,6 +79,9 @@ pub static COMPILER_SNAPSHOT: Lazy<Box<[u8]>> = Lazy::new(
     .into_boxed_slice()
   },
 );
+
+#[cfg(feature = "__lsp_runtime_js_sources")]
+pub static COMPILER_SNAPSHOT: Lazy<Box<[u8]>> = Lazy::new(|| Box::new([]));
 
 pub fn get_types_declaration_file_text() -> String {
   let mut assets = get_asset_texts_from_new_runtime()
