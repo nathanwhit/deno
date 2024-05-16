@@ -2,6 +2,9 @@
 
 //! Code for local node_modules resolution.
 
+#[cfg(target_os = "windows")]
+mod windows_bin;
+
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -704,6 +707,25 @@ fn get_package_folder_id_from_folder_name(
   })
 }
 
+#[cfg(target_family = "windows")]
+fn symlink_bin_entry(
+  bin_name: &str,
+  bin_script: &str,
+  package_path: &Path,
+  bin_node_modules_dir_path: &Path,
+) -> Result<(), AnyError> {
+  let cmd_shim = bin_node_modules_dir_path.join(bin_name);
+  let original = package_path.join(bin_script);
+
+  cmd_shim.set_extension("cmd");
+  if cmd_shim.exists() {}
+  let script = windows_bin::cmd_shim(&original, false);
+  fs::write(&link, script).with_context(|| {
+    format!("Can't set up '{}' bin at {}", bin_name, link.display())
+  })?;
+}
+
+#[cfg(target_family = "unix")]
 fn symlink_bin_entry(
   bin_name: &str,
   bin_script: &str,
@@ -725,37 +747,31 @@ fn symlink_bin_entry(
           resolved.display(),
           original.display()
         );
-        return Ok(());
       }
+      return Ok(());
     }
   }
 
-  #[cfg(target_family = "windows")]
-  {
-    todo!();
-  }
-  #[cfg(target_family = "unix")]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&original).unwrap().permissions();
-    if perms.mode() & 0o111 == 0 {
-      // if the original file is not executable, make it executable
-      perms.set_mode(perms.mode() | 0o111);
-      std::fs::set_permissions(&original, perms).with_context(|| {
-        format!("Setting permissions on '{}'", original.display())
-      })?;
-    }
-    let original_relative =
-      pathdiff::diff_paths(&original, bin_node_modules_dir_path)
-        .unwrap_or(original);
-    symlink(&original_relative, &link).with_context(|| {
-      format!(
-        "Can't set up '{}' bin at {}",
-        bin_name,
-        original_relative.display()
-      )
+  use std::os::unix::fs::PermissionsExt;
+  let mut perms = std::fs::metadata(&original).unwrap().permissions();
+  if perms.mode() & 0o111 == 0 {
+    // if the original file is not executable, make it executable
+    perms.set_mode(perms.mode() | 0o111);
+    std::fs::set_permissions(&original, perms).with_context(|| {
+      format!("Setting permissions on '{}'", original.display())
     })?;
   }
+  let original_relative =
+    pathdiff::diff_paths(&original, bin_node_modules_dir_path)
+      .unwrap_or(original);
+  symlink(&original_relative, &link).with_context(|| {
+    format!(
+      "Can't set up '{}' bin at {}",
+      bin_name,
+      original_relative.display()
+    )
+  })?;
+
   Ok(())
 }
 
