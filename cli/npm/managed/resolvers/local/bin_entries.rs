@@ -7,19 +7,13 @@ use std::path::Path;
 pub(super) fn set_up_bin_entry(
   package: &NpmResolutionPackage,
   bin_name: &str,
-  bin_script: &str,
-  package_path: &Path,
+  #[allow(unused_variables)] bin_script: &str,
+  #[allow(unused_variables)] package_path: &Path,
   bin_node_modules_dir_path: &Path,
 ) -> Result<(), AnyError> {
   #[cfg(windows)]
   {
-    set_up_bin_shim(
-      package,
-      bin_name,
-      bin_script,
-      package_path,
-      bin_node_modules_dir_path,
-    )?;
+    set_up_bin_shim(package, bin_name, bin_node_modules_dir_path)?;
   }
   #[cfg(unix)]
   {
@@ -38,8 +32,6 @@ pub(super) fn set_up_bin_entry(
 fn set_up_bin_shim(
   package: &NpmResolutionPackage,
   bin_name: &str,
-  bin_script: &str,
-  package_path: &Path,
   bin_node_modules_dir_path: &Path,
 ) -> Result<(), AnyError> {
   let mut cmd_shim = bin_node_modules_dir_path.join(bin_name);
