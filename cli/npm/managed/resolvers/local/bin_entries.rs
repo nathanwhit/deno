@@ -43,10 +43,9 @@ fn set_up_bin_shim(
   bin_node_modules_dir_path: &Path,
 ) -> Result<(), AnyError> {
   let mut cmd_shim = bin_node_modules_dir_path.join(bin_name);
-  let original = package_path.join(bin_script);
 
   cmd_shim.set_extension("cmd");
-  let shim = format!("deno run -A npm:{}/{bin_name}", package.id.nv);
+  let shim = format!("@deno run -A npm:{}/{bin_name} %*", package.id.nv);
   if cmd_shim.exists() {
     if let Ok(contents) = fs::read_to_string(cmd_shim) {
       if contents == shim {
