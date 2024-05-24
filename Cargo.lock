@@ -1624,6 +1624,7 @@ dependencies = [
  "rand",
  "rusqlite",
  "serde",
+ "smallvec",
  "url",
 ]
 
