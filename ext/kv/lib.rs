@@ -17,7 +17,10 @@ use base64::prelude::BASE64_URL_SAFE;
 use base64::Engine;
 use chrono::DateTime;
 use chrono::Utc;
+use convert_util::any_err;
+use convert_util::transmute_vec;
 use convert_util::OptionNull;
+use convert_util::SerdeWrapper;
 use convert_util::TupleArray;
 use deno_core::anyhow::Context;
 use deno_core::convert::Smi;
@@ -63,6 +66,7 @@ use log::debug;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::convert_util::VecArray;
 pub use crate::interface::*;
 
 pub const UNSTABLE_FEATURE_NAME: &str = "kv";
@@ -176,44 +180,6 @@ where
   }
 }
 
-pub unsafe trait TransparentWrapper<T> {
-  fn from_inner(inner: T) -> Self;
-  fn into_inner(self) -> T;
-}
-
-macro_rules! wrapper_struct {
-  ($($v: vis struct $wrapper: ident ($inner: ty);)+) => {
-
-    $(
-      #[repr(transparent)]
-      $v struct $wrapper(pub $inner);
-
-      impl From<$inner> for $wrapper {
-        fn from(inner: $inner) -> Self {
-          Self(inner)
-        }
-      }
-
-      impl From<$wrapper> for $inner {
-        fn from(wrapper: $wrapper) -> Self {
-          wrapper.0
-        }
-      }
-
-      // SAFETY: wrapper structs are transparent
-      unsafe impl TransparentWrapper<$inner> for $wrapper {
-        fn from_inner(inner: $inner) -> Self {
-          Self(inner)
-        }
-
-        fn into_inner(self) -> $inner {
-          self.0
-        }
-      }
-    )+
-  };
-}
-
 wrapper_struct! {
   struct ToV8KvEntry(KvEntry);
   struct BigIntWrapper(num_bigint::BigInt);
@@ -231,8 +197,7 @@ impl<'a> ToV8<'a> for BigIntWrapper {
     self,
     scope: &mut v8::HandleScope<'a>,
   ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
-    let BigIntWrapper(bigint) = self;
-    let (sign, words) = bigint.to_u64_digits();
+    let (sign, words) = self.0.to_u64_digits();
     let sign_bit = sign == num_bigint::Sign::Minus;
     Ok(
       v8::BigInt::new_from_words(scope, sign_bit, &words)
@@ -463,20 +428,8 @@ impl From<V8Consistency> for Consistency {
   }
 }
 
-fn transmute_vec<T: TransparentWrapper<U>, U>(v: Vec<T>) -> Vec<U> {
-  let mut v = std::mem::ManuallyDrop::new(v);
-  // SAFETY: the pointer, length, and capacity are valid because they
-  // were created from a Vec<T>.
-  // SAFETY: T is a transparent wrapper around U, so their memory layout
-  // is identical.
-  unsafe {
-    Vec::from_raw_parts(v.as_mut_ptr() as *mut U, v.len(), v.capacity())
-  }
-}
-
 fn cast_keyparts(parts: VecArray<KeyPartWrapper>) -> Vec<KeyPart> {
-  let VecArray(parts) = parts;
-  transmute_vec(parts)
+  transmute_vec(parts.0)
 }
 
 impl<'a> FromV8<'a> for V8ReadRange {
@@ -554,7 +507,6 @@ where
     )));
   }
 
-  // FIXME: actually use this
   let mut total_entries = 0usize;
 
   let read_ranges = transmute_vec(ranges);
@@ -819,17 +771,15 @@ impl<'a> FromV8<'a> for V8KvMutation {
     scope: &mut v8::HandleScope<'a>,
     value: v8::Local<'a, v8::Value>,
   ) -> Result<Self, Self::Error> {
-    let TupleArray((
-      key,
-      SerdeWrapper(kind),
-      SerdeWrapper(value),
-      SerdeWrapper(expire_in),
-    )): TupleArray<(
+    let TupleArray((key, kind, value, expire_in)): TupleArray<(
       V8KvKey,
       SerdeWrapper<String>,
       SerdeWrapper<Option<FromV8Value>>,
       SerdeWrapper<Option<u64>>,
     )> = TupleArray::from_v8(scope, value)?;
+    let kind = kind.0;
+    let value = value.0;
+    let expire_in = expire_in.0;
     let current_timestamp = utc_now();
     let key = encode_v8_key(cast_keyparts(key), scope)?;
     let kind = match (kind.as_str(), value) {
@@ -875,10 +825,10 @@ impl<'a> FromV8<'a> for V8Enqueue {
     value: v8::Local<'a, v8::Value>,
   ) -> Result<Self, Self::Error> {
     let TupleArray((
-      SerdeWrapper(payload),
-      SerdeWrapper(deadline),
-      VecArray(keys),
-      OptionNull(backoff_schedule),
+      payload,
+      deadline,
+      keys,
+      backoff_schedule,
     )): TupleArray<(
       SerdeWrapper<JsBuffer>,
       SerdeWrapper<u64>,
@@ -887,45 +837,11 @@ impl<'a> FromV8<'a> for V8Enqueue {
     )> = TupleArray::from_v8(scope, value)?;
 
     Ok(V8Enqueue(
-      payload,
-      deadline,
-      keys.into_iter().map(cast_keyparts).collect(),
-      backoff_schedule.map(|v| v.0.into_iter().map(|v| v.0).collect()),
+      payload.0,
+      deadline.0,
+      keys.0.into_iter().map(cast_keyparts).collect(),
+      backoff_schedule.0.map(|v| v.0.into_iter().map(|v| v.0).collect()),
     ))
-  }
-}
-
-#[repr(transparent)]
-pub struct SerdeWrapper<T>(pub T);
-
-impl<'a, T> FromV8<'a> for SerdeWrapper<T>
-where
-  T: for<'de> Deserialize<'de>,
-{
-  type Error = StdAnyError;
-
-  fn from_v8(
-    scope: &mut v8::HandleScope<'a>,
-    value: v8::Local<'a, v8::Value>,
-  ) -> Result<Self, Self::Error> {
-    let value = deno_core::serde_v8::from_v8(scope, value).map_err(any_err)?;
-    Ok(Self(value))
-  }
-}
-
-impl<'a, T> ToV8<'a> for SerdeWrapper<T>
-where
-  T: Serialize,
-{
-  type Error = StdAnyError;
-
-  fn to_v8(
-    self,
-    scope: &mut v8::HandleScope<'a>,
-  ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
-    deno_core::serde_v8::to_v8(scope, &self.0)
-      .map_err(any_err)
-      .map_err(Into::into)
   }
 }
 
@@ -1134,55 +1050,6 @@ fn decode_selector_and_cursor(
   }
 
   Ok((first_key, last_key))
-}
-
-fn any_err(e: impl Into<AnyError>) -> AnyError {
-  e.into()
-}
-
-pub struct VecArray<T>(pub Vec<T>);
-
-impl<T> From<Vec<T>> for VecArray<T> {
-  fn from(value: Vec<T>) -> Self {
-    VecArray(value)
-  }
-}
-
-impl<'a, T> ToV8<'a> for VecArray<T>
-where
-  T: ToV8<'a>,
-{
-  type Error = StdAnyError;
-
-  fn to_v8(
-    self,
-    scope: &mut v8::HandleScope<'a>,
-  ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
-    let mut buf = Vec::with_capacity(self.0.len());
-    for item in self.0 {
-      buf.push(item.to_v8(scope).map_err(any_err)?);
-    }
-    Ok(v8::Array::new_with_elements(scope, &buf).into())
-  }
-}
-
-impl<'a, T> FromV8<'a> for VecArray<T>
-where
-  T: FromV8<'a>,
-{
-  type Error = StdAnyError;
-  fn from_v8(
-    scope: &mut v8::HandleScope<'a>,
-    value: v8::Local<'a, v8::Value>,
-  ) -> Result<Self, Self::Error> {
-    let arr = v8::Local::<v8::Array>::try_from(value).map_err(any_err)?;
-    let mut buf = Vec::with_capacity(arr.length() as usize);
-    for i in 0..arr.length() {
-      let item = arr.get_index(scope, i).unwrap();
-      buf.push(T::from_v8(scope, item).map_err(any_err)?);
-    }
-    Ok(VecArray(buf))
-  }
 }
 
 #[op2(async)]
