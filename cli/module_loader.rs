@@ -802,21 +802,27 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
 
   fn prepare_load(
     &self,
-    specifier: &ModuleSpecifier,
+    specifier: &[ModuleSpecifier],
     _maybe_referrer: Option<String>,
     is_dynamic: bool,
   ) -> Pin<Box<dyn Future<Output = Result<(), AnyError>>>> {
-    if self.0.shared.node_resolver.in_npm_package(specifier) {
+    let not_in_npm_package = specifier
+      .iter()
+      .cloned()
+      .filter(|s| !self.0.shared.node_resolver.in_npm_package(&s))
+      .collect::<Vec<_>>();
+    if not_in_npm_package.is_empty() {
       return Box::pin(deno_core::futures::future::ready(Ok(())));
     }
 
-    let specifier = specifier.clone();
+    let specifiers = not_in_npm_package;
     let inner = self.0.clone();
 
     async move {
       let graph_container = &inner.graph_container;
       let module_load_preparer = &inner.shared.module_load_preparer;
 
+      let mut specifiers = specifiers;
       if is_dynamic {
         // When the specifier is already in the graph then it means it
         // was previously loaded, so we can skip that and only check if
@@ -825,13 +831,27 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
         // This doesn't acquire a graph update permit because that will
         // clone the graph which is a bit slow.
         let graph = graph_container.graph();
-        if !graph.roots.is_empty() && graph.get(&specifier).is_some() {
+
+        if !graph.roots.is_empty()
+          && specifiers.iter().any(|s| graph.get(s).is_some())
+        {
           log::debug!("Skipping prepare module load.");
+
           // roots are already validated so we can skip those
-          if !graph.roots.contains(&specifier) {
-            module_load_preparer.graph_roots_valid(&graph, &[specifier])?;
+          let (done, rest) =
+            specifiers.into_iter().partition(|s| graph.get(s).is_some());
+          specifiers = rest;
+          let left_to_validate = done
+            .into_iter()
+            .filter(|s| !graph.roots.contains(s))
+            .collect::<Vec<_>>();
+          if !left_to_validate.is_empty() {
+            module_load_preparer
+              .graph_roots_valid(&graph, &left_to_validate)?;
           }
-          return Ok(());
+          if specifiers.is_empty() {
+            return Ok(());
+          }
         }
       }
 
@@ -846,7 +866,7 @@ impl<TGraphContainer: ModuleGraphContainer> ModuleLoader
       module_load_preparer
         .prepare_module_load(
           graph,
-          &[specifier],
+          &specifiers,
           is_dynamic,
           lib,
           root_permissions,
