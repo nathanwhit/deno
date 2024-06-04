@@ -44,7 +44,7 @@ repository = "https://github.com/denoland/deno"
 
 [workspace.dependencies]
 deno_ast = { version = "=0.38.2", features = ["transpiling"] }
-deno_core = { version = "0.283.0" }
+deno_core = { git = "https://github.com/nathanwhit/deno_core", branch = "dynamic-prepare-batching", version = "0.283.0" }
 
 deno_bench_util = { version = "0.148.0", path = "./bench_util" }
 deno_lockfile = "0.20.0"
@@ -206,9 +206,10 @@ winres = "=0.1.12"
 
 # NB: the `bench` and `release` profiles must remain EXACTLY the same.
 [profile.release]
-codegen-units = 1
+codegen-units = 128
 incremental = true
-lto = true
+lto = "thin"
+debug = true
 opt-level = 'z' # Optimize for size
 
 # Build release with debug symbols: cargo build --profile=release-with-debug
@@ -218,9 +219,9 @@ debug = true
 
 # NB: the `bench` and `release` profiles must remain EXACTLY the same.
 [profile.bench]
-codegen-units = 1
+codegen-units = 128
 incremental = true
-lto = true
+lto = "thin"
 opt-level = 'z' # Optimize for size
 
 # Key generation is too slow on `debug`
