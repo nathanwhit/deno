@@ -780,12 +780,17 @@ impl<'a> FromV8<'a> for V8KvMutation {
     let kind = kind.0;
     let value = value.0;
     let expire_in = expire_in.0;
-    let current_timestamp = utc_now();
+    let current_timestamp = chrono::Utc::now();
     let key = encode_v8_key(cast_keyparts(key), scope)?;
     let kind = match (kind.as_str(), value) {
       ("set", Some(value)) => MutationKind::Set(value.try_into()?),
       ("delete", None) => MutationKind::Delete,
-      ("sum", Some(value)) => MutationKind::Sum(value.try_into()?),
+      ("sum", Some(value)) => MutationKind::Sum {
+        value: value.try_into()?,
+        min_v8: vec![],
+        max_v8: vec![],
+        clamp: false,
+      },
       ("min", Some(value)) => MutationKind::Min(value.try_into()?),
       ("max", Some(value)) => MutationKind::Max(value.try_into()?),
       ("setSuffixVersionstampedKey", Some(value)) => {
@@ -824,12 +829,7 @@ impl<'a> FromV8<'a> for V8Enqueue {
     scope: &mut v8::HandleScope<'a>,
     value: v8::Local<'a, v8::Value>,
   ) -> Result<Self, Self::Error> {
-    let TupleArray((
-      payload,
-      deadline,
-      keys,
-      backoff_schedule,
-    )): TupleArray<(
+    let TupleArray((payload, deadline, keys, backoff_schedule)): TupleArray<(
       SerdeWrapper<JsBuffer>,
       SerdeWrapper<u64>,
       VecArray<V8KvKey>,
@@ -840,7 +840,9 @@ impl<'a> FromV8<'a> for V8Enqueue {
       payload.0,
       deadline.0,
       keys.0.into_iter().map(cast_keyparts).collect(),
-      backoff_schedule.0.map(|v| v.0.into_iter().map(|v| v.0).collect()),
+      backoff_schedule
+        .0
+        .map(|v| v.0.into_iter().map(|v| v.0).collect()),
     ))
   }
 }
