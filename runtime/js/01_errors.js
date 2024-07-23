@@ -11,13 +11,6 @@ class NotFound extends Error {
   }
 }
 
-class PermissionDenied extends Error {
-  constructor(msg) {
-    super(msg);
-    this.name = "PermissionDenied";
-  }
-}
-
 class ConnectionRefused extends Error {
   constructor(msg) {
     super(msg);
@@ -160,7 +153,7 @@ class NotADirectory extends Error {
 
 const errors = {
   NotFound,
-  PermissionDenied,
+  PermissionDenied: core.PermissionDenied,
   ConnectionRefused,
   ConnectionReset,
   ConnectionAborted,
