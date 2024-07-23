@@ -1339,9 +1339,8 @@ dependencies = [
 
 [[package]]
 name = "deno_core"
-version = "0.294.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e3e1883573cace82d1e826096c8c06bd5e4310ca3a4dba0eb1bf67468719c01"
+version = "0.296.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=stack-trace-paths-take2#0dbca7cccb7cb15b26254c8b418f923b6c1fe918"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1820,9 +1819,8 @@ dependencies = [
 
 [[package]]
 name = "deno_ops"
-version = "0.170.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2534bce0346a6dbd6f892066b941a48297687d8755de135cef5dc15bed83214"
+version = "0.172.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=stack-trace-paths-take2#0dbca7cccb7cb15b26254c8b418f923b6c1fe918"
 dependencies = [
  "proc-macro-rules",
  "proc-macro2",
@@ -4674,9 +4672,9 @@ dependencies = [
 
 [[package]]
 name = "paste"
-version = "1.0.14"
+version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de3145af08024dea9fa9914f381a17b8fc6034dfb00f3a84013f7ff43f29ed4c"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "path-clean"
@@ -5923,9 +5921,8 @@ dependencies = [
 
 [[package]]
 name = "serde_v8"
-version = "0.203.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5edf75e70aeb4c6f14c606cfe2fc8b3bd43d4f79c781365c3f336f1fe4be508a"
+version = "0.205.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=stack-trace-paths-take2#0dbca7cccb7cb15b26254c8b418f923b6c1fe918"
 dependencies = [
  "num-bigint",
  "serde",
@@ -7543,9 +7540,9 @@ dependencies = [
 
 [[package]]
 name = "v8"
-version = "0.98.0"
+version = "0.98.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "feb252d5be11c32cb4755d66d58db30ff30af5f1f17183e83ff54383a402c5f6"
+checksum = "e9b8009c63eec162cbcc41aa4db66b81974f641d32a35b1a3198ec2ce4712d6b"
 dependencies = [
  "bindgen",
  "bitflags 2.5.0",
