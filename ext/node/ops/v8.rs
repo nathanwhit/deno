@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::cell::UnsafeCell;
 
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 use deno_core::op2;
@@ -39,12 +40,12 @@ pub fn op_v8_get_heap_statistics(
 }
 
 pub struct Serializer<'a> {
-  inner: RefCell<Option<v8::ValueSerializer<'a>>>,
+  inner: UnsafeCell<Option<v8::ValueSerializer<'a>>>,
 }
 
 impl<'a> Serializer<'a> {
-  fn inner_mut(&self) -> RefMut<v8::ValueSerializer<'a>> {
-    RefMut::map(self.inner.borrow_mut(), |inner| inner.as_mut().unwrap())
+  fn inner_mut(&self) -> &mut v8::ValueSerializer<'a> {
+    unsafe { self.inner.get().as_mut().unwrap().as_mut().unwrap() }
   }
 }
 
@@ -103,7 +104,7 @@ pub fn op_v8_new_serializer(
   let inner =
     v8::ValueSerializer::new(scope, Box::new(SerializerDelegate { obj }));
   Serializer {
-    inner: RefCell::new(Some(inner)),
+    inner: UnsafeCell::new(Some(inner)),
   }
 }
 
@@ -120,7 +121,11 @@ pub fn op_v8_set_treat_array_beffer_views_as_host_objects(
 #[op2(reentrant)]
 #[serde]
 pub fn op_v8_release_buffer(#[cppgc] ser: &Serializer) -> ToJsBuffer {
-  ser.inner.take().unwrap().release().into()
+  unsafe { ser.inner.get().as_mut().unwrap() }
+    .take()
+    .unwrap()
+    .release()
+    .into()
 }
 
 #[op2(fast, reentrant)]
@@ -172,7 +177,8 @@ pub fn op_v8_write_value(
 }
 
 pub struct Deserializer<'a> {
-  inner: RefCell<Option<v8::ValueDeserializer<'a>>>,
+  buf_ptr: *mut u8,
+  inner: UnsafeCell<Option<v8::ValueDeserializer<'a>>>,
 }
 
 impl<'a> deno_core::GarbageCollected for Deserializer<'a> {}
@@ -222,9 +228,8 @@ where
 }
 
 impl<'a> Deserializer<'a> {
-  fn inner_mut(&self) -> RefMutWrap<v8::ValueDeserializer<'a>> {
-    eprintln!("Acquiring: {}", std::backtrace::Backtrace::capture());
-    RefMut::map(self.inner.borrow_mut(), |inner| inner.as_mut().unwrap()).into()
+  fn inner_mut(&self) -> &mut v8::ValueDeserializer<'a> {
+    unsafe { self.inner.get().as_mut().unwrap().as_mut().unwrap() }
   }
 }
 
@@ -309,7 +314,8 @@ pub fn op_v8_new_deserializer(
     len,
   );
   Deserializer {
-    inner: RefCell::new(Some(inner)),
+    inner: UnsafeCell::new(Some(inner)),
+    buf_ptr: data.cast(),
   }
 }
 
@@ -345,11 +351,13 @@ pub fn op_v8_read_raw_bytes(
   #[cppgc] deser: &Deserializer,
   #[number] length: usize,
 ) -> usize {
-  deser
-    .inner_mut()
-    .read_raw_bytes(length)
-    .unwrap_or(&[])
-    .len()
+  if let Some(buf) = deser.inner_mut().read_raw_bytes(length) {
+    let ptr = buf.as_ptr();
+    let offset = (ptr as usize) - (deser.buf_ptr as usize);
+    offset
+  } else {
+    0
+  }
 }
 
 #[op2(fast, reentrant)]

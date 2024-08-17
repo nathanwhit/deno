@@ -6,7 +6,7 @@
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
-import { core, primordials } from "ext:core/mod.js";
+import { primordials } from "ext:core/mod.js";
 const { ObjectPrototypeToString } = primordials;
 import {
   op_v8_cached_data_version_tag,
@@ -34,7 +34,7 @@ import {
 
 import { Buffer } from "node:buffer";
 
-import { notImplemented, warnNotImplemented } from "ext:deno_node/_utils.ts";
+import { notImplemented } from "ext:deno_node/_utils.ts";
 
 export function cachedDataVersionTag() {
   return op_v8_cached_data_version_tag();
@@ -109,7 +109,7 @@ const kHandle = Symbol("kHandle");
 export class Serializer {
   [kHandle]: object;
   constructor() {
-    this[kHandle] = op_v8_new_serializer();
+    this[kHandle] = op_v8_new_serializer(this);
   }
 
   _setTreatArrayBufferViewsAsHostObjects(value: boolean): void {
