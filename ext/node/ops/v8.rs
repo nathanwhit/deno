@@ -178,7 +178,7 @@ pub fn op_v8_write_value(
 
 pub struct Deserializer<'a> {
   buf_ptr: *mut u8,
-  inner: UnsafeCell<Option<v8::ValueDeserializer<'a>>>,
+  inner: Option<UnsafeCell<v8::ValueDeserializer<'a>>>,
 }
 
 impl<'a> deno_core::GarbageCollected for Deserializer<'a> {}
@@ -228,8 +228,8 @@ where
 }
 
 impl<'a> Deserializer<'a> {
-  fn inner_mut(&self) -> &mut v8::ValueDeserializer<'a> {
-    unsafe { self.inner.get().as_mut().unwrap().as_mut().unwrap() }
+  fn inner_mut(&self) -> *mut v8::ValueDeserializer<'a> {
+    self.inner.as_ref().unwrap().get()
   }
 }
 
@@ -314,7 +314,7 @@ pub fn op_v8_new_deserializer(
     len,
   );
   Deserializer {
-    inner: UnsafeCell::new(Some(inner)),
+    inner: Some(UnsafeCell::new(inner)),
     buf_ptr: data.cast(),
   }
 }
@@ -377,7 +377,11 @@ pub fn op_v8_read_uint64(#[cppgc] deser: &Deserializer) -> (u32, u32) {
 
 #[op2(fast, reentrant)]
 pub fn op_v8_get_wire_format_version(#[cppgc] deser: &Deserializer) -> u32 {
-  deser.inner_mut().get_wire_format_version()
+  unsafe {
+    v8::ValueDeserializer::get_wire_format_version_raw(
+      deser.inner_mut().get_cxx_value_deserializer(),
+    )
+  }
 }
 
 #[op2(reentrant)]
