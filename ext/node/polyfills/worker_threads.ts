@@ -159,8 +159,13 @@ class NodeWorker extends EventEmitter {
     this.threadId = id;
     this.#pollControl();
     this.#pollMessages();
+
     // https://nodejs.org/api/worker_threads.html#event-online
-    this.emit("online");
+    process.nextTick(() => {
+      // console.log("newListener", event, this.listenerCount("online"));
+
+      this.emit("online");
+    });
   }
 
   [privateWorkerRef](ref) {
