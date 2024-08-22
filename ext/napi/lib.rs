@@ -493,6 +493,15 @@ impl NapiPermissions for deno_permissions::PermissionsContainer {
   }
 }
 
+unsafe impl Sync for NapiModuleHandle {}
+unsafe impl Send for NapiModuleHandle {}
+#[derive(Clone, Copy)]
+struct NapiModuleHandle(*const NapiModule);
+
+static NAPI_LOADED: std::sync::LazyLock<
+  RwLock<HashMap<String, NapiModuleHandle>>,
+> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
 #[op2(reentrant)]
 fn op_napi_open<NP, 'scope>(
   scope: &mut v8::HandleScope<'scope>,
@@ -574,10 +583,20 @@ where
 
   // The `module.exports` object.
   let exports = v8::Object::new(scope);
-
   let maybe_exports = if let Some(module_to_register) = maybe_module {
+    NAPI_LOADED
+      .write()
+      .insert(path, NapiModuleHandle(module_to_register));
     // SAFETY: napi_register_module guarantees that `module_to_register` is valid.
     let nm = unsafe { &*module_to_register };
+    assert_eq!(nm.nm_version, 1);
+    // SAFETY: we are going blind, calling the register function on the other side.
+    unsafe { (nm.nm_register_func)(env_ptr, exports.into()) }
+  } else if let Some(module_to_register) =
+    { NAPI_LOADED.read().get(&path).copied() }
+  {
+    // SAFETY: napi_register_module guarantees that `module_to_register` is valid.
+    let nm = unsafe { &*module_to_register.0 };
     assert_eq!(nm.nm_version, 1);
     // SAFETY: we are going blind, calling the register function on the other side.
     unsafe { (nm.nm_register_func)(env_ptr, exports.into()) }
