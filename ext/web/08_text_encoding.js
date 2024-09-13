@@ -181,6 +181,20 @@ class TextDecoder {
         );
       }
       return op_encoding_decode(input, this.#handle, stream);
+    } catch (error) {
+      // Some node code depends on having this error code
+      // when decoding fails.
+      // This way of attaching the code is
+      // kind of hacky, but we don't really have a good way to
+      // return node-style errors from ops
+      if (
+        error instanceof TypeError &&
+        typeof error.message === "string" &&
+        error.message.includes("encoded data is not valid")
+      ) {
+        error.code = "ERR_ENCODING_INVALID_ENCODED_DATA";
+      }
+      throw error;
     } finally {
       if (!stream && this.#handle !== null) {
         this.#handle = null;
