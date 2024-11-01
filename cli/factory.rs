@@ -216,6 +216,16 @@ pub struct CliFactory {
   services: CliFactoryServices,
 }
 
+fn use_byonm_for_current_subcommand(cli_options: &CliOptions) -> bool {
+  cli_options.use_byonm()
+    && !matches!(
+      cli_options.sub_command(),
+      DenoSubcommand::Install(_)
+        | DenoSubcommand::Add(_)
+        | DenoSubcommand::Remove(_)
+    )
+}
+
 impl CliFactory {
   pub fn from_flags(flags: Arc<Flags>) -> Self {
     Self {
@@ -407,7 +417,7 @@ impl CliFactory {
         async {
           let fs = self.fs();
           let cli_options = self.cli_options()?;
-          create_cli_npm_resolver(if cli_options.use_byonm() {
+          create_cli_npm_resolver(if use_byonm_for_current_subcommand(cli_options) {
             CliNpmResolverCreateOptions::Byonm(
               CliByonmNpmResolverCreateOptions {
                 fs: CliDenoResolverFs(fs.clone()),
@@ -499,7 +509,7 @@ impl CliFactory {
         let resolver = cli_options
           .create_workspace_resolver(
             self.file_fetcher()?,
-            if cli_options.use_byonm() {
+            if use_byonm_for_current_subcommand(cli_options) {
               PackageJsonDepResolution::Disabled
             } else {
               // todo(dsherret): this should be false for nodeModulesDir: true
