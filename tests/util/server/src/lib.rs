@@ -680,7 +680,7 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
   #[allow(clippy::print_stderr)]
   match wildcard_match_detailed(pattern, text) {
     WildcardMatchResult::Success => true,
-    WildcardMatchResult::Fail(debug_output) => {
+    WildcardMatchResult::Fail(debug_output, _) => {
       eprintln!("{}", debug_output);
       false
     }
@@ -689,7 +689,32 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 pub enum WildcardMatchResult {
   Success,
-  Fail(String),
+  Fail(String, Option<String>),
+}
+
+fn reconstruct_pattern<'a>(
+  parts: impl IntoIterator<Item = &'a WildcardPatternPart<'a>>,
+  output: &mut String,
+) -> String {
+  for part in parts {
+    match part {
+      WildcardPatternPart::Wildcard => output.push_str("[WILDCARD]"),
+      WildcardPatternPart::Wildline => output.push_str("[WILDLINE]"),
+      WildcardPatternPart::Wildnum(n) => {
+        output.push_str(&format!("[WILDCHARS({})]", n))
+      }
+      WildcardPatternPart::Text(text) => output.push_str(text),
+      WildcardPatternPart::UnorderedLines(vec) => {
+        output.push_str("[UNORDERED_START]\n");
+        vec.iter().for_each(|part| {
+          output.push_str(part);
+          output.push('\n')
+        });
+        output.push_str("[UNORDERED_END]\n");
+      }
+    }
+  }
+  output.clone()
 }
 
 pub fn wildcard_match_detailed(
@@ -719,6 +744,8 @@ pub fn wildcard_match_detailed(
 
   let mut was_last_wildcard = false;
   let mut was_last_wildline = false;
+
+  let mut new_expected = String::new();
   for (i, part) in parts.iter().enumerate() {
     match part {
       WildcardPatternPart::Wildcard => {
@@ -732,7 +759,7 @@ pub fn wildcard_match_detailed(
           output_lines
             .push(format!("==== HAD MISSING WILDCHARS({}) ====", times));
           output_lines.push(colors::red(annotate_whitespace(current_text)));
-          return WildcardMatchResult::Fail(output_lines.join("\n"));
+          return WildcardMatchResult::Fail(output_lines.join("\n"), None);
         }
         output_lines.push(format!("<WILDCHARS({}) />", times));
         current_text = &current_text[*times..];
@@ -770,7 +797,7 @@ pub fn wildcard_match_detailed(
               .push("==== HAD UNKNOWN PRECEDING TEXT ====".to_string());
             output_lines
               .push(colors::red(annotate_whitespace(&current_text[..index])));
-            return WildcardMatchResult::Fail(output_lines.join("\n"));
+            return WildcardMatchResult::Fail(output_lines.join("\n"), None);
           }
           None => {
             let was_wildcard_or_line = was_last_wildcard || was_last_wildline;
@@ -832,7 +859,22 @@ pub fn wildcard_match_detailed(
                 ""
               },
             ));
-            return WildcardMatchResult::Fail(output_lines.join("\n"));
+            if !parts[i + 1..].iter().any(|p| {
+              matches!(
+                p,
+                WildcardPatternPart::UnorderedLines(_)
+                  | WildcardPatternPart::Wildcard
+              )
+            }) {
+              eprintln!("CURRENT PART {:?}", part);
+              eprintln!("PARTS {:?}", parts);
+              reconstruct_pattern(&parts[..i], &mut new_expected);
+              new_expected.push_str(actual_next_text);
+            }
+            return WildcardMatchResult::Fail(
+              output_lines.join("\n"),
+              (!new_expected.is_empty()).then_some(new_expected),
+            );
           }
         }
       }
@@ -870,7 +912,18 @@ pub fn wildcard_match_detailed(
               .iter()
               .map(|l| colors::green(annotate_whitespace(l))),
           );
-          return WildcardMatchResult::Fail(output_lines.join("\n"));
+          reconstruct_pattern(&parts[..i], &mut new_expected);
+          new_expected.push_str("[UNORDERED_START]\n");
+          for line in actual_lines {
+            new_expected.push_str(line);
+            new_expected.push('\n');
+          }
+          new_expected.push_str("[UNORDERED_END]\n");
+          reconstruct_pattern(&parts[i + 1..], &mut new_expected);
+          return WildcardMatchResult::Fail(
+            output_lines.join("\n"),
+            Some(new_expected),
+          );
         }
 
         if let Some(invalid_expected) =
@@ -885,7 +938,7 @@ pub fn wildcard_match_detailed(
           );
         }
 
-        for actual_line in actual_lines {
+        for &actual_line in &actual_lines {
           let maybe_found_index =
             expected_lines.iter().position(|expected_line| {
               actual_line == *expected_line
@@ -910,7 +963,18 @@ pub fn wildcard_match_detailed(
                 colors::green(annotate_whitespace(expected))
               ));
             }
-            return WildcardMatchResult::Fail(output_lines.join("\n"));
+            reconstruct_pattern(&parts[..i], &mut new_expected);
+            new_expected.push_str("[UNORDERED_START]\n");
+            for line in actual_lines {
+              new_expected.push_str(line);
+              new_expected.push('\n');
+            }
+            new_expected.push_str("[UNORDERED_END]\n");
+            reconstruct_pattern(&parts[i + 1..], &mut new_expected);
+            return WildcardMatchResult::Fail(
+              output_lines.join("\n"),
+              Some(new_expected),
+            );
           }
         }
       }
@@ -929,7 +993,9 @@ pub fn wildcard_match_detailed(
   } else {
     output_lines.push("==== HAD TEXT AT END OF FILE ====".to_string());
     output_lines.push(colors::red(annotate_whitespace(current_text)));
-    WildcardMatchResult::Fail(output_lines.join("\n"))
+    reconstruct_pattern(&parts, &mut new_expected);
+    new_expected.push_str(current_text);
+    WildcardMatchResult::Fail(output_lines.join("\n"), Some(new_expected))
   }
 }
 
@@ -1556,5 +1622,20 @@ grault",
     assert_eq!(find_last_text_on_line("o\nbar", text), Some(2));
     assert_eq!(find_last_text_on_line("f", text), Some(0));
     assert_eq!(find_last_text_on_line("bar", text), None);
+  }
+
+  #[test]
+  fn test_new_expected() {
+    let text = "foo\nbbar\nbbaz\n";
+    let expected = "[UNORDERED_START]\nfoo\nbar\nbaz\n[UNORDERED_END]\n";
+    match wildcard_match_detailed(expected, text) {
+      WildcardMatchResult::Fail(msg, Some(new_out)) => {
+        assert_eq!(
+          new_out, "[UNORDERED_START]\nbbar\nbbaz\nfoo\n[UNORDERED_END]\n",
+          "bad {msg}"
+        );
+      }
+      _ => panic!(),
+    }
   }
 }

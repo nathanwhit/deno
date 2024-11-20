@@ -1,6 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::io::Write;
+use std::path::Path;
 
 use crate::colors;
 
@@ -60,10 +61,36 @@ pub fn assert_wildcard_match(actual: &str, expected: &str) {
 }
 
 #[track_caller]
+pub fn assert_wildcard_match_update_file(
+  actual: &str,
+  expected: &str,
+  expected_path: &Path,
+) {
+  assert_wildcard_match_with_logger_maybe_update(
+    actual,
+    expected,
+    &mut std::io::stderr(),
+    Some(expected_path),
+  )
+}
+
+#[track_caller]
 pub fn assert_wildcard_match_with_logger(
   actual: &str,
   expected: &str,
   logger: &mut dyn Write,
+) {
+  assert_wildcard_match_with_logger_maybe_update(
+    actual, expected, logger, None,
+  );
+}
+
+#[track_caller]
+pub fn assert_wildcard_match_with_logger_maybe_update(
+  actual: &str,
+  expected: &str,
+  logger: &mut dyn Write,
+  expected_path: Option<&Path>,
 ) {
   if !expected.contains("[WILD")
     && !expected.contains("[UNORDERED_START]")
@@ -75,7 +102,12 @@ pub fn assert_wildcard_match_with_logger(
       crate::WildcardMatchResult::Success => {
         // ignore
       }
-      crate::WildcardMatchResult::Fail(debug_output) => {
+      crate::WildcardMatchResult::Fail(debug_output, new_expected) => {
+        if let (Some(expected_path), Some(new_expected)) =
+          (expected_path, new_expected)
+        {
+          std::fs::write(expected_path, new_expected).unwrap();
+        }
         writeln!(
           logger,
           "{}{}{}",

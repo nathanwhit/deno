@@ -19,7 +19,9 @@ use std::rc::Rc;
 use os_pipe::pipe;
 
 use crate::assertions::assert_wildcard_match;
+use crate::assertions::assert_wildcard_match_update_file;
 use crate::assertions::assert_wildcard_match_with_logger;
+use crate::assertions::assert_wildcard_match_with_logger_maybe_update;
 use crate::deno_exe_path;
 use crate::denort_exe_path;
 use crate::env_vars_for_jsr_tests;
@@ -1139,6 +1141,31 @@ impl TestCommandOutput {
       .diagnostic_logger
       .writeln(format!("output path {}", output_path));
     let expected_text = output_path.read_to_string();
-    self.inner_assert_matches_text(actual, expected_text)
+
+    if !expected_text.contains("[WILD")
+      && !expected_text.contains("[UNORDERED_START]")
+      && expected_text != actual
+      && std::env::var("UPDATE_EXPECTED_OUTPUT").is_ok()
+    {
+      std::fs::write(&output_path, actual).unwrap();
+      panic!("Updated expected output file: {}", output_path);
+    } else if std::env::var("UPDATE_EXPECTED_OUTPUT").is_ok() {
+      match &self.diagnostic_logger.0 {
+        Some(logger) => assert_wildcard_match_with_logger_maybe_update(
+          actual,
+          expected_text.as_ref(),
+          &mut *logger.borrow_mut(),
+          Some(output_path.as_ref()),
+        ),
+        None => assert_wildcard_match_update_file(
+          actual,
+          expected_text.as_ref(),
+          output_path.as_ref(),
+        ),
+      };
+      self
+    } else {
+      self.inner_assert_matches_text(actual, expected_text)
+    }
   }
 }
