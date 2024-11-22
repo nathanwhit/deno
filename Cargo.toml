@@ -319,6 +319,8 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.serde]
 opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
 [profile.release.package.serde_v8]
 opt-level = 3
 [profile.release.package.libsui]
@@ -334,4 +336,6 @@ opt-level = 3
 [profile.release.package.zstd]
 opt-level = 3
 [profile.release.package.zstd-sys]
+opt-level = 3
+[profile.release.package.hashbrown]
 opt-level = 3
