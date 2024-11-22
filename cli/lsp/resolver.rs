@@ -664,6 +664,7 @@ impl<'a> ResolverFactory<'a> {
         npmrc,
         npm_system_info: NpmSystemInfo::default(),
         lifecycle_scripts: Default::default(),
+        can_leak_cache: false,
       })
     };
     self.set_npm_resolver(create_cli_npm_resolver_for_lsp(options).await);

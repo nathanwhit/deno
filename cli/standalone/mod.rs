@@ -650,6 +650,7 @@ pub async fn run(data: StandaloneData) -> Result<i32, AnyError> {
             ),
             npmrc,
             lifecycle_scripts: Default::default(),
+            can_leak_cache: false,
           },
         ))
         .await?;
@@ -706,6 +707,7 @@ pub async fn run(data: StandaloneData) -> Result<i32, AnyError> {
             ),
             npmrc: create_default_npmrc(),
             lifecycle_scripts: Default::default(),
+            can_leak_cache: false,
           },
         ))
         .await?;

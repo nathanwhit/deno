@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,10 +25,16 @@ use super::cache::RegistryInfoDownloader;
 #[derive(Debug)]
 pub struct CliNpmRegistryApi(Option<Arc<CliNpmRegistryApiInner>>);
 
+struct MemCache {
+  cache: ManuallyDrop<Mutex<HashMap<String, CacheItem>>>,
+  can_leak_cache: bool,
+}
+
 impl CliNpmRegistryApi {
   pub fn new(
     cache: Arc<NpmCache>,
     registry_info_downloader: Arc<RegistryInfoDownloader>,
+    can_leak_cache: bool,
   ) -> Self {
     Self(Some(Arc::new(CliNpmRegistryApiInner {
       cache,
@@ -35,6 +42,7 @@ impl CliNpmRegistryApi {
       mem_cache: Default::default(),
       previously_reloaded_packages: Default::default(),
       registry_info_downloader,
+      can_leak_cache,
     })))
   }
 
@@ -85,9 +93,20 @@ enum CacheItem {
 struct CliNpmRegistryApiInner {
   cache: Arc<NpmCache>,
   force_reload_flag: AtomicFlag,
-  mem_cache: Mutex<HashMap<String, CacheItem>>,
+  mem_cache: ManuallyDrop<Mutex<HashMap<String, CacheItem>>>,
   previously_reloaded_packages: Mutex<HashSet<String>>,
   registry_info_downloader: Arc<RegistryInfoDownloader>,
+  can_leak_cache: bool,
+}
+
+impl Drop for CliNpmRegistryApiInner {
+  fn drop(&mut self) {
+    if !self.can_leak_cache {
+      unsafe {
+        ManuallyDrop::drop(&mut self.mem_cache);
+      }
+    }
+  }
 }
 
 impl CliNpmRegistryApiInner {

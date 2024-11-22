@@ -467,6 +467,13 @@ impl CliFactory {
                 npm_system_info: cli_options.npm_system_info(),
                 npmrc: cli_options.npmrc().clone(),
                 lifecycle_scripts: cli_options.lifecycle_scripts_config(),
+                can_leak_cache: matches!(
+                  cli_options.sub_command(),
+                  DenoSubcommand::Install(_)
+                    | DenoSubcommand::Outdated(_)
+                    | DenoSubcommand::Add(_)
+                    | DenoSubcommand::Remove(_)
+                ),
               },
             )
           })

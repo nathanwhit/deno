@@ -80,6 +80,7 @@ pub struct CliManagedNpmResolverCreateOptions {
   pub npm_install_deps_provider: Arc<NpmInstallDepsProvider>,
   pub npmrc: Arc<ResolvedNpmRc>,
   pub lifecycle_scripts: LifecycleScriptsConfig,
+  pub can_leak_cache: bool,
 }
 
 pub async fn create_managed_npm_resolver_for_lsp(
@@ -109,6 +110,7 @@ pub async fn create_managed_npm_resolver_for_lsp(
       options.npm_system_info,
       snapshot,
       options.lifecycle_scripts,
+      options.can_leak_cache,
     )
   })
   .await
@@ -134,6 +136,7 @@ pub async fn create_managed_npm_resolver(
     options.npm_system_info,
     snapshot,
     options.lifecycle_scripts,
+    options.can_leak_cache,
   ))
 }
 
@@ -151,6 +154,7 @@ fn create_inner(
   npm_system_info: NpmSystemInfo,
   snapshot: Option<ValidSerializedNpmResolutionSnapshot>,
   lifecycle_scripts: LifecycleScriptsConfig,
+  can_leak_cache: bool,
 ) -> Arc<dyn CliNpmResolver> {
   let resolution = Arc::new(NpmResolution::from_serialized(
     npm_api.clone(),
@@ -187,6 +191,7 @@ fn create_inner(
     text_only_progress_bar,
     npm_system_info,
     lifecycle_scripts,
+    can_leak_cache,
   ))
 }
 
@@ -210,6 +215,7 @@ fn create_api(
       options.npmrc.clone(),
       options.text_only_progress_bar.clone(),
     )),
+    options.can_leak_cache,
   ))
 }
 
@@ -300,6 +306,7 @@ pub struct ManagedCliNpmResolver {
   npm_system_info: NpmSystemInfo,
   top_level_install_flag: AtomicFlag,
   lifecycle_scripts: LifecycleScriptsConfig,
+  can_leak_cache: bool,
 }
 
 impl std::fmt::Debug for ManagedCliNpmResolver {
@@ -324,6 +331,7 @@ impl ManagedCliNpmResolver {
     text_only_progress_bar: ProgressBar,
     npm_system_info: NpmSystemInfo,
     lifecycle_scripts: LifecycleScriptsConfig,
+    can_leak_cache: bool,
   ) -> Self {
     Self {
       fs,
@@ -338,6 +346,7 @@ impl ManagedCliNpmResolver {
       npm_system_info,
       top_level_install_flag: Default::default(),
       lifecycle_scripts,
+      can_leak_cache,
     }
   }
 
@@ -698,6 +707,7 @@ impl CliNpmResolver for ManagedCliNpmResolver {
       self.text_only_progress_bar.clone(),
       self.npm_system_info.clone(),
       self.lifecycle_scripts.clone(),
+      self.can_leak_cache,
     ))
   }
 
