@@ -41,6 +41,7 @@ use node_resolver::errors::PackageNotFoundError;
 use node_resolver::errors::ReferrerNotFoundError;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 
 use crate::args::NpmInstallDepsProvider;
 use crate::cache::CACHE_PERM;
@@ -321,6 +322,9 @@ async fn sync_resolution_with_fs(
 
   let pb_clear_guard = progress_bar.clear_guard(); // prevent flickering
 
+  let npm_sema = Semaphore::new(32);
+  let fs_sema = Semaphore::new(2);
+
   // 1. Write all the packages out the .deno directory.
   //
   // Copy (hardlink in future) <global_registry_cache>/<package_id>/ to
@@ -394,10 +398,14 @@ async fn sync_resolution_with_fs(
       let packages_with_deprecation_warnings =
         packages_with_deprecation_warnings.clone();
 
+      let sema = &npm_sema;
+      let fs_sema = &fs_sema;
       cache_futures.push(async move {
+        let _permit = sema.acquire().await;
         tarball_cache
           .ensure_package(&package.id.nv, &package.dist)
           .await?;
+        drop(_permit); // explicit for clarity
         let pb_guard = progress_bar.update_with_prompt(
           ProgressMessagePrompt::Initialize,
           &package.id.nv.to_string(),
@@ -407,6 +415,7 @@ async fn sync_resolution_with_fs(
           join_package_name(&sub_node_modules, &package.id.nv.name);
         let cache_folder = cache.package_folder_for_nv(&package.id.nv);
 
+        let _permit = fs_sema.acquire().await;
         deno_core::unsync::spawn_blocking({
           let package_path = package_path.clone();
           move || {
@@ -418,6 +427,7 @@ async fn sync_resolution_with_fs(
           }
         })
         .await??;
+        drop(_permit); // explicit for clarity
 
         if package.bin.is_some() {
           bin_entries_to_setup.borrow_mut().add(package, package_path);
