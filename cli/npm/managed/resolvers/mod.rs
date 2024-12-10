@@ -54,6 +54,7 @@ pub fn create_npm_fs_resolver(
       resolution,
       system_info,
       lifecycle_scripts,
+      npm_install_deps_provider.clone(),
     )),
   }
 }

@@ -386,6 +386,9 @@ impl<'a> deno_graph::source::NpmResolver for WorkerCliNpmGraphResolver<'a> {
               NpmCachingStrategy::Eager => {
                 Some(crate::npm::PackageCaching::All)
               }
+              NpmCachingStrategy::EagerConfigOnly => Some(
+                crate::npm::PackageCaching::OnlyOrTopLevel(package_reqs.into()),
+              ),
               NpmCachingStrategy::Lazy => {
                 Some(crate::npm::PackageCaching::Only(package_reqs.into()))
               }

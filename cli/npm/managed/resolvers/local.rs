@@ -261,6 +261,19 @@ impl NpmPackageFsResolver for LocalNpmPackageResolver {
     let snapshot = match caching {
       PackageCaching::All => self.resolution.snapshot(),
       PackageCaching::Only(reqs) => self.resolution.subset(&reqs),
+      PackageCaching::OnlyOrTopLevel(reqs) => {
+        let mut all_reqs = reqs.into_owned();
+        all_reqs.extend(
+          self
+            .npm_install_deps_provider
+            .remote_pkgs()
+            .iter()
+            .map(|pkg| pkg.req.clone()),
+        );
+        all_reqs.sort();
+        all_reqs.dedup();
+        self.resolution.subset(&all_reqs)
+      }
     };
     sync_resolution_with_fs(
       &snapshot,

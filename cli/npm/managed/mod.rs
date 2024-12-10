@@ -299,6 +299,7 @@ pub fn create_managed_in_npm_pkg_checker(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageCaching<'a> {
   Only(Cow<'a, [PackageReq]>),
+  OnlyOrTopLevel(Cow<'a, [PackageReq]>),
   All,
 }
 

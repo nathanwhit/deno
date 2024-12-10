@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::args::NpmInstallDepsProvider;
 use crate::colors;
 use crate::npm::managed::PackageCaching;
 use crate::npm::CliNpmCache;
@@ -42,6 +43,7 @@ pub struct GlobalNpmPackageResolver {
   system_info: NpmSystemInfo,
   registry_read_permission_checker: RegistryReadPermissionChecker,
   lifecycle_scripts: LifecycleScriptsConfig,
+  npm_install_deps_provider: Arc<NpmInstallDepsProvider>,
 }
 
 impl GlobalNpmPackageResolver {
@@ -52,6 +54,7 @@ impl GlobalNpmPackageResolver {
     resolution: Arc<NpmResolution>,
     system_info: NpmSystemInfo,
     lifecycle_scripts: LifecycleScriptsConfig,
+    npm_install_deps_provider: Arc<NpmInstallDepsProvider>,
   ) -> Self {
     Self {
       registry_read_permission_checker: RegistryReadPermissionChecker::new(
@@ -63,6 +66,7 @@ impl GlobalNpmPackageResolver {
       resolution,
       system_info,
       lifecycle_scripts,
+      npm_install_deps_provider,
     }
   }
 }
@@ -159,6 +163,20 @@ impl NpmPackageFsResolver for GlobalNpmPackageResolver {
       PackageCaching::All => self
         .resolution
         .all_system_packages_partitioned(&self.system_info),
+      PackageCaching::OnlyOrTopLevel(reqs) => {
+        let mut all_reqs = reqs.into_owned();
+        all_reqs.extend(
+          self
+            .npm_install_deps_provider
+            .remote_pkgs()
+            .iter()
+            .map(|pkg| pkg.req.clone()),
+        );
+        self
+          .resolution
+          .subset(&all_reqs)
+          .all_system_packages_partitioned(&self.system_info)
+      }
       PackageCaching::Only(reqs) => self
         .resolution
         .subset(&reqs)

@@ -1996,6 +1996,7 @@ fn load_env_variables_from_env_file(filename: Option<&Vec<String>>) {
 #[derive(Debug, Clone, Copy)]
 pub enum NpmCachingStrategy {
   Eager,
+  EagerConfigOnly,
   Lazy,
   Manual,
 }
