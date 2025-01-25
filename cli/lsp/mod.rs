@@ -1,5 +1,8 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::future::Future;
+use std::time::Duration;
+
 use deno_core::error::AnyError;
 use deno_core::unsync::spawn;
 pub use repl::ReplCompletionItem;
@@ -39,6 +42,42 @@ mod text;
 mod tsc;
 mod urls;
 
+type DenoLspService = tower_lsp::LspService<LanguageServer>;
+type LspRequest = tower_lsp::jsonrpc::Request;
+struct Loggy {
+  inner: DenoLspService,
+  tx: tokio::sync::mpsc::UnboundedSender<LspRequest>,
+}
+
+impl tower::Service<LspRequest> for Loggy {
+  type Response = <DenoLspService as tower::Service<LspRequest>>::Response;
+  type Error = <DenoLspService as tower::Service<LspRequest>>::Error;
+  type Future = std::pin::Pin<
+    Box<
+      dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static,
+    >,
+  >;
+
+  fn poll_ready(
+    &mut self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Result<(), Self::Error>> {
+    self.inner.poll_ready(cx)
+  }
+
+  fn call(&mut self, req: LspRequest) -> Self::Future {
+    let tx = self.tx.clone();
+    let r = req.clone();
+    let fut = self.inner.call(req);
+    let f = async move {
+      let _ = tx.send(r);
+      fut.await
+    };
+
+    Box::pin(f)
+  }
+}
+
 pub async fn start() -> Result<(), AnyError> {
   let stdin = tokio::io::stdin();
   let stdout = tokio::io::stdout();
@@ -76,13 +115,45 @@ pub async fn start() -> Result<(), AnyError> {
 
   let (service, socket) = builder.finish();
 
+  let (tx, buf) = tokio::sync::mpsc::unbounded_channel();
+  let svc = Loggy { inner: service, tx };
+  tokio::spawn({
+    let token = shutdown_flag.clone();
+    async move {
+      let mut buf = buf;
+      let mut reqs = Vec::new();
+      loop {
+        let mut new = false;
+        while let Ok(req) = buf.try_recv() {
+          reqs.push(req);
+          new = true;
+        }
+        if new {
+          tokio::fs::write(
+            "./messages.json",
+            deno_core::serde_json::to_string(&reqs).unwrap(),
+          )
+          .await
+          .unwrap();
+        }
+        tokio::select! {
+          biased;
+          _ = token.wait_raised() => {
+            break;
+          }
+          _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+      }
+    }
+  });
+
   // TODO(nayeemrmn): This shutdown flag is a workaround for
   // https://github.com/denoland/deno/issues/20700. Remove when
   // https://github.com/ebkalderon/tower-lsp/issues/399 is fixed.
   // Force end the server 8 seconds after receiving a shutdown request.
   tokio::select! {
     biased;
-    _ = Server::new(stdin, stdout, socket).serve(service) => {}
+    _ = Server::new(stdin, stdout, socket).concurrency_level(256).serve(svc) => {}
     _ = spawn(async move {
       shutdown_flag.wait_raised().await;
       tokio::time::sleep(std::time::Duration::from_secs(8)).await;
