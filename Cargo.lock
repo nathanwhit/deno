@@ -1510,6 +1510,7 @@ dependencies = [
  "deno_runtime",
  "deno_semver",
  "deno_snapshots",
+ "deno_stable_stacktrace",
  "deno_task_shell",
  "deno_telemetry",
  "deno_terminal 0.2.0",
@@ -2636,6 +2637,15 @@ name = "deno_snapshots"
 version = "0.8.0"
 dependencies = [
  "deno_runtime",
+]
+
+[[package]]
+name = "deno_stable_stacktrace"
+version = "0.1.0"
+dependencies = [
+ "backtrace",
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

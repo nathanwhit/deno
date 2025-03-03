@@ -361,7 +361,40 @@ fn setup_panic_hook() {
     eprintln!("Version: {}", deno_lib::version::DENO_VERSION_INFO.deno);
     eprintln!("Args: {:?}", env::args().collect::<Vec<_>>());
     eprintln!();
-    orig_hook(panic_info);
+    let addrs =
+      deno_stable_stacktrace::stable_stacktrace_addrs_if_no_debuginfo();
+    let (major, minor, patch, canary_hash) = deno_lib::version::version_parts()
+      .unwrap_or((
+        0,
+        0,
+        0,
+        Some(deno_lib::version::DENO_VERSION_INFO.git_hash),
+      ));
+    match addrs {
+      Some(addrs) => {
+        let stack_trace = deno_stable_stacktrace::encode::StackTrace::new(
+          addrs
+            .into_iter()
+            .map(|opt| opt.unwrap_or_default())
+            .collect(),
+          std::env::consts::ARCH,
+          std::env::consts::OS,
+          deno_stable_stacktrace::encode::Version {
+            major,
+            minor,
+            patch,
+            canary_hash: canary_hash.into(),
+            dev_build: cfg!(debug_assertions)
+              || std::env::var("DENO_DEV").is_ok(),
+          },
+        );
+        let encoded = stack_trace.encode_base64url();
+        eprintln!("Stack trace: {encoded}");
+      }
+      None => {
+        orig_hook(panic_info);
+      }
+    }
     deno_runtime::exit(1);
   }));
 }

@@ -387,6 +387,8 @@ lto = "thin"
 # Key generation is too slow on `debug`
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+[profile.dev.package.backtrace]
+opt-level = 3
 
 # rusty-v8 needs at least -O1 to not miscompile
 [profile.dev.package.v8]

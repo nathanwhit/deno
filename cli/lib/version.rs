@@ -21,6 +21,23 @@ const IS_CANARY: bool = option_env!("DENO_CANARY").is_some();
 // TODO(bartlomieju): this is temporary, to allow Homebrew to cut RC releases as well
 const IS_RC: bool = option_env!("DENO_RC").is_some();
 
+pub fn version_parts() -> Option<(u64, u64, u64, Option<&'static str>)> {
+  let [major, minor, patch] = DENO_VERSION
+    .split('.')
+    .collect::<Vec<&str>>()
+    .try_into()
+    .ok()?;
+  let major = major.parse().ok()?;
+  let minor = minor.parse().ok()?;
+  let patch = patch.parse().ok()?;
+
+  if IS_CANARY {
+    Some((major, minor, patch, Some(&GIT_COMMIT_HASH)))
+  } else {
+    Some((major, minor, patch, None))
+  }
+}
+
 pub static DENO_VERSION_INFO: std::sync::LazyLock<DenoVersionInfo> =
   std::sync::LazyLock::new(|| {
     let release_channel = libsui::find_section("denover")
