@@ -168,10 +168,10 @@ pub async fn run(
 ) -> Result<i32, AnyError> {
   let factory = CliFactory::from_flags(flags);
   let cli_options = factory.cli_options()?;
-  let main_module = cli_options.resolve_main_module()?;
+  let resolver = factory.resolver().await?.clone();
+  let main_module = cli_options.resolve_main_module(Some(&resolver))?;
   let permissions = factory.root_permissions_container()?;
   let npm_installer = factory.npm_installer_if_managed()?.cloned();
-  let resolver = factory.resolver().await?.clone();
   let file_fetcher = factory.file_fetcher()?;
   let tsconfig_resolver = factory.tsconfig_resolver()?;
   let worker_factory = factory.create_cli_main_worker_factory().await?;

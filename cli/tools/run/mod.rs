@@ -67,7 +67,8 @@ pub async fn run_script(
     deno_dir.upgrade_check_file_path(),
   );
 
-  let main_module = cli_options.resolve_main_module()?;
+  let resolver = factory.resolver().await?;
+  let main_module = cli_options.resolve_main_module(Some(resolver))?;
 
   if main_module.scheme() == "npm" {
     set_npm_user_agent();
@@ -87,7 +88,7 @@ pub async fn run_script(
 pub async fn run_from_stdin(flags: Arc<Flags>) -> Result<i32, AnyError> {
   let factory = CliFactory::from_flags(flags);
   let cli_options = factory.cli_options()?;
-  let main_module = cli_options.resolve_main_module()?;
+  let main_module = cli_options.resolve_main_module(None)?;
 
   maybe_npm_install(&factory).await?;
 
@@ -133,7 +134,8 @@ async fn run_with_watch(
           watcher_communicator.clone(),
         );
         let cli_options = factory.cli_options()?;
-        let main_module = cli_options.resolve_main_module()?;
+        let resolver = factory.resolver().await?;
+        let main_module = cli_options.resolve_main_module(Some(resolver))?;
 
         if main_module.scheme() == "npm" {
           set_npm_user_agent();
@@ -171,7 +173,7 @@ pub async fn eval_command(
   let factory = CliFactory::from_flags(flags);
   let cli_options = factory.cli_options()?;
   let file_fetcher = factory.file_fetcher()?;
-  let main_module = cli_options.resolve_main_module()?;
+  let main_module = cli_options.resolve_main_module(None)?;
 
   maybe_npm_install(&factory).await?;
 

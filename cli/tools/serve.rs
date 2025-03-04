@@ -39,7 +39,8 @@ pub async fn serve(
     deno_dir.upgrade_check_file_path(),
   );
 
-  let main_module = cli_options.resolve_main_module()?;
+  let resolver = factory.resolver().await?;
+  let main_module = cli_options.resolve_main_module(Some(resolver))?;
 
   maybe_npm_install(&factory).await?;
 
@@ -159,8 +160,9 @@ async fn serve_with_watch(
           flags,
           watcher_communicator.clone(),
         );
+        let resolver = factory.resolver().await?;
         let cli_options = factory.cli_options()?;
-        let main_module = cli_options.resolve_main_module()?;
+        let main_module = cli_options.resolve_main_module(Some(resolver))?;
 
         maybe_npm_install(&factory).await?;
 

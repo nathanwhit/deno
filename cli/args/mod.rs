@@ -607,7 +607,10 @@ impl CliOptions {
     self.flags.env_file.as_ref()
   }
 
-  pub fn resolve_main_module(&self) -> Result<&ModuleSpecifier, AnyError> {
+  pub fn resolve_main_module(
+    &self,
+    resolver: Option<&crate::resolver::CliResolver>,
+  ) -> Result<&ModuleSpecifier, AnyError> {
     self
       .main_module_cell
       .get_or_init(|| {
@@ -637,6 +640,25 @@ impl CliOptions {
                 )?
                 .unwrap_or(url)
               } else {
+                if let Some(resolver) = resolver {
+                  if url.scheme() == "file"
+                    && !url.to_file_path().unwrap().exists()
+                  {
+                    let referrer =
+                      ModuleSpecifier::from_file_path(self.initial_cwd())
+                        .unwrap();
+                    return Ok(resolver.resolve(
+                      &run_flags.script,
+                      &referrer,
+                      deno_graph::Position {
+                        line: 0,
+                        character: 0,
+                      },
+                      node_resolver::ResolutionMode::Import,
+                      node_resolver::NodeResolutionKind::Execution,
+                    )?);
+                  }
+                }
                 url
               }
             }
@@ -656,7 +678,7 @@ impl CliOptions {
   pub fn resolve_file_header_overrides(
     &self,
   ) -> HashMap<ModuleSpecifier, HashMap<String, String>> {
-    let maybe_main_specifier = self.resolve_main_module().ok();
+    let maybe_main_specifier = self.resolve_main_module(None).ok();
     // TODO(Cre3per): This mapping moved to deno_ast with https://github.com/denoland/deno_ast/issues/133 and should be available in deno_ast >= 0.25.0 via `MediaType::from_path(...).as_media_type()`
     let maybe_content_type =
       self.flags.ext.as_ref().and_then(|el| match el.as_str() {
@@ -1027,7 +1049,7 @@ impl CliOptions {
     }
 
     self
-      .resolve_main_module()
+      .resolve_main_module(None)
       .ok()
       .map(|url| vec![Cow::Borrowed(url)])
       .or_else(|| match &self.flags.subcommand {

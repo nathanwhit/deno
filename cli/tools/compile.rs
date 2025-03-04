@@ -36,7 +36,7 @@ pub async fn compile(
   let module_graph_creator = factory.module_graph_creator().await?;
   let binary_writer = factory.create_compile_binary_writer().await?;
   let http_client = factory.http_client_provider();
-  let entrypoint = cli_options.resolve_main_module()?;
+  let entrypoint = cli_options.resolve_main_module(None)?;
   let output_path = resolve_compile_executable_output_path(
     http_client,
     &compile_flags,
