@@ -2642,6 +2642,7 @@ dependencies = [
 [[package]]
 name = "deno_stable_stacktrace"
 version = "0.1.0"
+source = "git+https://github.com/nathanwhit/symbolicate#1130c9ffe230d155df5173528c23f5f7d6a98b22"
 dependencies = [
  "backtrace",
  "libc",
