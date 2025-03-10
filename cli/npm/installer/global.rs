@@ -20,6 +20,7 @@ use super::PackageCaching;
 use crate::args::LifecycleScriptsConfig;
 use crate::colors;
 use crate::npm::CliNpmCache;
+use crate::npm::CliNpmRegistryInfoProvider;
 use crate::npm::CliNpmTarballCache;
 
 /// Resolves packages from the global npm cache.
@@ -27,6 +28,7 @@ use crate::npm::CliNpmTarballCache;
 pub struct GlobalNpmPackageInstaller {
   cache: Arc<CliNpmCache>,
   tarball_cache: Arc<CliNpmTarballCache>,
+  registry_provider: Arc<CliNpmRegistryInfoProvider>,
   resolution: Arc<NpmResolutionCell>,
   lifecycle_scripts: LifecycleScriptsConfig,
   system_info: NpmSystemInfo,
@@ -36,6 +38,7 @@ impl GlobalNpmPackageInstaller {
   pub fn new(
     cache: Arc<CliNpmCache>,
     tarball_cache: Arc<CliNpmTarballCache>,
+    registry_provider: Arc<CliNpmRegistryInfoProvider>,
     resolution: Arc<NpmResolutionCell>,
     lifecycle_scripts: LifecycleScriptsConfig,
     system_info: NpmSystemInfo,
@@ -43,6 +46,7 @@ impl GlobalNpmPackageInstaller {
     Self {
       cache,
       tarball_cache,
+      registry_provider,
       resolution,
       lifecycle_scripts,
       system_info,
@@ -65,9 +69,13 @@ impl NpmPackageFsInstaller for GlobalNpmPackageInstaller {
         .subset(&reqs)
         .all_system_packages_partitioned(&self.system_info),
     };
-    cache_packages(&package_partitions.packages, &self.tarball_cache)
-      .await
-      .map_err(JsErrorBox::from_err)?;
+    cache_packages(
+      &package_partitions.packages,
+      &self.tarball_cache,
+      &self.registry_provider,
+    )
+    .await
+    .map_err(JsErrorBox::from_err)?;
 
     // create the copy package folders
     for copy in package_partitions.copy_packages {
@@ -98,12 +106,18 @@ impl NpmPackageFsInstaller for GlobalNpmPackageInstaller {
 async fn cache_packages(
   packages: &[NpmResolutionPackage],
   tarball_cache: &Arc<CliNpmTarballCache>,
+  registry_provider: &Arc<CliNpmRegistryInfoProvider>,
 ) -> Result<(), deno_npm_cache::EnsurePackageError> {
   let mut futures_unordered = FuturesUnordered::new();
   for package in packages {
     futures_unordered.push(async move {
+      let package_info = registry_provider
+        .package_info(&package.id.nv.name)
+        .await
+        .unwrap();
+      let version_info = package_info.version_info(&package.id.nv).unwrap();
       tarball_cache
-        .ensure_package(&package.id.nv, &package.dist)
+        .ensure_package(&package.id.nv, &version_info.dist)
         .await
     });
   }

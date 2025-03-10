@@ -1,5 +1,6 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -212,8 +213,18 @@ fn populate_lockfile_from_snapshot(
 
     NpmPackageLockfileInfo {
       serialized_id: pkg.id.as_serialized(),
-      integrity: pkg.dist.integrity().for_lockfile(),
+      integrity: pkg.extra.as_ref().unwrap().dist.integrity().for_lockfile(),
       dependencies,
+      bin: pkg.has_bin,
+      cpu: pkg.system.cpu.clone(),
+      os: pkg.system.os.clone(),
+      optional_dependencies: pkg
+        .optional_dependencies
+        .iter()
+        .cloned()
+        .collect(),
+      scripts: pkg.has_scripts,
+      deprecated: pkg.is_deprecated,
     }
   }
 

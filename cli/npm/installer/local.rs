@@ -40,6 +40,7 @@ use crate::args::NpmInstallDepsProvider;
 use crate::cache::CACHE_PERM;
 use crate::colors;
 use crate::npm::CliNpmCache;
+use crate::npm::CliNpmRegistryInfoProvider;
 use crate::npm::CliNpmTarballCache;
 use crate::sys::CliSys;
 use crate::util::fs::clone_dir_recursive;
@@ -61,6 +62,7 @@ pub struct LocalNpmPackageInstaller {
   lifecycle_scripts: LifecycleScriptsConfig,
   root_node_modules_path: PathBuf,
   system_info: NpmSystemInfo,
+  registry_provider: Arc<CliNpmRegistryInfoProvider>,
 }
 
 impl LocalNpmPackageInstaller {
@@ -75,6 +77,7 @@ impl LocalNpmPackageInstaller {
     node_modules_folder: PathBuf,
     lifecycle_scripts: LifecycleScriptsConfig,
     system_info: NpmSystemInfo,
+    registry_provider: Arc<CliNpmRegistryInfoProvider>,
   ) -> Self {
     Self {
       cache,
@@ -86,6 +89,7 @@ impl LocalNpmPackageInstaller {
       lifecycle_scripts,
       root_node_modules_path: node_modules_folder,
       system_info,
+      registry_provider,
     }
   }
 }
@@ -110,6 +114,7 @@ impl NpmPackageFsInstaller for LocalNpmPackageInstaller {
       &self.sys,
       &self.system_info,
       &self.lifecycle_scripts,
+      &self.registry_provider,
     )
     .await
     .map_err(JsErrorBox::from_err)
@@ -175,6 +180,7 @@ async fn sync_resolution_with_fs(
   sys: &CliSys,
   system_info: &NpmSystemInfo,
   lifecycle_scripts: &LifecycleScriptsConfig,
+  registry_provider: &Arc<CliNpmRegistryInfoProvider>,
 ) -> Result<(), SyncResolutionWithFsError> {
   if snapshot.is_empty() && npm_install_deps_provider.local_pkgs().is_empty() {
     return Ok(()); // don't create the directory
@@ -309,8 +315,13 @@ async fn sync_resolution_with_fs(
         packages_with_deprecation_warnings.clone();
 
       cache_futures.push(async move {
+        let package_info = registry_provider
+          .package_info(&package.id.nv.name)
+          .await
+          .unwrap();
+        let version_info = package_info.version_info(&package.id.nv).unwrap();
         tarball_cache
-          .ensure_package(&package.id.nv, &package.dist)
+          .ensure_package(&package.id.nv, &version_info.dist)
           .await
           .map_err(JsErrorBox::from_err)?;
         let pb_guard = progress_bar.update_with_prompt(
@@ -337,14 +348,14 @@ async fn sync_resolution_with_fs(
         .map_err(JsErrorBox::from_err)?
         .map_err(JsErrorBox::from_err)?;
 
-        if package.bin.is_some() {
+        if package.has_bin {
           bin_entries_to_setup.borrow_mut().add(package, package_path);
         }
 
-        if let Some(deprecated) = &package.deprecated {
+        if package.is_deprecated {
           packages_with_deprecation_warnings
             .lock()
-            .push((package.id.clone(), deprecated.clone()));
+            .push((package.id.clone(), "".to_string()));
         }
 
         // finally stop showing the progress bar

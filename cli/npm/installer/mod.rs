@@ -25,6 +25,7 @@ use crate::args::LifecycleScriptsConfig;
 use crate::args::NpmInstallDepsProvider;
 use crate::args::PackageJsonDepValueParseWithLocationError;
 use crate::npm::CliNpmCache;
+use crate::npm::CliNpmRegistryInfoProvider;
 use crate::npm::CliNpmTarballCache;
 use crate::sys::CliSys;
 use crate::util::progress_bar::ProgressBar;
@@ -66,6 +67,7 @@ impl NpmInstaller {
     maybe_node_modules_path: Option<PathBuf>,
     lifecycle_scripts: LifecycleScriptsConfig,
     system_info: NpmSystemInfo,
+    registry_provider: Arc<CliNpmRegistryInfoProvider>,
   ) -> Self {
     let fs_installer: Arc<dyn NpmPackageFsInstaller> =
       match maybe_node_modules_path {
@@ -79,10 +81,12 @@ impl NpmInstaller {
           node_modules_folder,
           lifecycle_scripts,
           system_info,
+          registry_provider,
         )),
         None => Arc::new(GlobalNpmPackageInstaller::new(
           npm_cache,
           tarball_cache,
+          registry_provider,
           npm_resolution.clone(),
           lifecycle_scripts,
           system_info,

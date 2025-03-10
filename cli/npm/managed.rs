@@ -182,7 +182,7 @@ pub enum SnapshotFromLockfileError {
 
 async fn snapshot_from_lockfile(
   lockfile: Arc<CliLockfile>,
-  api: &dyn NpmRegistryApi,
+  _api: &dyn NpmRegistryApi,
 ) -> Result<ValidSerializedNpmResolutionSnapshot, SnapshotFromLockfileError> {
   let (incomplete_snapshot, skip_integrity_check) = {
     let lock = lockfile.lock();
@@ -194,7 +194,6 @@ async fn snapshot_from_lockfile(
   let snapshot = deno_npm::resolution::snapshot_from_lockfile(
     deno_npm::resolution::SnapshotFromLockfileParams {
       incomplete_snapshot,
-      api,
       skip_integrity_check,
     },
   )

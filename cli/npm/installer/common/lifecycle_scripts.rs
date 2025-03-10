@@ -66,14 +66,15 @@ pub fn has_lifecycle_scripts(
   package: &NpmResolutionPackage,
   package_path: &Path,
 ) -> bool {
-  if let Some(install) = package.scripts.get("install") {
-    // default script
-    if !is_broken_default_install_script(install, package_path) {
-      return true;
-    }
-  }
-  package.scripts.contains_key("preinstall")
-    || package.scripts.contains_key("postinstall")
+  // if let Some(install) = package.scripts.get("install") {
+  //   // default script
+  //   if !is_broken_default_install_script(install, package_path) {
+  //     return true;
+  //   }
+  // }
+  // package.scripts.contains_key("preinstall")
+  //   || package.scripts.contains_key("postinstall")
+  false
 }
 
 // npm defaults to running `node-gyp rebuild` if there is a `binding.gyp` file
@@ -263,7 +264,11 @@ impl<'a> LifecycleScripts<'a> {
           get_package_path,
         );
         for script_name in ["preinstall", "install", "postinstall"] {
-          if let Some(script) = package.scripts.get(script_name) {
+          if let Some(script) = package
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.scripts.get(script_name))
+          {
             if script_name == "install"
               && is_broken_default_install_script(script, &package_path)
             {
@@ -414,7 +419,7 @@ fn resolve_custom_commands_from_packages<
   for package in packages {
     let package_path = get_package_path(package);
 
-    if package.bin.is_some() {
+    if package.has_bin {
       bin_entries.add(package, package_path);
     }
   }

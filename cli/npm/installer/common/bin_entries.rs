@@ -101,26 +101,27 @@ impl<'a> BinEntries<'a> {
     package_path: PathBuf,
   ) {
     self.sorted = false;
-    // check for a new collision, if we haven't already
-    // found one
-    match package.bin.as_ref().unwrap() {
-      deno_npm::registry::NpmPackageVersionBinEntry::String(_) => {
-        let bin_name = default_bin_name(package);
+    // TODO: re-enable this
+    // // check for a new collision, if we haven't already
+    // // found one
+    // match package.bin.as_ref().unwrap() {
+    //   deno_npm::registry::NpmPackageVersionBinEntry::String(_) => {
+    //     let bin_name = default_bin_name(package);
 
-        if let Some(other) = self.seen_names.insert(bin_name, &package.id) {
-          self.collisions.insert(&package.id);
-          self.collisions.insert(other);
-        }
-      }
-      deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
-        for name in entries.keys() {
-          if let Some(other) = self.seen_names.insert(name, &package.id) {
-            self.collisions.insert(&package.id);
-            self.collisions.insert(other);
-          }
-        }
-      }
-    }
+    //     if let Some(other) = self.seen_names.insert(bin_name, &package.id) {
+    //       self.collisions.insert(&package.id);
+    //       self.collisions.insert(other);
+    //     }
+    //   }
+    //   deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
+    //     for name in entries.keys() {
+    //       if let Some(other) = self.seen_names.insert(name, &package.id) {
+    //         self.collisions.insert(&package.id);
+    //         self.collisions.insert(other);
+    //       }
+    //     }
+    //   }
+    // }
 
     self.entries.push((package, package_path));
   }
@@ -147,35 +148,35 @@ impl<'a> BinEntries<'a> {
       self.sorted = true;
     }
 
-    let mut seen = HashSet::new();
+    // let mut seen = HashSet::new();
 
     for (package, package_path) in &self.entries {
       if !filter(package) {
         continue;
       }
-      if let Some(bin_entries) = &package.bin {
-        match bin_entries {
-          deno_npm::registry::NpmPackageVersionBinEntry::String(script) => {
-            let name = default_bin_name(package);
-            if !seen.insert(name) {
-              already_seen(package_path, script)?;
-              // we already set up a bin entry with this name
-              continue;
-            }
-            new(package, package_path, name, script)?;
-          }
-          deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
-            for (name, script) in entries {
-              if !seen.insert(name) {
-                already_seen(package_path, script)?;
-                // we already set up a bin entry with this name
-                continue;
-              }
-              new(package, package_path, name, script)?;
-            }
-          }
-        }
-      }
+      // if let Some(bin_entries) = &package.bin {
+      //   match bin_entries {
+      //     deno_npm::registry::NpmPackageVersionBinEntry::String(script) => {
+      //       let name = default_bin_name(package);
+      //       if !seen.insert(name) {
+      //         already_seen(package_path, script)?;
+      //         // we already set up a bin entry with this name
+      //         continue;
+      //       }
+      //       new(package, package_path, name, script)?;
+      //     }
+      //     deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
+      //       for (name, script) in entries {
+      //         if !seen.insert(name) {
+      //           already_seen(package_path, script)?;
+      //           // we already set up a bin entry with this name
+      //           continue;
+      //         }
+      //         new(package, package_path, name, script)?;
+      //       }
+      //     }
+      //   }
+      // }
     }
 
     Ok(())

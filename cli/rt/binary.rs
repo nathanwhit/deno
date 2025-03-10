@@ -546,12 +546,12 @@ fn deserialize_npm_snapshot(
       SerializedNpmResolutionSnapshotPackage {
         id,
         system: Default::default(),
-        dist: Default::default(),
         dependencies,
         optional_dependencies: Default::default(),
-        bin: None,
-        scripts: Default::default(),
-        deprecated: Default::default(),
+        extra: None,
+        has_bin: false,
+        has_scripts: false,
+        is_deprecated: false,
       },
     ))
   }

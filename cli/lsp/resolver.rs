@@ -774,7 +774,7 @@ impl<'a> ResolverFactory<'a> {
         npmrc.clone(),
       ));
       let npm_resolution_installer = Arc::new(NpmResolutionInstaller::new(
-        registry_info_provider,
+        registry_info_provider.clone(),
         self.services.npm_resolution.clone(),
         maybe_lockfile.clone(),
       ));
@@ -791,6 +791,7 @@ impl<'a> ResolverFactory<'a> {
         maybe_node_modules_path.clone(),
         LifecycleScriptsConfig::default(),
         NpmSystemInfo::default(),
+        registry_info_provider.clone(),
       ));
       self.set_npm_installer(npm_installer);
       if let Err(err) = npm_resolution_initializer.ensure_initialized().await {

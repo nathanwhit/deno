@@ -607,6 +607,7 @@ impl CliFactory {
           .map(|p| p.to_path_buf()),
         cli_options.lifecycle_scripts_config(),
         cli_options.npm_system_info(),
+        self.npm_registry_info_provider()?.clone(),
       )))
     })
   }
