@@ -8,8 +8,13 @@ use async_trait::async_trait;
 use deno_error::JsErrorBox;
 use deno_npm::npm_rc::ResolvedNpmRc;
 use deno_npm::registry::NpmPackageInfo;
+use deno_npm::registry::NpmPackageVersionInfo;
 use deno_npm::registry::NpmRegistryApi;
 use deno_npm::registry::NpmRegistryPackageInfoLoadError;
+use deno_npm::registry::SmallNpmPackageInfo;
+use deno_semver::package::PackageNv;
+use deno_semver::StackString;
+use deno_semver::Version;
 use deno_unsync::sync::AtomicFlag;
 use deno_unsync::sync::MultiRuntimeAsyncValueCreator;
 use futures::future::LocalBoxFuture;
@@ -35,10 +40,51 @@ type LoadResult = Result<FutureResult, Arc<JsErrorBox>>;
 type LoadFuture = LocalBoxFuture<'static, LoadResult>;
 
 #[derive(Debug, Clone)]
+pub struct CacheInfo {
+  pub versions: Arc<deno_npm::registry::SmallNpmPackageInfo>,
+  pub content: String,
+  pub version_ranges: HashMap<String, (u32, u32)>,
+}
+
+impl CacheInfo {
+  pub fn new(name: String, content: String) -> Self {
+    let fast_registry_json::Versions {
+      dist_tags,
+      version_ranges,
+      versions,
+    } = fast_registry_json::pluck_versions(&content).unwrap();
+    let info: Arc<SmallNpmPackageInfo> =
+      Arc::new(deno_npm::registry::SmallNpmPackageInfo {
+        name: StackString::from_string(name),
+        versions: versions
+          .iter()
+          .map(|v| Version::parse_from_npm(v).unwrap())
+          .collect(),
+        dist_tags: dist_tags
+          .into_iter()
+          .map(|(k, v)| (k.to_string(), Version::parse_from_npm(v).unwrap()))
+          .collect(),
+      });
+
+    let version_ranges = versions
+      .iter()
+      .zip(version_ranges.iter())
+      .map(|(v, r)| (v.to_string(), r.clone()))
+      .collect();
+
+    Self {
+      versions: info,
+      content,
+      version_ranges,
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
 enum FutureResult {
   PackageNotExists,
-  SavedFsCache(Arc<NpmPackageInfo>),
-  ErroredFsCache(Arc<NpmPackageInfo>),
+  SavedFsCache(Arc<CacheInfo>),
+  ErroredFsCache(Arc<CacheInfo>),
 }
 
 #[derive(Debug, Clone)]
@@ -48,16 +94,17 @@ enum MemoryCacheItem {
   /// The item has loaded in the past and was stored in the file system cache.
   /// There is no reason to request this package from the npm registry again
   /// for the duration of execution.
-  FsCached,
+  FsCached(Arc<CacheInfo>),
   /// An item is memory cached when it fails saving to the file system cache
   /// or the package does not exist.
-  MemoryCached(Result<Option<Arc<NpmPackageInfo>>, Arc<JsErrorBox>>),
+  MemoryCached(Result<Option<Arc<CacheInfo>>, Arc<JsErrorBox>>),
 }
 
 #[derive(Debug, Default)]
 struct MemoryCache {
   clear_id: usize,
   items: HashMap<String, MemoryCacheItem>,
+  versions: HashMap<PackageNv, Arc<NpmPackageVersionInfo>>,
 }
 
 impl MemoryCache {
@@ -221,7 +268,7 @@ impl<
   pub async fn package_info(
     self: &Arc<Self>,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
     match self.maybe_package_info(name).await {
       Ok(Some(info)) => Ok(info),
       Ok(None) => Err(NpmRegistryPackageInfoLoadError::PackageNotExists {
@@ -233,23 +280,65 @@ impl<
     }
   }
 
+  pub async fn maybe_package_version_info(
+    self: &Arc<Self>,
+    package_nv: &PackageNv,
+  ) -> Result<Option<Arc<NpmPackageVersionInfo>>, LoadPackageInfoError> {
+    if let Some(info) = self.memory_cache.lock().versions.get(package_nv) {
+      return Ok(Some(info.clone()));
+    }
+    let Some(info) = self
+      .load_package_info_inner(&package_nv.name)
+      .await
+      .map_err(|err| LoadPackageInfoError {
+        url: get_package_url(&self.npmrc, &package_nv.name),
+        name: package_nv.name.to_string(),
+        inner: err,
+      })?
+    else {
+      return Ok(None);
+    };
+    let &(start, end) = info
+      .version_ranges
+      .get(&package_nv.version.to_string())
+      .unwrap();
+    let parsed: NpmPackageVersionInfo =
+      serde_json::from_str(&info.content[start as usize..end as usize])
+        .map_err(|err| LoadPackageInfoError {
+          url: get_package_url(&self.npmrc, &package_nv.name),
+          name: package_nv.name.to_string(),
+          inner: LoadPackageInfoInnerError::Other(Arc::new(
+            JsErrorBox::from_err(err),
+          )),
+        })?;
+    let version_info = Arc::new(parsed);
+    self
+      .memory_cache
+      .lock()
+      .versions
+      .insert(package_nv.clone(), version_info.clone());
+    Ok(Some(version_info))
+  }
+
   pub async fn maybe_package_info(
     self: &Arc<Self>,
     name: &str,
-  ) -> Result<Option<Arc<NpmPackageInfo>>, LoadPackageInfoError> {
-    self.load_package_info_inner(name).await.map_err(|err| {
-      LoadPackageInfoError {
+  ) -> Result<Option<Arc<SmallNpmPackageInfo>>, LoadPackageInfoError> {
+    self
+      .load_package_info_inner(name)
+      .await
+      .map_err(|err| LoadPackageInfoError {
         url: get_package_url(&self.npmrc, name),
         name: name.to_string(),
         inner: err,
-      }
-    })
+      })
+      .map(|maybe_info| maybe_info.map(|info| info.versions.clone()))
   }
 
   async fn load_package_info_inner(
     self: &Arc<Self>,
     name: &str,
-  ) -> Result<Option<Arc<NpmPackageInfo>>, LoadPackageInfoInnerError> {
+  ) -> Result<Option<Arc<CacheInfo>>, LoadPackageInfoInnerError> {
     let (cache_item, clear_id) = {
       let mut mem_cache = self.memory_cache.lock();
       let cache_item = if let Some(cache_item) = mem_cache.get(name) {
@@ -268,13 +357,14 @@ impl<
     };
 
     match cache_item {
-      MemoryCacheItem::FsCached => {
-        // this struct previously loaded from the registry, so we can load it from the file system cache
-        self
-          .load_file_cached_package_info(name)
-          .await
-          .map(|info| Some(Arc::new(info)))
-          .map_err(LoadPackageInfoInnerError::LoadFileCachedPackageInfo)
+      MemoryCacheItem::FsCached(info) => {
+        // // this struct previously loaded from the registry, so we can load it from the file system cache
+        // self
+        //   .load_file_cached_package_info(name)
+        //   .await
+        //   .map(Some)
+        //   .map_err(LoadPackageInfoInnerError::LoadFileCachedPackageInfo)
+        Ok(Some(info.clone()))
       }
       MemoryCacheItem::MemoryCached(maybe_info) => {
         maybe_info.clone().map_err(LoadPackageInfoInnerError::Other)
@@ -287,9 +377,9 @@ impl<
             self.memory_cache.lock().try_insert(
               clear_id,
               name,
-              MemoryCacheItem::FsCached,
+              MemoryCacheItem::FsCached(info.clone()),
             );
-            Ok(Some(info))
+            Ok(Some(info.clone()))
           }
           Ok(FutureResult::ErroredFsCache(info)) => {
             // since saving to the fs cache failed, keep the package information in memory
@@ -298,7 +388,7 @@ impl<
               name,
               MemoryCacheItem::MemoryCached(Ok(Some(info.clone()))),
             );
-            Ok(Some(info))
+            Ok(Some(info.clone()))
           }
           Ok(FutureResult::PackageNotExists) => {
             self.memory_cache.lock().try_insert(
@@ -325,7 +415,7 @@ impl<
   async fn load_file_cached_package_info(
     &self,
     name: &str,
-  ) -> Result<NpmPackageInfo, LoadFileCachedPackageInfoError> {
+  ) -> Result<Arc<CacheInfo>, LoadFileCachedPackageInfoError> {
     // this scenario failing should be exceptionally rare so let's
     // deal with improving it only when anyone runs into an issue
     let maybe_package_info = deno_unsync::spawn_blocking({
@@ -340,7 +430,7 @@ impl<
       name: name.to_string(),
     })?;
     match maybe_package_info {
-      Some(package_info) => Ok(package_info),
+      Some(package_info) => Ok(Arc::new(package_info)),
       None => Err(LoadFileCachedPackageInfoError::FileMissing(
         name.to_string(),
       )),
@@ -395,7 +485,8 @@ impl<
         Some(bytes) => {
           let future_result = deno_unsync::spawn_blocking(
             move || -> Result<FutureResult, JsErrorBox> {
-              let package_info = serde_json::from_slice(&bytes).map_err(JsErrorBox::from_err)?;
+              let string = String::from_utf8(bytes).unwrap();
+              let package_info = CacheInfo::new(name.to_string(), string);
               match downloader.cache.save_package_info(&name, &package_info) {
                 Ok(()) => {
                   Ok(FutureResult::SavedFsCache(Arc::new(package_info)))
@@ -456,11 +547,41 @@ impl<
       + 'static,
   > NpmRegistryApi for NpmRegistryApiAdapter<THttpClient, TSys>
 {
-  async fn package_info(
+  // async fn package_info(
+  //   &self,
+  //   name: &str,
+  // ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  //   self.0.package_info(name).await
+  // }
+
+  async fn package_versions(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+    // self.0.package_versions(name).await
     self.0.package_info(name).await
+  }
+
+  async fn package_version_info(
+    &self,
+    package_nv: &PackageNv,
+    _: &HashMap<StackString, Vec<NpmPackageVersionInfo>>,
+  ) -> Result<Arc<NpmPackageVersionInfo>, NpmRegistryPackageInfoLoadError> {
+    // self.0.package_version_info(package_nv).await
+    self
+      .0
+      .maybe_package_version_info(package_nv)
+      .await
+      .map_err(|err| {
+        NpmRegistryPackageInfoLoadError::LoadError(Arc::new(
+          JsErrorBox::from_err(err),
+        ))
+      })?
+      .ok_or_else(|| {
+        NpmRegistryPackageInfoLoadError::VersionNotFound(
+          deno_npm::resolution::NpmPackageVersionNotFound(package_nv.clone()),
+        )
+      })
   }
 
   fn mark_force_reload(&self) -> bool {

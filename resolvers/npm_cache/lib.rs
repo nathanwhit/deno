@@ -20,6 +20,7 @@ use http::HeaderName;
 use http::HeaderValue;
 use http::StatusCode;
 use parking_lot::Mutex;
+use registry_info::CacheInfo;
 use sys_traits::FsCreateDirAll;
 use sys_traits::FsHardLink;
 use sys_traits::FsMetadata;
@@ -299,7 +300,7 @@ impl<
   pub fn load_package_info(
     &self,
     name: &str,
-  ) -> Result<Option<NpmPackageInfo>, serde_json::Error> {
+  ) -> Result<Option<registry_info::CacheInfo>, serde_json::Error> {
     let file_cache_path = self.get_registry_package_info_file_cache_path(name);
 
     let file_text = match std::fs::read_to_string(file_cache_path) {
@@ -307,17 +308,16 @@ impl<
       Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
       Err(err) => return Err(serde_json::Error::io(err)),
     };
-    serde_json::from_str(&file_text)
+    Ok(Some(CacheInfo::new(name.to_string(), file_text)))
   }
 
   pub fn save_package_info(
     &self,
     name: &str,
-    package_info: &NpmPackageInfo,
+    package_info: &CacheInfo,
   ) -> Result<(), JsErrorBox> {
     let file_cache_path = self.get_registry_package_info_file_cache_path(name);
-    let file_text =
-      serde_json::to_string(&package_info).map_err(JsErrorBox::from_err)?;
+    let file_text = package_info.content.clone();
     atomic_write_file_with_retries(
       &self.sys,
       &file_cache_path,

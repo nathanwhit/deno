@@ -37,6 +37,7 @@ sys_traits.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 url.workspace = true
+fast-registry-json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

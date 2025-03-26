@@ -36,6 +36,7 @@ use serde::Serialize;
 use sys_traits::FsCopy;
 use sys_traits::FsDirEntry;
 use sys_traits::FsReadDir;
+use tokio::sync::Semaphore;
 
 use super::common::bin_entries;
 use super::common::NpmPackageFsInstaller;
@@ -193,6 +194,8 @@ async fn sync_resolution_with_fs(
   if snapshot.is_empty() && npm_install_deps_provider.local_pkgs().is_empty() {
     return Ok(()); // don't create the directory
   }
+
+  let sema = Arc::new(Semaphore::new(2));
 
   // don't set up node_modules (and more importantly try to acquire the file lock)
   // if we're running as part of a lifecycle script

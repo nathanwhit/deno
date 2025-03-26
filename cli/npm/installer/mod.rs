@@ -9,6 +9,7 @@ use deno_core::unsync::sync::AtomicFlag;
 use deno_error::JsErrorBox;
 use deno_npm::registry::NpmPackageInfo;
 use deno_npm::registry::NpmRegistryPackageInfoLoadError;
+use deno_npm::registry::SmallNpmPackageInfo;
 use deno_npm::NpmSystemInfo;
 use deno_resolver::npm::managed::NpmResolutionCell;
 use deno_runtime::colors;
@@ -200,7 +201,7 @@ impl NpmInstaller {
   pub async fn cache_package_info(
     &self,
     package_name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
     self
       .npm_resolution_installer
       .cache_package_info(package_name)

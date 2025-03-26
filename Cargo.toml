@@ -60,7 +60,8 @@ deno_graph = "=0.89.2"
 deno_lint = "=0.74.0"
 deno_lockfile = "=0.25.0"
 deno_media_type = { version = "=0.2.8", features = ["module_specifier"] }
-deno_npm = "=0.29.0"
+deno_npm = { version = "=0.30.0", path = "../deno_npm" }
+fast-registry-json = { path = "../fast-registry-json" }
 deno_path_util = "=0.3.2"
 deno_permissions = { version = "0.55.0", path = "./runtime/permissions" }
 deno_runtime = { version = "0.204.0", path = "./runtime" }
@@ -375,7 +376,7 @@ opt-level = 'z' # Optimize for size
 
 # Build release with debug symbols: cargo build --profile=release-with-debug
 [profile.release-with-debug]
-inherits = "release"
+inherits = "release-lite"
 debug = true
 
 # Faster to compile than `release` but with similar performance.
@@ -489,4 +490,10 @@ opt-level = 3
 [profile.release.package.httpdate]
 opt-level = 3
 [profile.release.package.deno_unsync]
+opt-level = 3
+
+[profile.release.package.fast-registry-json]
+opt-level = 3
+
+[profile.release.package.deno_semver]
 opt-level = 3
