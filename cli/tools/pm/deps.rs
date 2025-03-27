@@ -733,9 +733,10 @@ impl DepManager {
               self.jsr_fetch_resolver.package_info(&semver_req.name).await;
             let latest = info
               .and_then(|info| {
-                let lower_bound = &semver_compatible.as_ref()?.version;
+                let lower_bound =
+                  semver_compatible.as_ref().map(|nv| &nv.version);
                 latest_version(
-                  Some(lower_bound),
+                  lower_bound,
                   info.versions.iter().filter_map(|(version, version_info)| {
                     if !version_info.yanked {
                       Some(version)

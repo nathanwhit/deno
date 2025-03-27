@@ -2,6 +2,7 @@
 
 mod interactive;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use deno_core::error::AnyError;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
 use deno_semver::StackString;
+use deno_semver::Version;
 use deno_semver::VersionReq;
 use deno_terminal::colors;
 
@@ -132,8 +134,6 @@ fn print_outdated(
   {
     let dep = deps.get_dep(dep_id);
 
-    let Some(resolved) = resolved else { continue };
-
     let latest = {
       let preferred = if compatible {
         &latest_versions.semver_compatible
@@ -147,13 +147,33 @@ fn print_outdated(
       }
     };
 
-    if latest > &resolved
-      && seen.insert((dep.kind, dep.req.name.clone(), resolved.version.clone()))
-    {
+    if let Some(resolved) = resolved {
+      if latest > &resolved
+        && seen.insert((
+          dep.kind,
+          dep.req.name.clone(),
+          resolved.version.clone(),
+        ))
+      {
+        outdated.push(OutdatedPackage {
+          kind: dep.kind,
+          name: dep.req.name.clone(),
+          current: resolved.version.to_string(),
+          latest: latest_versions
+            .latest
+            .map(|l| l.version.to_string())
+            .unwrap_or_default(),
+          semver_compatible: latest_versions
+            .semver_compatible
+            .map(|l| l.version.to_string())
+            .unwrap_or_default(),
+        })
+      }
+    } else {
       outdated.push(OutdatedPackage {
         kind: dep.kind,
         name: dep.req.name.clone(),
-        current: resolved.version.to_string(),
+        current: String::new(),
         latest: latest_versions
           .latest
           .map(|l| l.version.to_string())
@@ -240,8 +260,15 @@ pub async fn outdated(
     )?
   };
 
+  eprintln!("here");
   deps.resolve_versions().await?;
 
+  deps
+    .deps_with_resolved_latest_versions()
+    .into_iter()
+    .for_each(|el| {
+      eprintln!("{:?}", el);
+    });
   match update_flags.kind {
     crate::args::OutdatedKind::Update {
       latest,
@@ -285,18 +312,23 @@ fn choose_new_version_req(
     }
     ChosenVersionReq::Some(version_req)
   } else {
-    let Some(resolved) = resolved else {
-      return ChosenVersionReq::None {
-        latest_available: false,
-      };
-    };
+    let resolved = resolved.map(Cow::Borrowed).unwrap_or_else(|| {
+      Cow::Owned(PackageNv {
+        name: dep.req.name.clone(),
+        version: Version::default(),
+      })
+    });
     let Some(preferred) = (if update_to_latest {
       latest_versions.latest.as_ref()
     } else {
       latest_versions.semver_compatible.as_ref()
     }) else {
       return ChosenVersionReq::None {
-        latest_available: false,
+        latest_available: !update_to_latest
+          && latest_versions
+            .latest
+            .as_ref()
+            .is_some_and(|nv| nv.version > resolved.version),
       };
     };
     if preferred.version <= resolved.version {
