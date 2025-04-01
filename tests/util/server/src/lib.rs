@@ -989,6 +989,7 @@ pub fn wildcard_match_detailed(
     WildcardMatchResult::Fail(
       "<matched everything>\n!!!! PROBLEM: Missing final newline at end of expected output !!!!"
         .to_string(),
+        None
     )
   } else {
     output_lines.push("==== HAD TEXT AT END OF FILE ====".to_string());

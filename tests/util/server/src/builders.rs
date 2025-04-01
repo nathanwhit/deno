@@ -1140,7 +1140,13 @@ impl TestCommandOutput {
     self
       .diagnostic_logger
       .writeln(format!("output path {}", output_path));
-    let expected_text = output_path.read_to_string();
+    let expected_text = if !output_path.exists()
+      && std::env::var("UPDATE_EXPECTED_OUTPUT").is_ok()
+    {
+      "".to_string()
+    } else {
+      output_path.read_to_string()
+    };
 
     if !expected_text.contains("[WILD")
       && !expected_text.contains("[UNORDERED_START]")
