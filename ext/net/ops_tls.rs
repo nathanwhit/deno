@@ -37,9 +37,6 @@ use deno_tls::TlsKey;
 use deno_tls::TlsKeyLookup;
 use deno_tls::TlsKeys;
 use deno_tls::TlsKeysHolder;
-pub use rustls_tokio_stream::TlsStream;
-use rustls_tokio_stream::TlsStreamRead;
-use rustls_tokio_stream::TlsStreamWrite;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -57,6 +54,9 @@ use crate::DefaultTlsOptions;
 use crate::NetPermissions;
 use crate::UnsafelyIgnoreCertificateErrors;
 
+pub type TlsStream = rustls_tokio_stream::TlsStream<TcpStream>;
+pub type TlsStreamRead = rustls_tokio_stream::TlsStreamRead<TcpStream>;
+pub type TlsStreamWrite = rustls_tokio_stream::TlsStreamWrite<TcpStream>;
 pub(crate) const TLS_BUFFER_SIZE: Option<NonZeroUsize> =
   NonZeroUsize::new(65536);
 

@@ -2269,6 +2269,7 @@ dependencies = [
  "deno_path_util",
  "deno_permissions",
  "deno_process",
+ "deno_tls",
  "deno_whoami",
  "der",
  "digest",
@@ -2308,6 +2309,7 @@ dependencies = [
  "ripemd",
  "rsa",
  "rusqlite",
+ "rustls-tokio-stream",
  "scrypt",
  "sec1",
  "serde",
@@ -7087,8 +7089,6 @@ dependencies = [
 [[package]]
 name = "rustls-tokio-stream"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faa7dc7c991d9164e55bbf1558029eb5b84d32cc4d61a7df5b8641b2deedc4b3"
 dependencies = [
  "futures",
  "rustls",
