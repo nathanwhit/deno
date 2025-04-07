@@ -200,7 +200,7 @@ pub struct NodeExtInitServices<
 }
 
 deno_core::extension!(deno_node,
-  deps = [ deno_io, deno_fs ],
+  deps = [ deno_io, deno_fs, deno_net ],
   parameters = [P: NodePermissions, TInNpmPackageChecker: InNpmPackageChecker, TNpmPackageFolderResolver: NpmPackageFolderResolver, TSys: ExtNodeSys],
   ops = [
     ops::blocklist::op_socket_address_parse,
@@ -441,12 +441,15 @@ deno_core::extension!(deno_node,
     ops::inspector::op_inspector_disconnect,
     ops::inspector::op_inspector_emit_protocol_event,
     ops::inspector::op_inspector_enabled,
+    ops::tls::op_node_tls_start,
+    ops::tls::op_node_tls_handshake,
   ],
   objects = [
     ops::perf_hooks::EldHistogram,
     ops::sqlite::DatabaseSync,
     ops::sqlite::Session,
-    ops::sqlite::StatementSync
+    ops::sqlite::StatementSync,
+    ops::streams::NodeStreamResource,
   ],
   esm_entry_point = "ext:deno_node/02_init.js",
   esm = [
@@ -623,6 +626,7 @@ deno_core::extension!(deno_node,
     "path/mod.ts",
     "path/separator.ts",
     "readline/promises.ts",
+    "internal/js_stream_socket.ts",
     "node:_http_agent" = "_http_agent.mjs",
     "node:_http_common" = "_http_common.ts",
     "node:_http_outgoing" = "_http_outgoing.ts",

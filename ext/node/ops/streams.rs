@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
@@ -30,19 +31,37 @@ fn get<'s>(
   stream.get(scope, prop)
 }
 
-pub struct NodeStreamResource {
+unsafe impl Send for NodeStreamResource {}
+unsafe impl Sync for NodeStreamResource {}
+
+pub struct NodeStreamResourceInner {
   read_fn: v8::TracedReference<v8::Function>,
   write_fn: v8::TracedReference<v8::Function>,
   stream: v8::TracedReference<v8::Object>,
   context: v8::Global<v8::Context>,
   isolate: *mut v8::Isolate,
-  readable: AtomicBool,
-  waker: AtomicWaker,
-  excess_buf: Mutex<ExcessBuf>,
-  has_excess_buf: AtomicBool,
+  pub(crate) readable: AtomicBool,
+  pub(crate) waker: AtomicWaker,
+  pub(crate) excess_buf: Mutex<ExcessBuf>,
+  pub(crate) has_excess_buf: AtomicBool,
 }
 
-struct ExcessBuf {
+#[derive(Clone)]
+pub struct NodeStreamResource {
+  pub(crate) inner: Arc<NodeStreamResourceInner>,
+}
+
+impl std::fmt::Debug for NodeStreamResource {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("NodeStreamResource")
+      .field("readable", &self.inner.readable)
+      .field("waker", &self.inner.waker)
+      .field("has_excess_buf", &self.inner.has_excess_buf)
+      .finish()
+  }
+}
+
+pub(crate) struct ExcessBuf {
   buf: Vec<u8>,
   index: usize,
 }
@@ -74,7 +93,18 @@ impl ExcessBuf {
   }
 }
 
-impl GarbageCollected for NodeStreamResource {}
+impl GarbageCollected for NodeStreamResource {
+  fn trace(&self, visitor: &v8::cppgc::Visitor) {
+    self.inner.trace(visitor);
+  }
+}
+impl GarbageCollected for NodeStreamResourceInner {
+  fn trace(&self, visitor: &v8::cppgc::Visitor) {
+    visitor.trace(&self.read_fn);
+    visitor.trace(&self.write_fn);
+    visitor.trace(&self.stream);
+  }
+}
 
 #[op2]
 impl NodeStreamResource {
@@ -86,6 +116,7 @@ impl NodeStreamResource {
     stream: v8::Local<'a, v8::Object>,
   ) -> NodeStreamResource {
     // stream.get(scope, READ)
+    eprintln!("new NodeStreamResource");
     let read_fn = get(scope, stream, READ)
       .unwrap()
       .try_cast::<v8::Function>()
@@ -102,17 +133,30 @@ impl NodeStreamResource {
     let readable = AtomicBool::new(false);
     let waker = AtomicWaker::new();
     let excess_buf = Mutex::new(ExcessBuf::new());
+    eprintln!("made new NodeStreamResource");
     NodeStreamResource {
-      read_fn,
-      write_fn,
-      stream,
-      context,
-      isolate,
-      readable,
-      waker,
-      excess_buf,
-      has_excess_buf: AtomicBool::new(false),
+      inner: Arc::new(NodeStreamResourceInner {
+        read_fn,
+        write_fn,
+        stream,
+        context,
+        isolate,
+        readable,
+        waker,
+        excess_buf,
+        has_excess_buf: AtomicBool::new(false),
+      }),
     }
+  }
+
+  #[fast]
+  pub fn wake_readable(&self) {
+    eprintln!("wake_readable");
+    self
+      .inner
+      .readable
+      .store(true, std::sync::atomic::Ordering::SeqCst);
+    self.inner.waker.wake();
   }
 
   // pub fn read(
@@ -126,13 +170,15 @@ impl NodeStreamResource {
 
 impl NodeStreamResource {
   pub fn try_read(&self, mut buf: impl BufMut) -> usize {
+    eprintln!("try_read: {:?}", buf.remaining_mut());
+    let me = &self.inner;
     {
       if buf.remaining_mut() > 0
-        && self
+        && me
           .has_excess_buf
           .swap(false, std::sync::atomic::Ordering::SeqCst)
       {
-        let mut excess_buf = self.excess_buf.lock();
+        let mut excess_buf = me.excess_buf.lock();
         let len = excess_buf.as_slice().len();
         if len > 0 {
           let slice = excess_buf.as_slice();
@@ -140,8 +186,7 @@ impl NodeStreamResource {
           let to_copy = std::cmp::min(len, remaining);
           buf.put_slice(&slice[..to_copy]);
           let done = excess_buf.consume(to_copy);
-          self
-            .has_excess_buf
+          me.has_excess_buf
             .store(done, std::sync::atomic::Ordering::SeqCst);
           if to_copy == remaining {
             return to_copy;
@@ -150,10 +195,10 @@ impl NodeStreamResource {
       }
     }
 
-    let isolate: &mut v8::Isolate = unsafe { &mut *self.isolate };
-    let scope = &mut v8::HandleScope::with_context(isolate, &self.context);
-    let stream = self.stream.get(scope).unwrap();
-    let read_fn = self.read_fn.get(scope).unwrap();
+    let isolate: &mut v8::Isolate = unsafe { &mut *me.isolate };
+    let scope = &mut v8::HandleScope::with_context(isolate, &me.context);
+    let stream = me.stream.get(scope).unwrap();
+    let read_fn = me.read_fn.get(scope).unwrap();
     let result = read_fn.call(scope, stream.into(), &[]).unwrap();
     if result.is_null_or_undefined() {
       return 0;
@@ -169,13 +214,36 @@ impl NodeStreamResource {
       return to_copy;
     }
     if len > remaining {
-      let mut excess_buf = self.excess_buf.lock();
+      let mut excess_buf = me.excess_buf.lock();
       excess_buf.extend_from_slice(&slice[remaining..]);
-      self
-        .has_excess_buf
+      me.has_excess_buf
         .store(true, std::sync::atomic::Ordering::SeqCst);
     }
     len
+  }
+
+  pub fn try_write(&self, buf: &[u8]) -> usize {
+    let scope = &mut self.get_scope();
+    let stream = self.inner.stream.get(scope).unwrap();
+    let write_fn = self.inner.write_fn.get(scope).unwrap();
+    let backing_store =
+      v8::ArrayBuffer::new_backing_store_from_boxed_slice(buf.into());
+    let shared = v8::SharedRef::from(backing_store);
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &shared);
+    let buffer = v8::Uint8Array::new(scope, buffer, 0, buf.len()).unwrap();
+    let result = write_fn
+      .call(scope, stream.into(), &[buffer.into()])
+      .unwrap();
+    if result.is_null_or_undefined() {
+      return 0;
+    }
+    let _result = result.cast::<v8::Boolean>();
+    buf.len()
+  }
+
+  fn get_scope(&self) -> v8::HandleScope {
+    let isolate: &mut v8::Isolate = unsafe { &mut *self.inner.isolate };
+    v8::HandleScope::with_context(isolate, &self.inner.context)
   }
 }
 
@@ -185,12 +253,15 @@ impl AsyncRead for NodeStreamResource {
     cx: &mut Context<'_>,
     buf: &mut tokio::io::ReadBuf<'_>,
   ) -> Poll<Result<(), std::io::Error>> {
-    self.waker.register(cx.waker());
+    eprintln!("poll_read: {:?}", buf.remaining_mut());
+    self.inner.waker.register(cx.waker());
 
     if self
+      .inner
       .has_excess_buf
       .load(std::sync::atomic::Ordering::SeqCst)
       || self
+        .inner
         .readable
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
@@ -212,18 +283,35 @@ impl AsyncWrite for NodeStreamResource {
     _cx: &mut Context<'_>,
     buf: &[u8],
   ) -> Poll<Result<usize, std::io::Error>> {
-    todo!()
+    let written = self.try_write(buf);
+    Poll::Ready(Ok(written))
   }
   fn poll_flush(
     self: Pin<&mut Self>,
-    cx: &mut Context<'_>,
+    _cx: &mut Context<'_>,
   ) -> Poll<Result<(), std::io::Error>> {
-    todo!()
+    Poll::Ready(Ok(()))
   }
   fn poll_shutdown(
     self: Pin<&mut Self>,
-    cx: &mut Context<'_>,
+    _cx: &mut Context<'_>,
   ) -> Poll<Result<(), std::io::Error>> {
-    todo!()
+    Poll::Ready(Ok(()))
   }
+}
+
+//
+
+struct StreamReq {}
+
+pub trait StreamListener {
+  fn on_stream_alloc(&self, suggested_size: usize) -> Buf;
+  fn on_stream_read(&self, buf: &Buf);
+  fn on_stream_after_write(&self, buf: &Buf);
+  fn on_stream_close(&self);
+}
+
+pub struct Buf {
+  ptr: *mut u8,
+  len: usize,
 }

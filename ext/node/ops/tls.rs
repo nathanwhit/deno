@@ -1,5 +1,6 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 use base64::Engine;
+use deno_core::futures::FutureExt;
 use deno_core::op2;
 use webpki_root_certs;
 
@@ -89,54 +90,176 @@ pub fn op_get_root_certificates() -> Vec<String> {
 pub(crate) const TLS_BUFFER_SIZE: Option<NonZeroUsize> =
   NonZeroUsize::new(65536);
 
-pub struct TlsListener {
-  pub(crate) tcp_listener: TcpListener,
-  pub(crate) tls_config: Option<Arc<ServerConfig>>,
-  pub(crate) server_config_provider: Option<ServerConfigProvider>,
-}
+// pub struct TlsListener {
+//   pub(crate) tcp_listener: TcpListener,
+//   pub(crate) tls_config: Option<Arc<ServerConfig>>,
+//   pub(crate) server_config_provider: Option<ServerConfigProvider>,
+// }
 
-enum TcpOrStream {
+#[derive(Debug)]
+pub enum TcpOrStream {
   Tcp(TcpStream),
   Stream(crate::ops::streams::NodeStreamResource),
 }
 
-
-
-
-impl TlsListener {
-  pub async fn accept(&self) -> std::io::Result<(TlsStream, SocketAddr)> {
-    let (tcp, addr) = self.tcp_listener.accept().await?;
-    let tls = if let Some(provider) = &self.server_config_provider {
-      TlsStream::new_server_side_acceptor(
-        tcp,
-        provider.clone(),
-        TLS_BUFFER_SIZE,
-      )
+impl rustls_tokio_stream::UnderlyingStream
+  for crate::ops::streams::NodeStreamResource
+{
+  fn poll_read_ready(
+    &self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    eprintln!("poll_read_ready");
+    self.inner.waker.register(cx.waker());
+    if self
+      .inner
+      .readable
+      .load(std::sync::atomic::Ordering::SeqCst)
+    {
+      std::task::Poll::Ready(Ok(()))
     } else {
-      TlsStream::new_server_side(
-        tcp,
-        self.tls_config.clone().unwrap(),
-        TLS_BUFFER_SIZE,
-      )
-    };
-    Ok((tls, addr))
+      std::task::Poll::Pending
+    }
   }
-  pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-    self.tcp_listener.local_addr()
+
+  fn poll_write_ready(
+    &self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    eprintln!("poll_write_ready");
+    std::task::Poll::Ready(Ok(()))
+  }
+
+  fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    Ok(self.try_read(buf))
+  }
+
+  fn try_write(&self, buf: &[u8]) -> std::io::Result<usize> {
+    Ok(self.try_write(buf))
+  }
+
+  fn readable(
+    &self,
+  ) -> impl std::prelude::rust_2024::Future<Output = std::io::Result<()>> + Send
+  {
+    eprintln!("readable");
+    std::future::ready(Ok(()))
+  }
+
+  fn writable(
+    &self,
+  ) -> impl std::prelude::rust_2024::Future<Output = std::io::Result<()>> + Send
+  {
+    eprintln!("writable");
+    std::future::ready(Ok(()))
+  }
+
+  fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+    Ok(())
   }
 }
 
+impl rustls_tokio_stream::UnderlyingStream for TcpOrStream {
+  fn poll_read_ready(
+    &self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.poll_read_ready(cx),
+      TcpOrStream::Stream(stream) => stream.poll_read_ready(cx),
+    }
+  }
+
+  fn poll_write_ready(
+    &self,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.poll_write_ready(cx),
+      TcpOrStream::Stream(stream) => stream.poll_write_ready(cx),
+    }
+  }
+
+  fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.try_read(buf),
+      TcpOrStream::Stream(stream) => Ok(stream.try_read(buf)),
+    }
+  }
+
+  fn try_write(&self, buf: &[u8]) -> std::io::Result<usize> {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.try_write(buf),
+      TcpOrStream::Stream(stream) => Ok(stream.try_write(buf)),
+    }
+  }
+
+  fn readable(
+    &self,
+  ) -> impl std::prelude::rust_2024::Future<Output = std::io::Result<()>> + Send
+  {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.readable().boxed(),
+      TcpOrStream::Stream(stream) => stream.readable().boxed(),
+    }
+  }
+
+  fn writable(
+    &self,
+  ) -> impl std::prelude::rust_2024::Future<Output = std::io::Result<()>> + Send
+  {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.writable().boxed(),
+      TcpOrStream::Stream(stream) => stream.writable().boxed(),
+    }
+  }
+
+  fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+    match self {
+      TcpOrStream::Tcp(tcp) => tcp.shutdown(how),
+      TcpOrStream::Stream(stream) => stream.shutdown(how),
+    }
+  }
+}
+
+// impl TlsListener {
+//   pub async fn accept(
+//     &self,
+//   ) -> std::io::Result<(TlsStream<TcpOrStream>, SocketAddr)> {
+//     let (tcp, addr) = self.tcp_listener.accept().await?;
+//     let tls = if let Some(provider) = &self.server_config_provider {
+//       TlsStream::new_server_side_acceptor(
+//         tcp,
+//         provider.clone(),
+//         TLS_BUFFER_SIZE,
+//       )
+//     } else {
+//       TlsStream::new_server_side(
+//         tcp,
+//         self.tls_config.clone().unwrap(),
+//         TLS_BUFFER_SIZE,
+//       )
+//     };
+//     Ok((tls, addr))
+//   }
+//   pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+//     self.tcp_listener.local_addr()
+//   }
+// }
+
 #[derive(Debug)]
 pub struct TlsStreamResource {
-  rd: AsyncRefCell<TlsStreamRead>,
-  wr: AsyncRefCell<TlsStreamWrite>,
+  rd: AsyncRefCell<TlsStreamRead<TcpOrStream>>,
+  wr: AsyncRefCell<TlsStreamWrite<TcpOrStream>>,
   // `None` when a TLS handshake hasn't been done.
   handshake_info: RefCell<Option<TlsHandshakeInfo>>,
   cancel_handle: CancelHandle, // Only read and handshake ops get canceled.
 }
 
 impl TlsStreamResource {
-  pub fn new((rd, wr): (TlsStreamRead, TlsStreamWrite)) -> Self {
+  pub fn new(
+    (rd, wr): (TlsStreamRead<TcpOrStream>, TlsStreamWrite<TcpOrStream>),
+  ) -> Self {
     Self {
       rd: rd.into(),
       wr: wr.into(),
@@ -145,7 +268,9 @@ impl TlsStreamResource {
     }
   }
 
-  pub fn into_inner(self) -> (TlsStreamRead, TlsStreamWrite) {
+  pub fn into_inner(
+    self,
+  ) -> (TlsStreamRead<TcpOrStream>, TlsStreamWrite<TcpOrStream>) {
     (self.rd.into_inner(), self.wr.into_inner())
   }
 
@@ -218,10 +343,11 @@ pub struct ConnectTlsArgs {
   server_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StartTlsArgs {
   rid: ResourceId,
+
   ca_certs: Vec<String>,
   hostname: String,
   alpn_protocols: Option<Vec<String>>,
@@ -291,14 +417,13 @@ pub fn op_tls_cert_resolver_resolve_error(
 }
 
 #[op2(stack_trace)]
-#[serde]
-pub fn op_tls_start<NP>(
+#[smi]
+pub fn op_node_tls_start(
   state: Rc<RefCell<OpState>>,
+  #[cppgc] stream: Option<&crate::ops::streams::NodeStreamResource>,
   #[serde] args: StartTlsArgs,
-) -> Result<(ResourceId, IpAddr, IpAddr), NetError>
-where
-  NP: NetPermissions + 'static,
-{
+) -> Result<ResourceId, NetError> {
+  eprintln!("op_node_tls_start: {stream:?}, {args:?}");
   let rid = args.rid;
   let hostname = match &*args.hostname {
     "" => "localhost".to_string(),
@@ -325,21 +450,29 @@ where
     .root_cert_store()
     .map_err(NetError::RootCertStore)?;
 
-  let resource_rc = state
-    .borrow_mut()
-    .resource_table
-    .take::<TcpStreamResource>(rid)
-    .map_err(NetError::Resource)?;
+  let underlying = if let Some(stream) = stream {
+    TcpOrStream::Stream(stream.clone())
+  } else {
+    let resource_rc = state
+      .borrow_mut()
+      .resource_table
+      .take::<TcpStreamResource>(rid)
+      .map_err(NetError::Resource)?;
+
+    let resource =
+      Rc::try_unwrap(resource_rc).map_err(|_| NetError::TcpStreamBusy)?;
+    let (read_half, write_half) = resource.into_inner();
+    let tcp_stream =
+      read_half.reunite(write_half).map_err(NetError::Reunite)?;
+
+    // let local_addr = tcp_stream.local_addr()?;
+    // let remote_addr = tcp_stream.peer_addr()?;
+    TcpOrStream::Tcp(tcp_stream)
+  };
+
   // This TCP connection might be used somewhere else. If it's the case, we cannot proceed with the
   // process of starting a TLS connection on top of this TCP connection, so we just return a Busy error.
   // See also: https://github.com/denoland/deno/pull/16242
-  let resource =
-    Rc::try_unwrap(resource_rc).map_err(|_| NetError::TcpStreamBusy)?;
-  let (read_half, write_half) = resource.into_inner();
-  let tcp_stream = read_half.reunite(write_half).map_err(NetError::Reunite)?;
-
-  let local_addr = tcp_stream.local_addr()?;
-  let remote_addr = tcp_stream.peer_addr()?;
 
   let mut tls_config = create_client_config(
     root_cert_store,
@@ -356,7 +489,7 @@ where
 
   let tls_config = Arc::new(tls_config);
   let tls_stream = TlsStream::new_client_side(
-    tcp_stream,
+    underlying,
     ClientConnection::new(tls_config, hostname_dns)?,
     TLS_BUFFER_SIZE,
   );
@@ -368,219 +501,219 @@ where
       .add(TlsStreamResource::new(tls_stream.into_split()))
   };
 
-  Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
+  Ok(rid)
 }
 
-#[op2(async, stack_trace)]
-#[serde]
-pub async fn op_net_connect_tls<NP>(
-  state: Rc<RefCell<OpState>>,
-  #[serde] addr: IpAddr,
-  #[serde] args: ConnectTlsArgs,
-  #[cppgc] key_pair: &TlsKeysHolder,
-) -> Result<(ResourceId, IpAddr, IpAddr), NetError>
-where
-  NP: NetPermissions + 'static,
-{
-  let cert_file = args.cert_file.as_deref();
-  let unsafely_ignore_certificate_errors = state
-    .borrow()
-    .try_borrow::<UnsafelyIgnoreCertificateErrors>()
-    .and_then(|it| it.0.clone());
+// #[op2(async, stack_trace)]
+// #[serde]
+// pub async fn op_net_connect_tls<NP>(
+//   state: Rc<RefCell<OpState>>,
+//   #[serde] addr: IpAddr,
+//   #[serde] args: ConnectTlsArgs,
+//   #[cppgc] key_pair: &TlsKeysHolder,
+// ) -> Result<(ResourceId, IpAddr, IpAddr), NetError>
+// where
+//   NP: NetPermissions + 'static,
+// {
+//   let cert_file = args.cert_file.as_deref();
+//   let unsafely_ignore_certificate_errors = state
+//     .borrow()
+//     .try_borrow::<UnsafelyIgnoreCertificateErrors>()
+//     .and_then(|it| it.0.clone());
 
-  let cert_file = {
-    let mut s = state.borrow_mut();
-    let permissions = s.borrow_mut::<NP>();
-    permissions
-      .check_net(&(&addr.hostname, Some(addr.port)), "Deno.connectTls()")
-      .map_err(NetError::Permission)?;
-    if let Some(path) = cert_file {
-      Some(
-        permissions
-          .check_read(path, "Deno.connectTls()")
-          .map_err(NetError::Permission)?,
-      )
-    } else {
-      None
-    }
-  };
+//   let cert_file = {
+//     let mut s = state.borrow_mut();
+//     let permissions = s.borrow_mut::<NP>();
+//     permissions
+//       .check_net(&(&addr.hostname, Some(addr.port)), "Deno.connectTls()")
+//       .map_err(NetError::Permission)?;
+//     if let Some(path) = cert_file {
+//       Some(
+//         permissions
+//           .check_read(path, "Deno.connectTls()")
+//           .map_err(NetError::Permission)?,
+//       )
+//     } else {
+//       None
+//     }
+//   };
 
-  let mut ca_certs = args
-    .ca_certs
-    .into_iter()
-    .map(|s| s.into_bytes())
-    .collect::<Vec<_>>();
+//   let mut ca_certs = args
+//     .ca_certs
+//     .into_iter()
+//     .map(|s| s.into_bytes())
+//     .collect::<Vec<_>>();
 
-  if let Some(path) = cert_file {
-    let mut buf = Vec::new();
-    File::open(path)?.read_to_end(&mut buf)?;
-    ca_certs.push(buf);
-  };
+//   if let Some(path) = cert_file {
+//     let mut buf = Vec::new();
+//     File::open(path)?.read_to_end(&mut buf)?;
+//     ca_certs.push(buf);
+//   };
 
-  let root_cert_store = state
-    .borrow()
-    .borrow::<DefaultTlsOptions>()
-    .root_cert_store()
-    .map_err(NetError::RootCertStore)?;
-  let hostname_dns = if let Some(server_name) = args.server_name {
-    ServerName::try_from(server_name)
-  } else {
-    ServerName::try_from(addr.hostname.clone())
-  }
-  .map_err(|_| NetError::InvalidHostname(addr.hostname.clone()))?;
-  let connect_addr = resolve_addr(&addr.hostname, addr.port)
-    .await?
-    .next()
-    .ok_or_else(|| NetError::NoResolvedAddress)?;
-  let tcp_stream = TcpStream::connect(connect_addr).await?;
-  let local_addr = tcp_stream.local_addr()?;
-  let remote_addr = tcp_stream.peer_addr()?;
+//   let root_cert_store = state
+//     .borrow()
+//     .borrow::<DefaultTlsOptions>()
+//     .root_cert_store()
+//     .map_err(NetError::RootCertStore)?;
+//   let hostname_dns = if let Some(server_name) = args.server_name {
+//     ServerName::try_from(server_name)
+//   } else {
+//     ServerName::try_from(addr.hostname.clone())
+//   }
+//   .map_err(|_| NetError::InvalidHostname(addr.hostname.clone()))?;
+//   let connect_addr = resolve_addr(&addr.hostname, addr.port)
+//     .await?
+//     .next()
+//     .ok_or_else(|| NetError::NoResolvedAddress)?;
+//   let tcp_stream = TcpStream::connect(connect_addr).await?;
+//   let local_addr = tcp_stream.local_addr()?;
+//   let remote_addr = tcp_stream.peer_addr()?;
 
-  let mut tls_config = create_client_config(
-    root_cert_store,
-    ca_certs,
-    unsafely_ignore_certificate_errors,
-    key_pair.take(),
-    SocketUse::GeneralSsl,
-  )?;
+//   let mut tls_config = create_client_config(
+//     root_cert_store,
+//     ca_certs,
+//     unsafely_ignore_certificate_errors,
+//     key_pair.take(),
+//     SocketUse::GeneralSsl,
+//   )?;
 
-  if let Some(alpn_protocols) = args.alpn_protocols {
-    tls_config.alpn_protocols =
-      alpn_protocols.into_iter().map(|s| s.into_bytes()).collect();
-  }
+//   if let Some(alpn_protocols) = args.alpn_protocols {
+//     tls_config.alpn_protocols =
+//       alpn_protocols.into_iter().map(|s| s.into_bytes()).collect();
+//   }
 
-  let tls_config = Arc::new(tls_config);
+//   let tls_config = Arc::new(tls_config);
 
-  let tls_stream = TlsStream::new_client_side(
-    tcp_stream,
-    ClientConnection::new(tls_config, hostname_dns)?,
-    TLS_BUFFER_SIZE,
-  );
+//   let tls_stream = TlsStream::new_client_side(
+//     tcp_stream,
+//     ClientConnection::new(tls_config, hostname_dns)?,
+//     TLS_BUFFER_SIZE,
+//   );
 
-  let rid = {
-    let mut state_ = state.borrow_mut();
-    state_
-      .resource_table
-      .add(TlsStreamResource::new(tls_stream.into_split()))
-  };
+//   let rid = {
+//     let mut state_ = state.borrow_mut();
+//     state_
+//       .resource_table
+//       .add(TlsStreamResource::new(tls_stream.into_split()))
+//   };
 
-  Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
-}
+//   Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
+// }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListenTlsArgs {
-  alpn_protocols: Option<Vec<String>>,
-  reuse_port: bool,
-  #[serde(default)]
-  load_balanced: bool,
-}
+// #[derive(Deserialize)]
+// #[serde(rename_all = "camelCase")]
+// pub struct ListenTlsArgs {
+//   alpn_protocols: Option<Vec<String>>,
+//   reuse_port: bool,
+//   #[serde(default)]
+//   load_balanced: bool,
+// }
 
-#[op2(stack_trace)]
-#[serde]
-pub fn op_net_listen_tls<NP>(
-  state: &mut OpState,
-  #[serde] addr: IpAddr,
-  #[serde] args: ListenTlsArgs,
-  #[cppgc] keys: &TlsKeysHolder,
-) -> Result<(ResourceId, IpAddr), NetError>
-where
-  NP: NetPermissions + 'static,
-{
-  if args.reuse_port {
-    super::check_unstable(state, "Deno.listenTls({ reusePort: true })");
-  }
+// #[op2(stack_trace)]
+// #[serde]
+// pub fn op_net_listen_tls<NP>(
+//   state: &mut OpState,
+//   #[serde] addr: IpAddr,
+//   #[serde] args: ListenTlsArgs,
+//   #[cppgc] keys: &TlsKeysHolder,
+// ) -> Result<(ResourceId, IpAddr), NetError>
+// where
+//   NP: NetPermissions + 'static,
+// {
+//   if args.reuse_port {
+//     super::check_unstable(state, "Deno.listenTls({ reusePort: true })");
+//   }
 
-  {
-    let permissions = state.borrow_mut::<NP>();
-    permissions
-      .check_net(&(&addr.hostname, Some(addr.port)), "Deno.listenTls()")
-      .map_err(NetError::Permission)?;
-  }
+//   {
+//     let permissions = state.borrow_mut::<NP>();
+//     permissions
+//       .check_net(&(&addr.hostname, Some(addr.port)), "Deno.listenTls()")
+//       .map_err(NetError::Permission)?;
+//   }
 
-  let bind_addr = resolve_addr_sync(&addr.hostname, addr.port)?
-    .next()
-    .ok_or(NetError::NoResolvedAddress)?;
+//   let bind_addr = resolve_addr_sync(&addr.hostname, addr.port)?
+//     .next()
+//     .ok_or(NetError::NoResolvedAddress)?;
 
-  let tcp_listener = if args.load_balanced {
-    TcpListener::bind_load_balanced(bind_addr)
-  } else {
-    TcpListener::bind_direct(bind_addr, args.reuse_port)
-  }?;
-  let local_addr = tcp_listener.local_addr()?;
-  let alpn = args
-    .alpn_protocols
-    .unwrap_or_default()
-    .into_iter()
-    .map(|s| s.into_bytes())
-    .collect();
-  let listener = match keys.take() {
-    TlsKeys::Null => return Err(NetError::ListenTlsRequiresKey),
-    TlsKeys::Static(TlsKey(cert, key)) => {
-      let mut tls_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert, key)?;
-      tls_config.alpn_protocols = alpn;
-      TlsListener {
-        tcp_listener,
-        tls_config: Some(tls_config.into()),
-        server_config_provider: None,
-      }
-    }
-    TlsKeys::Resolver(resolver) => TlsListener {
-      tcp_listener,
-      tls_config: None,
-      server_config_provider: Some(resolver.into_server_config_provider(alpn)),
-    },
-  };
+//   let tcp_listener = if args.load_balanced {
+//     TcpListener::bind_load_balanced(bind_addr)
+//   } else {
+//     TcpListener::bind_direct(bind_addr, args.reuse_port)
+//   }?;
+//   let local_addr = tcp_listener.local_addr()?;
+//   let alpn = args
+//     .alpn_protocols
+//     .unwrap_or_default()
+//     .into_iter()
+//     .map(|s| s.into_bytes())
+//     .collect();
+//   let listener = match keys.take() {
+//     TlsKeys::Null => return Err(NetError::ListenTlsRequiresKey),
+//     TlsKeys::Static(TlsKey(cert, key)) => {
+//       let mut tls_config = ServerConfig::builder()
+//         .with_no_client_auth()
+//         .with_single_cert(cert, key)?;
+//       tls_config.alpn_protocols = alpn;
+//       TlsListener {
+//         tcp_listener,
+//         tls_config: Some(tls_config.into()),
+//         server_config_provider: None,
+//       }
+//     }
+//     TlsKeys::Resolver(resolver) => TlsListener {
+//       tcp_listener,
+//       tls_config: None,
+//       server_config_provider: Some(resolver.into_server_config_provider(alpn)),
+//     },
+//   };
 
-  let tls_listener_resource = NetworkListenerResource::new(listener);
+//   let tls_listener_resource = NetworkListenerResource::new(listener);
 
-  let rid = state.resource_table.add(tls_listener_resource);
+//   let rid = state.resource_table.add(tls_listener_resource);
 
-  Ok((rid, IpAddr::from(local_addr)))
-}
+//   Ok((rid, IpAddr::from(local_addr)))
+// }
+
+// #[op2(async)]
+// #[serde]
+// pub async fn op_net_accept_tls(
+//   state: Rc<RefCell<OpState>>,
+//   #[smi] rid: ResourceId,
+// ) -> Result<(ResourceId, IpAddr, IpAddr), NetError> {
+//   let resource = state
+//     .borrow()
+//     .resource_table
+//     .get::<NetworkListenerResource<TlsListener>>(rid)
+//     .map_err(|_| NetError::ListenerClosed)?;
+
+//   let cancel_handle = RcRef::map(&resource, |r| &r.cancel);
+//   let listener = RcRef::map(&resource, |r| &r.listener)
+//     .try_borrow_mut()
+//     .ok_or_else(|| NetError::AcceptTaskOngoing)?;
+
+//   let (tls_stream, remote_addr) =
+//     match listener.accept().try_or_cancel(&cancel_handle).await {
+//       Ok(tuple) => tuple,
+//       Err(err) if err.kind() == ErrorKind::Interrupted => {
+//         return Err(NetError::ListenerClosed);
+//       }
+//       Err(err) => return Err(err.into()),
+//     };
+
+//   let local_addr = tls_stream.local_addr()?;
+//   let rid = {
+//     let mut state_ = state.borrow_mut();
+//     state_
+//       .resource_table
+//       .add(TlsStreamResource::new(tls_stream.into_split()))
+//   };
+
+//   Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
+// }
 
 #[op2(async)]
 #[serde]
-pub async fn op_net_accept_tls(
-  state: Rc<RefCell<OpState>>,
-  #[smi] rid: ResourceId,
-) -> Result<(ResourceId, IpAddr, IpAddr), NetError> {
-  let resource = state
-    .borrow()
-    .resource_table
-    .get::<NetworkListenerResource<TlsListener>>(rid)
-    .map_err(|_| NetError::ListenerClosed)?;
-
-  let cancel_handle = RcRef::map(&resource, |r| &r.cancel);
-  let listener = RcRef::map(&resource, |r| &r.listener)
-    .try_borrow_mut()
-    .ok_or_else(|| NetError::AcceptTaskOngoing)?;
-
-  let (tls_stream, remote_addr) =
-    match listener.accept().try_or_cancel(&cancel_handle).await {
-      Ok(tuple) => tuple,
-      Err(err) if err.kind() == ErrorKind::Interrupted => {
-        return Err(NetError::ListenerClosed);
-      }
-      Err(err) => return Err(err.into()),
-    };
-
-  let local_addr = tls_stream.local_addr()?;
-  let rid = {
-    let mut state_ = state.borrow_mut();
-    state_
-      .resource_table
-      .add(TlsStreamResource::new(tls_stream.into_split()))
-  };
-
-  Ok((rid, IpAddr::from(local_addr), IpAddr::from(remote_addr)))
-}
-
-#[op2(async)]
-#[serde]
-pub async fn op_tls_handshake(
+pub async fn op_node_tls_handshake(
   state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
 ) -> Result<TlsHandshakeInfo, NetError> {

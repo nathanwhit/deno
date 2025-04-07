@@ -31,7 +31,22 @@ import {
   isAnyArrayBuffer,
   isArrayBufferView,
 } from "ext:deno_node/internal/util/types.ts";
+import {
+  NodeStreamResource,
+  op_node_tls_handshake,
+  op_node_tls_start,
+} from "ext:core/ops";
 
+import { Conn } from "ext:deno_net/01_net.js";
+
+import { core, primordials } from "ext:core/mod.js";
+
+import { JSStreamSocket } from "ext:deno_node/internal/js_stream_socket.ts";
+import { Duplex } from "node:stream";
+import console from "node:console";
+
+const { internalRidSymbol } = core;
+const { ObjectDefineProperty } = primordials;
 const kConnectOptions = Symbol("connect-options");
 const kIsVerified = Symbol("verified");
 const kPendingSession = Symbol("pendingSession");
@@ -59,6 +74,55 @@ function onConnectEnd(this: any) {
   }
 }
 
+class TlsConn extends Conn {
+  #rid = 0;
+
+  constructor(rid) {
+    super(rid);
+    ObjectDefineProperty(this, internalRidSymbol, {
+      __proto__: null,
+      enumerable: false,
+      value: rid,
+    });
+    this.#rid = rid;
+  }
+
+  handshake() {
+    return op_node_tls_handshake(this.#rid);
+  }
+}
+
+function startTls(
+  conn: number | Duplex,
+  {
+    hostname = "127.0.0.1",
+    caCerts = [],
+    alpnProtocols = undefined,
+  } = { __proto__: null },
+) {
+  console.error("startTls", conn);
+  let connn;
+  if (typeof conn === "number") {
+    connn = conn;
+  } else {
+    connn = new JSStreamSocket(conn);
+
+    conn.on("readable", () => {
+      console.error("readable");
+      connn.wakeReadable();
+    });
+  }
+  const rid = op_node_tls_start(
+    connn,
+    {
+      rid: typeof conn === "number" ? conn : 0,
+      hostname,
+      caCerts,
+      alpnProtocols,
+    },
+  );
+  return new TlsConn(rid);
+}
 export class TLSSocket extends net.Socket {
   _tlsOptions: any;
   _secureEstablished: boolean;
@@ -135,10 +199,25 @@ export class TLSSocket extends net.Socket {
     /** Wraps the given socket and adds the tls capability to the underlying
      * handle */
     function _wrapHandle(tlsOptions: any, wrap: net.Socket | undefined) {
+      console.error("wrapHandle", tlsOptions, wrap);
       let handle: any;
 
       if (wrap) {
-        handle = wrap._handle;
+        if (wrap instanceof net.Socket) {
+          handle = wrap._handle;
+        } else if (wrap instanceof Duplex) {
+          console.error(
+            "wrapHandle",
+            handle,
+            "wrap",
+            wrap,
+            wrap.read,
+            wrap.write,
+          );
+          handle = wrap;
+        } else {
+          handle = wrap._handle;
+        }
       }
 
       const options = tlsOptions;
@@ -152,6 +231,7 @@ export class TLSSocket extends net.Socket {
 
       // Set `afterConnectTls` hook. This is called in the `afterConnect` method of net.Socket
       handle.afterConnectTls = async () => {
+        console.error("afterConnectTls");
         options.hostname ??= undefined; // coerce to undefined if null, startTls expects hostname to be undefined
         if (tlssock._needsSockInitWorkaround) {
           // skips the TLS handshake for @npmcli/agent as it's handled by
@@ -162,7 +242,14 @@ export class TLSSocket extends net.Socket {
         }
 
         try {
-          const conn = await Deno.startTls(handle[kStreamBaseField], options);
+          console.error("startTls", handle);
+          const conn = startTls(
+            (kStreamBaseField in handle &&
+                internalRidSymbol in handle[kStreamBaseField])
+              ? handle[kStreamBaseField][internalRidSymbol]
+              : handle,
+            options,
+          );
           try {
             const hs = await conn.handshake();
             if (hs.alpnProtocol) {
@@ -179,6 +266,7 @@ export class TLSSocket extends net.Socket {
           handle[kStreamBaseField] = conn;
           handle.upgrading = false;
           if (!handle.pauseOnCreate) {
+            console.error("readStart", handle);
             handle.readStart();
           }
 
@@ -186,7 +274,8 @@ export class TLSSocket extends net.Socket {
 
           tlssock.emit("secure");
           tlssock.removeListener("end", onConnectEnd);
-        } catch {
+        } catch (e) {
+          console.error("startTls error", e);
           // TODO(kt3k): Handle this
         }
       };
@@ -244,6 +333,14 @@ export class TLSSocket extends net.Socket {
       subject: "localhost",
       subjectaltname: "IP Address:127.0.0.1, IP Address:::1",
     };
+  }
+
+  getCipher() {
+    return;
+  }
+
+  setMaxSendFragment(size: number) {
+    return;
   }
 }
 
@@ -488,4 +585,3 @@ export default {
   Server,
   unfqdn,
 };
-
