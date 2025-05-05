@@ -152,7 +152,7 @@ impl super::common::NpmPackageExtraInfoProvider for ExtraInfoProvider {
       return Ok(extra_info.clone());
     }
 
-    let extra_info = if expected.deprecated {
+    let extra_info = if expected.deprecated || expected.scripts {
       // we need the registry version info to get the deprecated string, since it's not in the
       // package's package.json
       self.fetch_from_registry(package_nv).await?
