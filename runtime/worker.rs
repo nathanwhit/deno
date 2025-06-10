@@ -228,11 +228,13 @@ pub struct WorkerOptions {
   /// provide JavaScript sources that were already snapshotted.
   pub extensions: Vec<Extension>,
 
+  pub extra_extensions: Vec<Extension>,
+
   /// V8 snapshot that should be loaded on startup.
   pub startup_snapshot: Option<&'static [u8]>,
 
   /// Should op registration be skipped?
-  pub skip_op_registration: bool,
+  pub op_registration: deno_core::OpRegistration,
 
   /// Optional isolate creation parameters, such as heap limits.
   pub create_params: Option<v8::CreateParams>,
@@ -269,7 +271,8 @@ impl Default for WorkerOptions {
       create_web_worker_cb: Arc::new(|_| {
         unimplemented!("web workers are not supported")
       }),
-      skip_op_registration: false,
+      op_registration: deno_core::OpRegistration::default(),
+      extra_extensions: Default::default(),
       seed: None,
       unsafely_ignore_certificate_errors: Default::default(),
       should_break_on_first_statement: Default::default(),
@@ -460,15 +463,17 @@ impl MainWorker {
       >(options.startup_snapshot.is_some(), false);
 
       extensions.extend(std::mem::take(&mut options.extensions));
+      let extra_extensions = std::mem::take(&mut options.extra_extensions);
 
       common_runtime(
         services.module_loader.clone(),
         options.startup_snapshot,
         options.create_params,
-        options.skip_op_registration,
+        options.op_registration,
         services.shared_array_buffer_store,
         services.compiled_wasm_module_store,
         extensions,
+        extra_extensions,
         op_metrics_factory_fn,
         options.enable_stack_trace_arg_in_ops,
       )
@@ -1096,10 +1101,11 @@ fn common_runtime(
   module_loader: Rc<dyn ModuleLoader>,
   startup_snapshot: Option<&'static [u8]>,
   create_params: Option<v8::CreateParams>,
-  skip_op_registration: bool,
+  op_registration: deno_core::OpRegistration,
   shared_array_buffer_store: Option<SharedArrayBufferStore>,
   compiled_wasm_module_store: Option<CompiledWasmModuleStore>,
   extensions: Vec<Extension>,
+  extra_extensions: Vec<Extension>,
   op_metrics_factory_fn: Option<OpMetricsFactoryFn>,
   enable_stack_trace_arg_in_ops: bool,
 ) -> JsRuntime {
@@ -1107,10 +1113,11 @@ fn common_runtime(
     module_loader: Some(module_loader),
     startup_snapshot,
     create_params,
-    skip_op_registration,
+    op_registration,
     shared_array_buffer_store,
     compiled_wasm_module_store,
     extensions,
+    extra_extensions,
     #[cfg(feature = "transpile")]
     extension_transpiler: Some(Rc::new(|specifier, source| {
       crate::transpile::maybe_transpile_source(specifier, source)
@@ -1167,13 +1174,13 @@ impl UnconfiguredRuntime {
     compiled_wasm_module_store: Option<CompiledWasmModuleStore>,
     additional_extensions: Vec<Extension>,
   ) -> Self {
-    let mut extensions = common_extensions::<
+    let extensions = common_extensions::<
       TInNpmPackageChecker,
       TNpmPackageFolderResolver,
       TExtNodeSys,
     >(true, true);
 
-    extensions.extend(additional_extensions);
+    let extra_extensions = additional_extensions;
 
     let module_loader =
       Rc::new(PlaceholderModuleLoader(std::cell::RefCell::new(None)));
@@ -1182,10 +1189,11 @@ impl UnconfiguredRuntime {
       module_loader.clone(),
       Some(startup_snapshot),
       create_params,
-      true,
+      deno_core::OpRegistration::SkipAll,
       shared_array_buffer_store,
       compiled_wasm_module_store,
       extensions,
+      extra_extensions,
       None,
       false,
     );

@@ -689,6 +689,7 @@ const NOT_IMPORTED_OPS = [
   "op_jupyter_get_buffer",
   // Used in jupyter API
   "op_base64_encode",
+  "op_deno_bundle",
 
   // Used in the lint API
   "op_lint_report",

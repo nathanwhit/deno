@@ -1126,6 +1126,7 @@ impl CliFactory {
       self.sys(),
       self.create_cli_main_worker_options()?,
       self.root_permissions_container()?.clone(),
+      self.flags.clone(),
     ))
   }
 

@@ -22,6 +22,7 @@ use sys_traits::EnvCurrentDir;
 use tokio::select;
 
 use crate::args::CliLockfile;
+use crate::args::Flags;
 use crate::npm::CliNpmInstaller;
 use crate::npm::CliNpmResolver;
 use crate::sys::CliSys;
@@ -321,6 +322,7 @@ pub struct CliMainWorkerFactory {
   sys: CliSys,
   default_npm_caching_strategy: NpmCachingStrategy,
   needs_test_modules: bool,
+  flags: Arc<Flags>,
 }
 
 impl CliMainWorkerFactory {
@@ -334,6 +336,7 @@ impl CliMainWorkerFactory {
     sys: CliSys,
     options: CliMainWorkerOptions,
     root_permissions: PermissionsContainer,
+    flags: Arc<Flags>,
   ) -> Self {
     Self {
       lib_main_worker_factory,
@@ -349,6 +352,7 @@ impl CliMainWorkerFactory {
       }),
       default_npm_caching_strategy: options.default_npm_caching_strategy,
       needs_test_modules: options.needs_test_modules,
+      flags,
     }
   }
 
@@ -392,7 +396,7 @@ impl CliMainWorkerFactory {
     mode: WorkerExecutionMode,
     main_module: ModuleSpecifier,
     permissions: PermissionsContainer,
-    custom_extensions: Vec<Extension>,
+    mut custom_extensions: Vec<Extension>,
     stdio: deno_runtime::deno_io::Stdio,
     unconfigured_runtime: Option<deno_runtime::UnconfiguredRuntime>,
   ) -> Result<CliMainWorker, CreateCustomWorkerError> {
@@ -445,6 +449,9 @@ impl CliMainWorkerFactory {
       main_module
     };
 
+    custom_extensions
+      .push(crate::ops::bundle::deno_bundle::init(self.flags.clone()));
+
     let mut worker = self.lib_main_worker_factory.create_custom_worker(
       mode,
       main_module,
@@ -453,16 +460,18 @@ impl CliMainWorkerFactory {
       stdio,
       unconfigured_runtime,
     )?;
+    macro_rules! test_file {
+      ($($file:literal),*) => {
+        $(worker.js_runtime().lazy_load_es_module_with_code(
+          concat!("ext:cli/", $file),
+          deno_core::ascii_str_include!(concat!("js/", $file)),
+        )?;)*
+      }
+    }
+
+    test_file!("bundle.js");
 
     if self.needs_test_modules {
-      macro_rules! test_file {
-        ($($file:literal),*) => {
-          $(worker.js_runtime().lazy_load_es_module_with_code(
-            concat!("ext:cli/", $file),
-            deno_core::ascii_str_include!(concat!("js/", $file)),
-          )?;)*
-        }
-      }
       test_file!(
         "40_test_common.js",
         "40_test.js",

@@ -636,6 +636,7 @@ impl<TSys: DenoLibSys> LibMainWorkerFactory<TSys> {
       v8_code_cache: shared.code_cache.clone(),
     };
 
+    let has_extra = !custom_extensions.is_empty();
     let options = WorkerOptions {
       bootstrap: BootstrapOptions {
         deno_version: crate::version::DENO_VERSION_INFO.deno.to_string(),
@@ -664,7 +665,8 @@ impl<TSys: DenoLibSys> LibMainWorkerFactory<TSys> {
         otel_config: shared.options.otel_config.clone(),
         close_on_idle: true,
       },
-      extensions: custom_extensions,
+      extensions: vec![],
+      extra_extensions: custom_extensions,
       startup_snapshot: shared.options.startup_snapshot,
       create_params: create_isolate_create_params(&shared.sys),
       unsafely_ignore_certificate_errors: shared
@@ -681,7 +683,15 @@ impl<TSys: DenoLibSys> LibMainWorkerFactory<TSys> {
       cache_storage_dir,
       origin_storage_dir,
       stdio,
-      skip_op_registration: shared.options.skip_op_registration,
+      op_registration: if shared.options.skip_op_registration {
+        if has_extra {
+          deno_core::OpRegistration::RegisterExtra
+        } else {
+          deno_core::OpRegistration::SkipAll
+        }
+      } else {
+        deno_core::OpRegistration::RegisterAll
+      },
       enable_stack_trace_arg_in_ops: has_trace_permissions_enabled(),
       unconfigured_runtime,
     };

@@ -464,7 +464,8 @@ pub struct CleanFlags {
   pub dry_run: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BundleFlags {
   pub entrypoints: Vec<String>,
   pub output_path: Option<String>,
@@ -477,7 +478,8 @@ pub struct BundleFlags {
   pub packages: PackageHandling,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum BundleFormat {
   Esm,
   Cjs,
@@ -494,7 +496,8 @@ impl std::fmt::Display for BundleFormat {
   }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PackageHandling {
   Bundle,
   External,
