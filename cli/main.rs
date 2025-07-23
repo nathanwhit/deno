@@ -24,6 +24,9 @@ mod type_checker;
 mod util;
 mod worker;
 
+// #[global_allocator]
+// static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod sys {
   #[allow(clippy::disallowed_types)] // ok, definition
   pub type CliSys = sys_traits::impls::RealSys;
