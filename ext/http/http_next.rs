@@ -8,6 +8,9 @@ use std::io;
 use std::pin::Pin;
 use std::ptr::null;
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::task::Poll;
+use std::task::ready;
 
 use cache_control::CacheControl;
 use deno_core::AsyncRefCell;
@@ -30,13 +33,21 @@ use deno_core::serde_v8::from_v8;
 use deno_core::unsync::JoinHandle;
 use deno_core::unsync::spawn;
 use deno_core::v8;
+use deno_core::v8_static_strings;
+use deno_error::JsErrorBox;
 use deno_error::JsErrorClass;
 use deno_net::ops_tls::TlsStream;
 use deno_net::raw::NetworkStream;
+use deno_net::resolve_addr::resolve_addr_sync;
+use deno_net::tcp::TcpListener;
 use deno_websocket::ws_create_server_stream;
 use fly_accept_encoding::Encoding;
+use http::response::Parts;
 use hyper::StatusCode;
+use hyper::body::Body;
+use hyper::body::Frame;
 use hyper::body::Incoming;
+use hyper::body::SizeHint;
 use hyper::header::ACCEPT_ENCODING;
 use hyper::header::CACHE_CONTROL;
 use hyper::header::CONTENT_ENCODING;
@@ -70,6 +81,7 @@ use crate::request_properties::HttpListenProperties;
 use crate::request_properties::HttpPropertyExtractor;
 use crate::response_body::Compression;
 use crate::response_body::ResponseBytesInner;
+use crate::response_body::ResponseStreamResult;
 use crate::service::HttpRecord;
 use crate::service::HttpRecordResponse;
 use crate::service::HttpRequestBodyAutocloser;
@@ -876,12 +888,15 @@ pub fn op_http_set_response_body_bytes(
   }
 }
 
-fn serve_http11_unconditional(
+fn serve_http11_unconditional<B: Body + 'static>(
   io: impl HttpServeStream,
-  svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
+  svc: impl HttpService<Incoming, ResBody = B> + 'static,
   cancel: Rc<CancelHandle>,
   http1_builder_hook: Option<fn(http1::Builder) -> http1::Builder>,
-) -> impl Future<Output = Result<(), hyper::Error>> + 'static {
+) -> impl Future<Output = Result<(), hyper::Error>> + 'static
+where
+  B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
   let mut builder = http1::Builder::new();
   builder.keep_alive(true).writev(*USE_WRITEV);
 
@@ -904,14 +919,17 @@ fn serve_http11_unconditional(
   }
 }
 
-fn serve_http2_unconditional(
+fn serve_http2_unconditional<B: Body + 'static>(
   io: impl HttpServeStream,
-  svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
+  svc: impl HttpService<Incoming, ResBody = B> + 'static,
   cancel: Rc<CancelHandle>,
   http2_builder_hook: Option<
     fn(http2::Builder<LocalExecutor>) -> http2::Builder<LocalExecutor>,
   >,
-) -> impl Future<Output = Result<(), hyper::Error>> + 'static {
+) -> impl Future<Output = Result<(), hyper::Error>> + 'static
+where
+  B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
   let mut builder = http2::Builder::new(LocalExecutor);
 
   if let Some(http2_builder_hook) = http2_builder_hook {
@@ -930,12 +948,15 @@ fn serve_http2_unconditional(
   }
 }
 
-async fn serve_http2_autodetect(
+async fn serve_http2_autodetect<B: Body + 'static>(
   io: impl HttpServeStream,
-  svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
+  svc: impl HttpService<Incoming, ResBody = B> + 'static,
   cancel: Rc<CancelHandle>,
   options: Options,
-) -> Result<(), HttpNextError> {
+) -> Result<(), HttpNextError>
+where
+  B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
   let prefix = NetworkStreamPrefixCheck::new(io, HTTP2_PREFIX);
   let (matches, io) = prefix.match_prefix().await?;
   if matches {
@@ -1497,3 +1518,361 @@ pub fn op_http_metric_handle_otel_error(external: *const c_void) {
 
   http.otel_info_set_error("user");
 }
+macro_rules! lazy_strings {
+  ($name: ident { $($field: ident = $value: expr),* }) => {
+    #[derive(Clone)]
+    struct $name {
+      $(
+        $field: v8::Global<v8::String>,
+      )*
+    }
+    impl $name {
+      fn new(scope: &mut v8::HandleScope) -> Self {
+        $(
+          let $field = v8::String::new_from_utf8(scope, $value.as_bytes(), v8::NewStringType::Internalized).unwrap();
+          let $field = v8::Global::new(scope, $field);
+        )*
+        Self {
+          $(
+            $field,
+          )*
+        }
+      }
+
+      fn get_or_init(scope: &mut v8::HandleScope, op_state: &mut deno_core::OpState) -> Self {
+        if let Some(strings) = op_state.try_borrow::<Self>() {
+          strings.clone()
+        } else {
+          let strings = Self::new(scope);
+          op_state.put(strings.clone());
+          strings
+        }
+      }
+
+      fn to_local<'scope>(string: &v8::Global<v8::String>, scope: &mut v8::HandleScope<'scope>) -> v8::Local<'scope, v8::String> {
+        v8::Local::new(scope, string)
+      }
+    }
+
+  }
+}
+v8_static_strings!(
+  HEADER_LIST = "headerList",
+  STATUS = "status",
+  STATUS_MESSAGE = "statusMessage",
+  TYPE = "type",
+  URL = "url",
+  URL_LIST = "urlList",
+  BODY = "body",
+  STREAM_OR_STATIC = "streamOrStatic",
+);
+
+lazy_strings!(Strings {
+  header_list = "headerList",
+  status = "status",
+  status_message = "statusMessage",
+  type_ = "type",
+  url = "url",
+  url_list = "urlList",
+  body = "body",
+  stream_or_static = "streamOrStatic"
+});
+
+#[op2(fast, reentrant)]
+pub fn op_serve2(
+  state: &mut OpState,
+  scope: &mut v8::HandleScope,
+  arg1: v8::Local<v8::Value>,
+  arg2: v8::Local<v8::Value>,
+) {
+  let strings = Strings::get_or_init(scope, state);
+  state.external_ops_tracker.ref_op();
+  serve(scope, strings, arg1, arg2);
+}
+
+fn serve(
+  scope: &mut v8::HandleScope,
+  strings: Strings,
+  arg1: v8::Local<v8::Value>,
+  arg2: v8::Local<v8::Value>,
+) {
+  let isolate: &mut v8::Isolate = scope.as_mut();
+  let isolate = isolate as *mut v8::Isolate;
+  let mut options: Option<v8::Local<v8::Object>> = None;
+  let mut handler: Option<v8::Local<v8::Function>> = None;
+
+  if arg1.is_function() {
+    handler = Some(arg1.cast::<v8::Function>());
+  } else if arg2.is_function() {
+    handler = Some(arg2.cast::<v8::Function>());
+    options = Some(arg2.cast::<v8::Object>());
+  } else {
+    options = Some(arg1.cast::<v8::Object>());
+  }
+  let load_balanced = false;
+
+  let addr = resolve_addr_sync("0.0.0.0", 8000).unwrap().next().unwrap();
+
+  let listener = if load_balanced {
+    TcpListener::bind_load_balanced(addr)
+  } else {
+    TcpListener::bind_direct(addr, false)
+  }
+  .unwrap();
+  let local_addr = listener.local_addr().unwrap();
+  let context = scope.get_current_context();
+  let context = v8::Global::new(scope, context);
+  let handler = v8::Global::new(scope, handler.unwrap());
+  serve_http_on_listener(listener, strings, handler, isolate, context);
+}
+
+fn serve_http_on_listener(
+  listener: TcpListener,
+  strings: Strings,
+  handler: v8::Global<v8::Function>,
+  isolate: *mut v8::Isolate,
+  context: v8::Global<v8::Context>,
+) -> JoinHandle<()> {
+  spawn(async move {
+    loop {
+      let (stream, addr) = listener.accept().await.unwrap();
+      let context = context.clone();
+      let handler = handler.clone();
+      let strings = strings.clone();
+      let svc = service_fn(move |req: Request| {
+        let context = context.clone();
+        let handler = handler.clone();
+        let strings = strings.clone();
+        async move {
+          let scope = &mut v8::HandleScope::new(unsafe { &mut *isolate });
+          let context = v8::Local::new(scope, context);
+          let scope = &mut v8::ContextScope::new(scope, context);
+          let recv = v8::null(scope).into();
+          let handler = v8::Local::new(scope, handler);
+          let response = handler.call(scope, recv, &[]).unwrap();
+          let global = v8::Global::new(scope, response);
+          let response = deno_core::JsRuntime::scoped_resolve(scope, global)
+            .await
+            .unwrap();
+          let response = v8::Local::new(scope, response);
+          Ok::<_, HttpNextError>(response_from_value(scope, &strings, response))
+        }
+      });
+      let connection_cancel_handle = CancelHandle::new_rc();
+      spawn(async move {
+        serve_http2_autodetect(
+          stream,
+          svc,
+          CancelHandle::new_rc(),
+          Options {
+            http2_builder_hook: None,
+            http1_builder_hook: None,
+            no_legacy_abort: true,
+          },
+        )
+        .try_or_cancel(connection_cancel_handle)
+        .await
+        .unwrap();
+      });
+    }
+  })
+}
+
+fn response_from_value(
+  scope: &mut v8::HandleScope,
+  strings: &Strings,
+  value: v8::Local<v8::Value>,
+) -> hyper::Response<Resp> {
+  let value = value.cast::<v8::Object>();
+
+  macro_rules! get {
+    ($value: ident . $name: ident) => {{
+      let name = Strings::to_local(&strings.$name, scope);
+      $value.get(scope, name.into())
+    }};
+    ($name: ident) => {{
+      let name = Strings::to_local(&strings.$name, scope);
+      value.get(scope, name.into())
+    }};
+  }
+  let header_list = get!(header_list);
+  let status = get!(status);
+  let status_message = get!(status_message);
+  let type_ = get!(type_);
+  let url = get!(url);
+  let url_list = get!(url_list);
+  let body = get!(body).unwrap();
+
+  let mut headers = HeaderMap::with_capacity(10);
+  if let Some(header_list) = header_list {
+    // [string,string][]
+    let header_list = header_list.cast::<v8::Array>();
+    for i in 0..header_list.length() {
+      let item = header_list.get_index(scope, i).unwrap();
+      let item = item.cast::<v8::Array>();
+      let name = item.get_index(scope, 0).unwrap().cast::<v8::String>();
+      let value = item.get_index(scope, 1).unwrap().cast::<v8::String>();
+      headers.insert(
+        http::HeaderName::from_bytes(
+          name.to_rust_string_lossy(scope).as_bytes(),
+        )
+        .unwrap(),
+        http::HeaderValue::from_bytes(
+          value.to_rust_string_lossy(scope).as_bytes(),
+        )
+        .unwrap(),
+      );
+    }
+  }
+  headers.insert(
+    HeaderName::from_static("vary"),
+    HeaderValue::from_static("accept-encoding"),
+  );
+
+  let status = status.unwrap().cast::<v8::Number>().value();
+  let (mut parts, _) = http::Response::new(()).into_parts();
+  parts.headers = headers;
+  parts.status = StatusCode::from_u16(status as u16).unwrap();
+  if body.is_null_or_undefined() {
+    return hyper::Response::from_parts(parts, Resp(RefCell::new(None)));
+  }
+  let body_obj = body.cast::<v8::Object>();
+  let stream_or_static = get!(body_obj.stream_or_static).unwrap();
+  if stream_or_static.is_null_or_undefined() {
+    return hyper::Response::from_parts(parts, Resp(RefCell::new(None)));
+  } else {
+    let stream_or_static = stream_or_static.cast::<v8::Object>();
+    let body = get!(stream_or_static.body).unwrap();
+    if body.is_string() {
+      let body = body.cast::<v8::String>().to_rust_string_lossy(scope);
+      hyper::Response::from_parts(
+        parts,
+        Resp(RefCell::new(Some(RespInner {
+          trailers: None,
+          response_body: ResponseBytesInner::Bytes(body.into_bytes().into()),
+        }))),
+      )
+    } else {
+      todo!()
+    }
+  }
+}
+
+// `None` variant used when no body is present, for example
+// when we want to return a synthetic 400 for invalid requests.
+pub struct Resp(pub(crate) RefCell<Option<RespInner>>);
+
+pub struct RespInner {
+  pub trailers: Option<HeaderMap>,
+  pub response_body: ResponseBytesInner,
+}
+
+impl Body for Resp {
+  type Data = BufView;
+  type Error = JsErrorBox;
+
+  fn poll_frame(
+    self: Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    use crate::response_body::PollFrame;
+    let mut thing = self.0.borrow_mut();
+    let Some(record) = thing.as_mut() else {
+      return Poll::Ready(None);
+    };
+
+    let res = loop {
+      let res = match &mut record.response_body {
+        ResponseBytesInner::Done | ResponseBytesInner::Empty => {
+          if let Some(trailers) = record.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+          }
+          unreachable!()
+        }
+        ResponseBytesInner::Bytes(..) => {
+          let bytes = std::mem::replace(
+            &mut record.response_body,
+            ResponseBytesInner::Done,
+          );
+          let ResponseBytesInner::Bytes(data) = bytes else {
+            unreachable!();
+          };
+          return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        ResponseBytesInner::UncompressedStream(stm) => {
+          ready!(Pin::new(stm).poll_frame(cx))
+        }
+        ResponseBytesInner::GZipStream(stm) => {
+          ready!(Pin::new(stm.as_mut()).poll_frame(cx))
+        }
+        ResponseBytesInner::BrotliStream(stm) => {
+          ready!(Pin::new(stm.as_mut()).poll_frame(cx))
+        }
+      };
+      // This is where we retry the NoData response
+      if matches!(res, ResponseStreamResult::NoData) {
+        continue;
+      }
+      break res;
+    };
+
+    if matches!(res, ResponseStreamResult::EndOfStream) {
+      if let Some(trailers) = record.trailers.take() {
+        return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+      }
+      record.response_body = ResponseBytesInner::Done;
+    }
+
+    // if let ResponseStreamResult::NonEmptyBuf(buf) = &res {
+    //   let mut http = record.0.borrow_mut();
+    //   if let Some(otel_info) = &mut http.as_mut().unwrap().otel_info {
+    //     if let Some(response_size) = &mut otel_info.response_size {
+    //       *response_size += buf.len() as u64;
+    //     }
+    //   }
+    // }
+
+    Poll::Ready(res.into())
+  }
+
+  fn is_end_stream(&self) -> bool {
+    let mut thing = self.0.borrow();
+    let Some(record) = thing.as_ref() else {
+      return true;
+    };
+    matches!(
+      record.response_body,
+      ResponseBytesInner::Done | ResponseBytesInner::Empty
+    ) && record.trailers.is_none()
+  }
+
+  fn size_hint(&self) -> SizeHint {
+    let mut thing = self.0.borrow();
+    let Some(record) = thing.as_ref() else {
+      return SizeHint::with_exact(0);
+    };
+    // The size hint currently only used in the case where it is exact bounds in hyper, but we'll pass it through
+    // anyways just in case hyper needs it.
+    record.response_body.size_hint()
+  }
+}
+
+impl Drop for Resp {
+  fn drop(&mut self) {
+    let mut thing = self.0.borrow_mut();
+    let Some(record) = thing.as_mut() else {
+      return;
+    };
+    // SAFETY: this ManuallyDrop is not used again.
+    // let record = unsafe { ManuallyDrop::take(record) };
+    // http_trace!(record, "HttpRecordResponse::drop");
+    // record.finish();
+  }
+}
+
+struct Context {}
+
+// fn make_callback(
+//   handler: v8::Local<v8::Function>,
+// ) -> impl FnOnce(Request) -> Response {
+// }

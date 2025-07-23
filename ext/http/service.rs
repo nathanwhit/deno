@@ -653,7 +653,7 @@ impl HttpRecord {
 // `None` variant used when no body is present, for example
 // when we want to return a synthetic 400 for invalid requests.
 #[repr(transparent)]
-pub struct HttpRecordResponse(Option<ManuallyDrop<Rc<HttpRecord>>>);
+pub struct HttpRecordResponse(pub(crate) Option<ManuallyDrop<Rc<HttpRecord>>>);
 
 impl Body for HttpRecordResponse {
   type Data = BufView;

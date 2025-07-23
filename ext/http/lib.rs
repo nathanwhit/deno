@@ -206,6 +206,7 @@ deno_core::extension!(
     op_http_write_resource,
     op_http_write,
     op_http_notify_serving,
+    http_next::op_serve2,
     http_next::op_http_close_after_finish,
     http_next::op_http_get_request_header,
     http_next::op_http_get_request_headers,

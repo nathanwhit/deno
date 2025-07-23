@@ -31,6 +31,7 @@ import {
   op_http_upgrade_raw,
   op_http_upgrade_websocket_next,
   op_http_wait,
+  op_serve2,
 } from "ext:core/ops";
 const {
   ArrayPrototypeFind,
@@ -744,124 +745,146 @@ function formatHostName(hostname: string): string {
 }
 
 function serve(arg1, arg2) {
-  let options: RawServeOptions | undefined;
-  let handler: RawHandler | undefined;
+  // let options: RawServeOptions | undefined;
+  // let handler: RawHandler | undefined;
 
-  if (typeof arg1 === "function") {
-    handler = arg1;
-  } else if (typeof arg2 === "function") {
-    handler = arg2;
-    options = arg1;
-  } else {
-    options = arg1;
-  }
-  if (handler === undefined) {
-    if (options === undefined) {
-      throw new TypeError(
-        "Cannot serve HTTP requests: either a `handler` or `options` must be specified",
-      );
+  // if (typeof arg1 === "function") {
+  //   handler = arg1;
+  // } else if (typeof arg2 === "function") {
+  //   handler = arg2;
+  //   options = arg1;
+  // } else {
+  //   options = arg1;
+  // }
+  // if (handler === undefined) {
+  //   if (options === undefined) {
+  //     throw new TypeError(
+  //       "Cannot serve HTTP requests: either a `handler` or `options` must be specified",
+  //     );
+  //   }
+  //   handler = options.handler;
+  // }
+  // if (typeof handler !== "function") {
+  //   throw new TypeError(
+  //     `Cannot serve HTTP requests: handler must be a function, received ${typeof handler}`,
+  //   );
+  // }
+  // if (options === undefined) {
+  //   options = { __proto__: null };
+  // }
+
+  // const {
+  //   0: overrideKind,
+  //   1: overrideHost,
+  //   2: overridePort,
+  //   3: duplicateListener,
+  // } = op_http_serve_address_override();
+  // if (overrideKind) {
+  //   let envOptions = duplicateListener ? { __proto__: null } : options;
+
+  //   switch (overrideKind) {
+  //     case 1: {
+  //       // TCP
+  //       envOptions = {
+  //         ...envOptions,
+  //         hostname: overrideHost,
+  //         port: overridePort,
+  //       };
+  //       delete envOptions.path;
+  //       delete envOptions.cid;
+  //       break;
+  //     }
+  //     case 2: {
+  //       // Unix
+  //       envOptions = {
+  //         ...envOptions,
+  //         path: overrideHost,
+  //       };
+  //       delete envOptions.hostname;
+  //       delete envOptions.cid;
+  //       delete envOptions.port;
+  //       break;
+  //     }
+  //     case 3: {
+  //       // Vsock
+  //       envOptions = {
+  //         ...envOptions,
+  //         cid: Number(overrideHost),
+  //         port: overridePort,
+  //       };
+  //       delete envOptions.hostname;
+  //       delete envOptions.path;
+  //       break;
+  //     }
+  //     case 4: {
+  //       // Tunnel
+  //       envOptions = {
+  //         ...envOptions,
+  //         tunnel: true,
+  //       };
+  //       delete envOptions.hostname;
+  //       delete envOptions.cid;
+  //       delete envOptions.port;
+  //       delete envOptions.path;
+  //     }
+  //   }
+
+  //   if (duplicateListener) {
+  //     envOptions.onListen = () => {
+  //       // override default console.log behavior
+  //     };
+  //     const envListener = serveInner(envOptions, handler);
+  //     const userListener = serveInner(options, handler);
+
+  //     return {
+  //       addr: userListener.addr,
+  //       finished: SafePromiseAll([envListener.finished, userListener.finished]),
+  //       shutdown() {
+  //         return SafePromiseAll([
+  //           envListener.shutdown(),
+  //           userListener.shutdown(),
+  //         ]);
+  //       },
+  //       ref() {
+  //         envListener.ref();
+  //         userListener.ref();
+  //       },
+  //       unref() {
+  //         envListener.unref();
+  //         userListener.unref();
+  //       },
+  //       [SymbolAsyncDispose]() {
+  //         return this.shutdown();
+  //       },
+  //     };
+  //   }
+
+  //   options = envOptions;
+  // }
+
+  // return serveInner(options, handler);
+
+  op_serve2(arg1, (...args: any[]) => {
+    const result = arg2(...args);
+    if ("then" in result) {
+      return result.then((response) => {
+        return toInnerResponse(response);
+      });
     }
-    handler = options.handler;
-  }
-  if (typeof handler !== "function") {
-    throw new TypeError(
-      `Cannot serve HTTP requests: handler must be a function, received ${typeof handler}`,
-    );
-  }
-  if (options === undefined) {
-    options = { __proto__: null };
-  }
+    return toInnerResponse(result);
+  });
+}
 
-  const {
-    0: overrideKind,
-    1: overrideHost,
-    2: overridePort,
-    3: duplicateListener,
-  } = op_http_serve_address_override();
-  if (overrideKind) {
-    let envOptions = duplicateListener ? { __proto__: null } : options;
-
-    switch (overrideKind) {
-      case 1: {
-        // TCP
-        envOptions = {
-          ...envOptions,
-          hostname: overrideHost,
-          port: overridePort,
-        };
-        delete envOptions.path;
-        delete envOptions.cid;
-        break;
-      }
-      case 2: {
-        // Unix
-        envOptions = {
-          ...envOptions,
-          path: overrideHost,
-        };
-        delete envOptions.hostname;
-        delete envOptions.cid;
-        delete envOptions.port;
-        break;
-      }
-      case 3: {
-        // Vsock
-        envOptions = {
-          ...envOptions,
-          cid: Number(overrideHost),
-          port: overridePort,
-        };
-        delete envOptions.hostname;
-        delete envOptions.path;
-        break;
-      }
-      case 4: {
-        // Tunnel
-        envOptions = {
-          ...envOptions,
-          tunnel: true,
-        };
-        delete envOptions.hostname;
-        delete envOptions.cid;
-        delete envOptions.port;
-        delete envOptions.path;
-      }
-    }
-
-    if (duplicateListener) {
-      envOptions.onListen = () => {
-        // override default console.log behavior
-      };
-      const envListener = serveInner(envOptions, handler);
-      const userListener = serveInner(options, handler);
-
-      return {
-        addr: userListener.addr,
-        finished: SafePromiseAll([envListener.finished, userListener.finished]),
-        shutdown() {
-          return SafePromiseAll([
-            envListener.shutdown(),
-            userListener.shutdown(),
-          ]);
-        },
-        ref() {
-          envListener.ref();
-          userListener.ref();
-        },
-        unref() {
-          envListener.unref();
-          userListener.unref();
-        },
-        [SymbolAsyncDispose]() {
-          return this.shutdown();
-        },
-      };
-    }
-
-    options = envOptions;
-  }
-
-  return serveInner(options, handler);
+function flatten(innerResponse: any) {
+  return [
+    innerResponse.body,
+    innerResponse.headerList,
+    innerResponse.status,
+    innerResponse.statusMessage,
+    innerResponse.type,
+    innerResponse.url,
+    innerResponse.urlList,
+  ];
 }
 
 function serveInner(options, handler) {

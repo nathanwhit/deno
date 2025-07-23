@@ -1614,6 +1614,7 @@ dependencies = [
  "malva",
  "markup_fmt",
  "memchr",
+ "mimalloc",
  "nix 0.27.1",
  "node_resolver",
  "notify",
@@ -5575,6 +5576,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ec2a862134d2a7d32d7983ddcdd1c4923530833c9f2ea1a44fc5fa473989058"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.42"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5814,6 +5823,13 @@ dependencies = [
  "log",
  "objc",
  "paste",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.46"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
