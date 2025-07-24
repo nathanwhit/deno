@@ -8,6 +8,8 @@ const {
   internalRidSymbol,
 } = core;
 import {
+  op_get_inner_request_url,
+  op_get_inner_request_header_list,
   op_http_cancel,
   op_http_close,
   op_http_close_after_finish,
@@ -864,8 +866,11 @@ function serve(arg1, arg2) {
 
   // return serveInner(options, handler);
 
-  op_serve2(arg1, (...args: any[]) => {
-    const result = arg2(...args);
+  op_serve2(arg1, (reqId) => {
+    const req = new NewInnerRequest(reqId);
+    const r = fromInnerRequest(req, "immutable");
+    req.request = r;
+    const result = arg2(r);
     if ("then" in result) {
       return result.then((response) => {
         return toInnerResponse(response);
@@ -873,6 +878,22 @@ function serve(arg1, arg2) {
     }
     return toInnerResponse(result);
   });
+}
+
+class NewInnerRequest {
+  constructor(private requestId: number) {}
+
+  get url() {
+    return getInnerRequestUrl(this.requestId);
+  }
+
+  get headerList() {
+    return op_get_inner_request_header_list(this.requestId);
+  }
+}
+
+function getInnerRequestUrl(requestId: number) {
+  return op_get_inner_request_url(requestId);
 }
 
 function flatten(innerResponse: any) {

@@ -1632,6 +1632,7 @@ fn serve_http_on_listener(
   handler: v8::Global<v8::Function>,
   isolate: *mut v8::Isolate,
   context: v8::Global<v8::Context>,
+  request_storage: RequestStorage,
 ) -> JoinHandle<()> {
   spawn(async move {
     loop {
@@ -1639,17 +1640,31 @@ fn serve_http_on_listener(
       let context = context.clone();
       let handler = handler.clone();
       let strings = strings.clone();
+      let request_storage = request_storage.clone();
       let svc = service_fn(move |req: Request| {
         let context = context.clone();
         let handler = handler.clone();
         let strings = strings.clone();
+        let request_storage = request_storage.clone();
         async move {
           let scope = &mut v8::HandleScope::new(unsafe { &mut *isolate });
           let context = v8::Local::new(scope, context);
           let scope = &mut v8::ContextScope::new(scope, context);
           let recv = v8::null(scope).into();
           let handler = v8::Local::new(scope, handler);
-          let response = handler.call(scope, recv, &[]).unwrap();
+
+          let inner_request = RequestData {
+            url: String::new(),
+            header_list: Vec::new(),
+          };
+          let request_id =
+            request_storage.requests.borrow_mut().insert(inner_request);
+
+          let request_id_number = v8::Number::new(scope, request_id as f64);
+
+          let response = handler
+            .call(scope, recv, &[request_id_number.into()])
+            .unwrap();
           let global = v8::Global::new(scope, response);
           let response = deno_core::JsRuntime::scoped_resolve(scope, global)
             .await
@@ -1676,6 +1691,58 @@ fn serve_http_on_listener(
       });
     }
   })
+}
+
+struct RequestData {
+  url: String,
+  header_list: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestStorage {
+  requests: Rc<RefCell<slab::Slab<RequestData>>>,
+}
+
+impl RequestStorage {
+  pub fn new() -> Self {
+    Self {
+      requests: Rc::new(RefCell::new(slab::Slab::new())),
+    }
+  }
+}
+
+#[op2]
+#[string]
+pub fn op_get_inner_request_url(
+  state: &mut OpState,
+  #[smi] request_id: u32,
+) -> String {
+  let Some(storage) = state.try_borrow::<RequestStorage>() else {
+    return String::new();
+  };
+  storage
+    .requests
+    .borrow()
+    .get(request_id as usize)
+    .map(|r| r.url.clone())
+    .unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+pub fn op_get_inner_request_header_list(
+  state: &mut OpState,
+  #[smi] request_id: u32,
+) -> Vec<(String, String)> {
+  let Some(storage) = state.try_borrow::<RequestStorage>() else {
+    return Vec::new();
+  };
+  storage
+    .requests
+    .borrow()
+    .get(request_id as usize)
+    .map(|r| r.header_list.clone())
+    .unwrap_or_default()
 }
 
 fn response_from_value(

@@ -52,6 +52,7 @@ phf.workspace = true
 pin-project.workspace = true
 scopeguard.workspace = true
 serde.workspace = true
+slab.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
