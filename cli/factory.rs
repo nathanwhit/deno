@@ -1261,7 +1261,7 @@ fn new_workspace_factory_options(
         | DenoSubcommand::Remove(_)
         | DenoSubcommand::Init(_)
         | DenoSubcommand::Outdated(_)
-        | DenoSubcommand::Clean(_)
+        | DenoSubcommand::Clean(_) // | DenoSubcommand::Bundle(_)
     ),
     no_lock: flags.no_lock
       || matches!(
