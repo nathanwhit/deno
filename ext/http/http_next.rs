@@ -1636,6 +1636,7 @@ pub fn op_serve2(
   scope: &mut v8::HandleScope,
   arg1: v8::Local<v8::Value>,
   arg2: v8::Local<v8::Value>,
+  on_error_handler: v8::Local<v8::Function>,
 ) {
   let strings = Strings::get_or_init(scope, state);
   let request_storage =
@@ -1662,6 +1663,7 @@ pub fn op_serve2(
     response_storage,
     arg1,
     arg2,
+    on_error_handler,
   );
 }
 
@@ -1672,6 +1674,7 @@ fn serve(
   response_storage: ResponseStorage,
   arg1: v8::Local<v8::Value>,
   arg2: v8::Local<v8::Value>,
+  on_error_handler: v8::Local<v8::Function>,
 ) {
   let isolate: &mut v8::Isolate = scope.as_mut();
   let isolate = isolate as *mut v8::Isolate;
@@ -1700,10 +1703,12 @@ fn serve(
   let context = scope.get_current_context();
   let context = v8::Global::new(scope, context);
   let handler = v8::Global::new(scope, handler.unwrap());
+  let on_error_handler = v8::Global::new(scope, on_error_handler);
   serve_http_on_listener(
     listener,
     strings,
     handler,
+    on_error_handler,
     isolate,
     context,
     request_storage,
@@ -1715,6 +1720,7 @@ fn serve_http_on_listener(
   listener: TcpListener,
   strings: Strings,
   handler: v8::Global<v8::Function>,
+  on_error_handler: v8::Global<v8::Function>,
   isolate: *mut v8::Isolate,
   context: v8::Global<v8::Context>,
   request_storage: RequestStorage,
@@ -1728,12 +1734,14 @@ fn serve_http_on_listener(
       let strings = strings.clone();
       let request_storage = request_storage.clone();
       let response_storage = response_storage.clone();
-      let svc = service_fn(move |req: Request| {
+      let on_error_handler = on_error_handler.clone();
+      let svc = service_fn(move |mut req: Request| {
         let context = context.clone();
         let handler = handler.clone();
         let strings = strings.clone();
         let request_storage = request_storage.clone();
         let response_storage = response_storage.clone();
+        let on_error_handler = on_error_handler.clone();
         async move {
           let scope = &mut v8::HandleScope::new(unsafe { &mut *isolate });
           let context = v8::Local::new(scope, context);
@@ -1743,30 +1751,42 @@ fn serve_http_on_listener(
 
           let inner_request = RequestData {
             url: req.uri().to_string(),
-            header_list: req
-              .headers()
-              .iter()
-              .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
-              .collect(),
+            headers: std::mem::take(req.headers_mut()),
+            response: None,
           };
           let request_id =
             request_storage.requests.borrow_mut().insert(inner_request);
 
           let request_id_number = v8::Number::new(scope, request_id as f64);
 
-          let response = handler.call(scope, recv, &[request_id_number.into()]);
+          let tc = &mut v8::TryCatch::new(scope);
+
+          let response = handler.call(tc, recv, &[request_id_number.into()]);
+          if tc.has_caught() {
+            let exception = tc.exception().unwrap();
+            let local = v8::Local::new(tc, on_error_handler);
+            let _ = local.call(tc, recv, &[exception.into()]);
+            return Ok::<_, HttpNextError>(response_from_data(ResponseData {
+              status: 500,
+              status_message: "Internal Server Error".to_string(),
+              body: ResponseBytesInner::Bytes(
+                b"Internal Server Error".to_vec().into(),
+              ),
+              headers: HeaderMap::new(),
+            }));
+          }
           if let Some(response) = response {
-            let global = v8::Global::new(scope, response);
-            let _response = deno_core::JsRuntime::scoped_resolve(scope, global)
+            let global = v8::Global::new(tc, response);
+            let _response = deno_core::JsRuntime::scoped_resolve(tc, global)
               .await
               .unwrap();
           }
-          let data = response_storage
-            .responses
+          let data = request_storage
+            .requests
             .borrow_mut()
-            .remove(&(request_id as u32))
+            .remove(request_id)
+            .response
             .unwrap();
-          let _ = request_storage.requests.borrow_mut().remove(request_id);
           Ok::<_, HttpNextError>(response_from_data(data))
         }
       });
@@ -1808,10 +1828,11 @@ fn response_from_data(data: ResponseData) -> hyper::Response<Resp> {
   )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RequestData {
   url: String,
-  header_list: Vec<(String, String)>,
+  headers: HeaderMap,
+  response: Option<ResponseData>,
 }
 
 #[derive(Debug, Clone)]
@@ -1878,7 +1899,12 @@ pub fn op_get_inner_request_header_list(
     .requests
     .borrow()
     .get(request_id as usize)
-    .map(|r| r.header_list.clone())
+    .map(|r| {
+      r.headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+        .collect()
+    })
     .unwrap_or_default()
 }
 
@@ -1892,7 +1918,7 @@ pub fn op_set_response_text(
   #[string] text: String,
   header_list: v8::Local<v8::Array>,
 ) {
-  let storage = state.borrow::<ResponseStorage>();
+  let storage = state.borrow::<RequestStorage>();
   let mut headers = HeaderMap::with_capacity(10);
   for i in 0..header_list.length() {
     let item = header_list.get_index(scope, i).unwrap();
@@ -1912,15 +1938,17 @@ pub fn op_set_response_text(
     HeaderName::from_static("vary"),
     HeaderValue::from_static("accept-encoding"),
   );
-  storage.responses.borrow_mut().insert(
-    response_id,
-    ResponseData {
-      status,
-      status_message: status_message.to_string(),
-      body: ResponseBytesInner::Bytes(text.into_bytes().into()),
-      headers,
-    },
-  );
+  storage
+    .requests
+    .borrow_mut()
+    .get_mut(response_id as usize)
+    .unwrap()
+    .response = Some(ResponseData {
+    status,
+    status_message: status_message.to_string(),
+    body: ResponseBytesInner::Bytes(text.into_bytes().into()),
+    headers,
+  });
 }
 
 fn response_from_value(

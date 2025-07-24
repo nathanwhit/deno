@@ -832,6 +832,8 @@ function serve(arg1, arg2) {
       });
     }
     return handleResponse(reqId, result);
+  }, (error) => {
+    return handleResponse(reqId, internalServerError());
   });
 }
 
