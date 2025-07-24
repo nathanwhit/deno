@@ -1586,13 +1586,22 @@ pub fn op_serve2(
   arg2: v8::Local<v8::Value>,
 ) {
   let strings = Strings::get_or_init(scope, state);
+  let request_storage =
+    if let Some(request_storage) = state.try_borrow::<RequestStorage>() {
+      request_storage.clone()
+    } else {
+      let request_storage = RequestStorage::new();
+      state.put(request_storage.clone());
+      request_storage
+    };
   state.external_ops_tracker.ref_op();
-  serve(scope, strings, arg1, arg2);
+  serve(scope, strings, request_storage, arg1, arg2);
 }
 
 fn serve(
   scope: &mut v8::HandleScope,
   strings: Strings,
+  request_storage: RequestStorage,
   arg1: v8::Local<v8::Value>,
   arg2: v8::Local<v8::Value>,
 ) {
@@ -1623,7 +1632,14 @@ fn serve(
   let context = scope.get_current_context();
   let context = v8::Global::new(scope, context);
   let handler = v8::Global::new(scope, handler.unwrap());
-  serve_http_on_listener(listener, strings, handler, isolate, context);
+  serve_http_on_listener(
+    listener,
+    strings,
+    handler,
+    isolate,
+    context,
+    request_storage,
+  );
 }
 
 fn serve_http_on_listener(
@@ -1669,6 +1685,7 @@ fn serve_http_on_listener(
           let response = deno_core::JsRuntime::scoped_resolve(scope, global)
             .await
             .unwrap();
+          request_storage.requests.borrow_mut().remove(request_id);
           let response = v8::Local::new(scope, response);
           Ok::<_, HttpNextError>(response_from_value(scope, &strings, response))
         }
@@ -1693,6 +1710,7 @@ fn serve_http_on_listener(
   })
 }
 
+#[derive(Debug, Clone)]
 struct RequestData {
   url: String,
   header_list: Vec<(String, String)>,

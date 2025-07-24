@@ -8,8 +8,8 @@ const {
   internalRidSymbol,
 } = core;
 import {
-  op_get_inner_request_url,
   op_get_inner_request_header_list,
+  op_get_inner_request_url,
   op_http_cancel,
   op_http_close,
   op_http_close_after_finish,
@@ -869,7 +869,6 @@ function serve(arg1, arg2) {
   op_serve2(arg1, (reqId) => {
     const req = new NewInnerRequest(reqId);
     const r = fromInnerRequest(req, "immutable");
-    req.request = r;
     const result = arg2(r);
     if ("then" in result) {
       return result.then((response) => {
