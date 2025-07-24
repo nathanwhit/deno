@@ -872,7 +872,9 @@ function serve(arg1, arg2) {
     const r = fromInnerRequest(req, "immutable");
     const result = arg2(r);
     if ("then" in result) {
-      return result.then((response) => {
+      console.log("thenable");
+      return PromisePrototypeThen(result, (response) => {
+        console.log("thenable resolved");
         return handleResponse(reqId, response);
       });
     }
@@ -885,6 +887,7 @@ function serve(arg1, arg2) {
 function handleResponse(reqId, response) {
   const res = toInnerResponse(response);
   if (typeof res.body.streamOrStatic.body === "string") {
+    // console.log("setting response text");
     op_set_response_text(
       reqId,
       res.status,
@@ -892,6 +895,7 @@ function handleResponse(reqId, response) {
       res.body.streamOrStatic.body,
       res.headerList,
     );
+    // console.log("set response text");
   } else {
     throw new Error();
   }
