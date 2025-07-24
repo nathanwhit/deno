@@ -234,6 +234,7 @@ deno_core::extension!(
     http_next::op_http_metric_handle_otel_error,
     http_next::op_get_inner_request_url,
     http_next::op_get_inner_request_header_list,
+    http_next::op_set_response_text,
   ],
   esm = ["00_serve.ts", "01_http.js", "02_websocket.ts"],
   options = {
@@ -242,6 +243,7 @@ deno_core::extension!(
   state = |state, options| {
     state.put::<Options>(options.options);
     state.put::<http_next::RequestStorage>(http_next::RequestStorage::new());
+    state.put::<http_next::ResponseStorage>(http_next::ResponseStorage::new());
   }
 );
 

@@ -34,6 +34,7 @@ import {
   op_http_upgrade_websocket_next,
   op_http_wait,
   op_serve2,
+  op_set_response_text,
 } from "ext:core/ops";
 const {
   ArrayPrototypeFind,
@@ -872,17 +873,32 @@ function serve(arg1, arg2) {
     const result = arg2(r);
     if ("then" in result) {
       return result.then((response) => {
-        return toInnerResponse(response);
+        return handleResponse(reqId, response);
       });
     }
-    return toInnerResponse(result);
+    return handleResponse(reqId, result);
   });
+}
+
+function handleResponse(reqId, response) {
+  const res = toInnerResponse(response);
+  if (typeof res.body.streamOrStatic.body === "string") {
+    op_set_response_text(
+      reqId,
+      res.status,
+      res.statusMessage,
+      res.body.streamOrStatic.body,
+      res.headerList,
+    );
+  } else {
+    throw new Error();
+  }
 }
 
 class NewInnerRequest {
   constructor(private requestId: number) {}
 
-  get url() {
+  url() {
     return getInnerRequestUrl(this.requestId);
   }
 

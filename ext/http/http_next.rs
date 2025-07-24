@@ -1,6 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::future::Future;
 use std::future::poll_fn;
@@ -1594,14 +1595,30 @@ pub fn op_serve2(
       state.put(request_storage.clone());
       request_storage
     };
+  let response_storage =
+    if let Some(response_storage) = state.try_borrow::<ResponseStorage>() {
+      response_storage.clone()
+    } else {
+      let response_storage = ResponseStorage::new();
+      state.put(response_storage.clone());
+      response_storage
+    };
   state.external_ops_tracker.ref_op();
-  serve(scope, strings, request_storage, arg1, arg2);
+  serve(
+    scope,
+    strings,
+    request_storage,
+    response_storage,
+    arg1,
+    arg2,
+  );
 }
 
 fn serve(
   scope: &mut v8::HandleScope,
   strings: Strings,
   request_storage: RequestStorage,
+  response_storage: ResponseStorage,
   arg1: v8::Local<v8::Value>,
   arg2: v8::Local<v8::Value>,
 ) {
@@ -1639,6 +1656,7 @@ fn serve(
     isolate,
     context,
     request_storage,
+    response_storage,
   );
 }
 
@@ -1649,6 +1667,7 @@ fn serve_http_on_listener(
   isolate: *mut v8::Isolate,
   context: v8::Global<v8::Context>,
   request_storage: RequestStorage,
+  response_storage: ResponseStorage,
 ) -> JoinHandle<()> {
   spawn(async move {
     loop {
@@ -1657,11 +1676,13 @@ fn serve_http_on_listener(
       let handler = handler.clone();
       let strings = strings.clone();
       let request_storage = request_storage.clone();
+      let response_storage = response_storage.clone();
       let svc = service_fn(move |req: Request| {
         let context = context.clone();
         let handler = handler.clone();
         let strings = strings.clone();
         let request_storage = request_storage.clone();
+        let response_storage = response_storage.clone();
         async move {
           let scope = &mut v8::HandleScope::new(unsafe { &mut *isolate });
           let context = v8::Local::new(scope, context);
@@ -1670,24 +1691,32 @@ fn serve_http_on_listener(
           let handler = v8::Local::new(scope, handler);
 
           let inner_request = RequestData {
-            url: String::new(),
-            header_list: Vec::new(),
+            url: req.uri().to_string(),
+            header_list: req
+              .headers()
+              .iter()
+              .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+              .collect(),
           };
           let request_id =
             request_storage.requests.borrow_mut().insert(inner_request);
 
           let request_id_number = v8::Number::new(scope, request_id as f64);
 
-          let response = handler
-            .call(scope, recv, &[request_id_number.into()])
+          let response = handler.call(scope, recv, &[request_id_number.into()]);
+          if let Some(response) = response {
+            let global = v8::Global::new(scope, response);
+            let _response = deno_core::JsRuntime::scoped_resolve(scope, global)
+              .await
+              .unwrap();
+          }
+          let data = response_storage
+            .responses
+            .borrow_mut()
+            .remove(&(request_id as u32))
             .unwrap();
-          let global = v8::Global::new(scope, response);
-          let response = deno_core::JsRuntime::scoped_resolve(scope, global)
-            .await
-            .unwrap();
-          request_storage.requests.borrow_mut().remove(request_id);
-          let response = v8::Local::new(scope, response);
-          Ok::<_, HttpNextError>(response_from_value(scope, &strings, response))
+          let _ = request_storage.requests.borrow_mut().remove(request_id);
+          Ok::<_, HttpNextError>(response_from_data(data))
         }
       });
       let connection_cancel_handle = CancelHandle::new_rc();
@@ -1710,6 +1739,24 @@ fn serve_http_on_listener(
   })
 }
 
+fn response_from_data(data: ResponseData) -> hyper::Response<Resp> {
+  let (mut parts, _) = http::Response::new(()).into_parts();
+  parts.status = StatusCode::from_u16(data.status).unwrap();
+  let mut headers = HeaderMap::with_capacity(10);
+  headers.insert(
+    HeaderName::from_static("vary"),
+    HeaderValue::from_static("accept-encoding"),
+  );
+  parts.headers = headers;
+  hyper::Response::from_parts(
+    parts,
+    Resp(RefCell::new(Some(RespInner {
+      trailers: None,
+      response_body: data.body,
+    }))),
+  )
+}
+
 #[derive(Debug, Clone)]
 struct RequestData {
   url: String,
@@ -1719,6 +1766,27 @@ struct RequestData {
 #[derive(Debug, Clone)]
 pub struct RequestStorage {
   requests: Rc<RefCell<slab::Slab<RequestData>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseStorage {
+  responses: Rc<RefCell<BTreeMap<u32, ResponseData>>>,
+}
+
+impl ResponseStorage {
+  pub fn new() -> Self {
+    Self {
+      responses: Rc::new(RefCell::new(BTreeMap::new())),
+    }
+  }
+}
+
+#[derive(Debug)]
+struct ResponseData {
+  status: u16,
+  status_message: String,
+  body: ResponseBytesInner,
+  headers: HeaderMap,
 }
 
 impl RequestStorage {
@@ -1761,6 +1829,47 @@ pub fn op_get_inner_request_header_list(
     .get(request_id as usize)
     .map(|r| r.header_list.clone())
     .unwrap_or_default()
+}
+
+#[op2(fast)]
+pub fn op_set_response_text(
+  state: &mut OpState,
+  scope: &mut v8::HandleScope,
+  #[smi] response_id: u32,
+  #[smi] status: u16,
+  #[string] status_message: &str,
+  #[string] text: String,
+  header_list: v8::Local<v8::Array>,
+) {
+  let storage = state.borrow::<ResponseStorage>();
+  let mut headers = HeaderMap::with_capacity(10);
+  for i in 0..header_list.length() {
+    let item = header_list.get_index(scope, i).unwrap();
+    let item = item.cast::<v8::Array>();
+    let name = item.get_index(scope, 0).unwrap().cast::<v8::String>();
+    let value = item.get_index(scope, 1).unwrap().cast::<v8::String>();
+    headers.insert(
+      http::HeaderName::from_bytes(name.to_rust_string_lossy(scope).as_bytes())
+        .unwrap(),
+      http::HeaderValue::from_bytes(
+        value.to_rust_string_lossy(scope).as_bytes(),
+      )
+      .unwrap(),
+    );
+  }
+  headers.insert(
+    HeaderName::from_static("vary"),
+    HeaderValue::from_static("accept-encoding"),
+  );
+  storage.responses.borrow_mut().insert(
+    response_id,
+    ResponseData {
+      status,
+      status_message: status_message.to_string(),
+      body: ResponseBytesInner::Bytes(text.into_bytes().into()),
+      headers,
+    },
+  );
 }
 
 fn response_from_value(
