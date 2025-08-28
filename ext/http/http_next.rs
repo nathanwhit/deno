@@ -1641,7 +1641,7 @@ pub fn op_serve2(
   arg2: v8::Local<v8::Value>,
   on_error_handler: v8::Local<v8::Function>,
 ) {
-  let strings = Strings::get_or_init(scope, state);
+  // let strings = Strings::get_or_init(scope, state);
   let request_storage =
     if let Some(request_storage) = state.try_borrow::<RequestStorage>() {
       request_storage.clone()
@@ -1661,7 +1661,7 @@ pub fn op_serve2(
   state.external_ops_tracker.ref_op();
   serve(
     scope,
-    strings,
+    // strings,
     request_storage,
     response_storage,
     arg1,
@@ -1672,7 +1672,7 @@ pub fn op_serve2(
 
 fn serve(
   scope: &mut v8::HandleScope,
-  strings: Strings,
+  // strings: Strings,
   request_storage: RequestStorage,
   response_storage: ResponseStorage,
   arg1: v8::Local<v8::Value>,
@@ -1709,7 +1709,7 @@ fn serve(
   let on_error_handler = v8::Global::new(scope, on_error_handler);
   serve_http_on_listener(
     listener,
-    strings,
+    // strings,
     handler,
     on_error_handler,
     isolate,
@@ -1721,7 +1721,7 @@ fn serve(
 
 fn serve_http_on_listener(
   listener: TcpListener,
-  strings: Strings,
+  // strings: Strings,
   handler: v8::Global<v8::Function>,
   on_error_handler: v8::Global<v8::Function>,
   isolate: *mut v8::Isolate,
@@ -1734,7 +1734,7 @@ fn serve_http_on_listener(
       let (stream, addr) = listener.accept().await.unwrap();
       let context = context.clone();
       let handler = handler.clone();
-      let strings = strings.clone();
+      // let strings = strings.clone();
       let request_storage = request_storage.clone();
       let response_storage = response_storage.clone();
       let on_error_handler = on_error_handler.clone();
@@ -1742,7 +1742,7 @@ fn serve_http_on_listener(
         let context = context.clone();
         // eprintln!("context: {:?}", context);
         let handler = handler.clone();
-        let strings = strings.clone();
+        // let strings = strings.clone();
         let request_storage = request_storage.clone();
         let response_storage = response_storage.clone();
         let on_error_handler = on_error_handler.clone();

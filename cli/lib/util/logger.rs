@@ -28,7 +28,9 @@ impl CliLogger {
 
 impl log::Log for CliLogger {
   fn enabled(&self, metadata: &log::Metadata) -> bool {
-    self.inner.load().logger.enabled(metadata)
+    false
+    // eprintln!("enabled: {:?}", metadata);
+    // self.inner.load().logger.enabled(metadata)
   }
 
   fn log(&self, record: &log::Record) {
@@ -83,6 +85,8 @@ pub fn init(options: InitLoggingOptions) {
   // used to make available the lsp_debug which is then filtered out at runtime
   // in the cli logger
   .filter_module("deno::lsp::performance", log::LevelFilter::Debug)
+  .filter_module("hyper", log::LevelFilter::Off)
+  .filter_module("h2", log::LevelFilter::Off)
   .filter_module("rustls", log::LevelFilter::Off)
   // swc_ecma_codegen's `srcmap!` macro emits error-level spans only on debug
   // build:

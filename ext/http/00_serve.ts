@@ -823,7 +823,7 @@ function serve(arg1, arg2) {
   // return serveInner(options, handler);
 
   op_serve2(arg1, (reqId) => {
-    const req = new NewInnerRequest(reqId);
+    // const req = new NewInnerRequest(reqId);
     // const r = fromInnerRequest(req, "immutable");
     const result = arg2({});
     if ("then" in result) {
@@ -856,17 +856,17 @@ function handleResponse(reqId, response) {
   // }
 }
 
-class NewInnerRequest {
-  constructor(private requestId: number) {}
+// class NewInnerRequest {
+//   constructor(private requestId: number) {}
 
-  url() {
-    return getInnerRequestUrl(this.requestId);
-  }
+//   url() {
+//     return getInnerRequestUrl(this.requestId);
+//   }
 
-  get headerList() {
-    return op_get_inner_request_header_list(this.requestId);
-  }
-}
+//   get headerList() {
+//     return op_get_inner_request_header_list(this.requestId);
+//   }
+// }
 
 function getInnerRequestUrl(requestId: number) {
   return op_get_inner_request_url(requestId);
