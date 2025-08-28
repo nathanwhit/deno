@@ -824,8 +824,8 @@ function serve(arg1, arg2) {
 
   op_serve2(arg1, (reqId) => {
     const req = new NewInnerRequest(reqId);
-    const r = fromInnerRequest(req, "immutable");
-    const result = arg2(r);
+    // const r = fromInnerRequest(req, "immutable");
+    const result = arg2({});
     if ("then" in result) {
       console.log("thenable");
       return PromisePrototypeThen(result, (response) => {
@@ -840,20 +840,20 @@ function serve(arg1, arg2) {
 }
 
 function handleResponse(reqId, response) {
-  const res = toInnerResponse(response);
-  if (typeof res.body.streamOrStatic.body === "string") {
-    // console.log("setting response text");
-    op_set_response_text(
-      reqId,
-      res.status,
-      res.statusMessage,
-      res.body.streamOrStatic.body,
-      res.headerList,
-    );
-    // console.log("set response text");
-  } else {
-    throw new Error();
-  }
+  // const res = toInnerResponse(response);
+  // if (typeof res.body.streamOrStatic.body === "string") {
+  // console.log("setting response text");
+  op_set_response_text(
+    reqId,
+    200,
+    "OK",
+    response.bodyText,
+    [],
+  );
+  // console.log("set response text");
+  // } else {
+  //   throw new Error();
+  // }
 }
 
 class NewInnerRequest {

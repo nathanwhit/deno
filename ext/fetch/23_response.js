@@ -235,6 +235,12 @@ function initializeAResponse(response, init, bodyWithType) {
 }
 
 class Response {
+  constructor(bodyText) {
+    this.bodyText = bodyText;
+  }
+}
+
+class Responsey {
   get [_mimeType]() {
     const values = getDecodeSplitHeader(
       headerListFromHeaders(this[_headers]),

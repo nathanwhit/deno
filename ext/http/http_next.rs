@@ -1760,8 +1760,10 @@ fn serve_http_on_listener(
             headers: std::mem::take(req.headers_mut()),
             response: None,
           };
+          // eprintln!("inner_request: {:?}", inner_request);
           let request_id =
             request_storage.requests.borrow_mut().insert(inner_request);
+          // eprintln!("request_id: {:?}", request_id);
 
           let request_id_number = v8::Number::new(scope, request_id as f64);
 
@@ -1953,6 +1955,7 @@ pub fn op_set_response_text(
     HeaderName::from_static("vary"),
     HeaderValue::from_static("accept-encoding"),
   );
+  // eprintln!("setting response text: {:?}; {response_id}", text);
   storage
     .requests
     .borrow_mut()
