@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -137,9 +138,30 @@ pub struct HtmlEntrypoint {
   pub scripts: Vec<Script>,
   pub temp_module: String,
   pub contents: String,
+  pub entry_name: String,
+}
+
+// Helper to create a filesystem-friendly name based on a path
+fn sanitize_entry_name(cwd: &Path, path: &Path) -> String {
+  let rel =
+    pathdiff::diff_paths(path, cwd).unwrap_or_else(|| path.to_path_buf());
+  let stem = rel
+    .with_extension("")
+    .to_string_lossy()
+    .replace(['\\', '/'], "$PATHSEP$");
+  if stem.is_empty() {
+    "entry".to_string()
+  } else {
+    stem
+  }
+}
+
+fn desanitize_entry_name(name: &str) -> String {
+  name.replace("$PATHSEP$", std::path::MAIN_SEPARATOR_STR)
 }
 
 fn parse_html_entrypoint(
+  cwd: &Path,
   path: &Path,
   contents: String,
 ) -> anyhow::Result<HtmlEntrypoint> {
@@ -162,81 +184,137 @@ fn parse_html_entrypoint(
     scripts,
     temp_module,
     contents,
+    entry_name: sanitize_entry_name(cwd, path),
   })
 }
 
-pub fn load_html_entrypoint(path: &Path) -> anyhow::Result<HtmlEntrypoint> {
+pub fn load_html_entrypoint(
+  cwd: &Path,
+  path: &Path,
+) -> anyhow::Result<HtmlEntrypoint> {
   let contents = std::fs::read_to_string(path)?;
-  parse_html_entrypoint(path, contents)
+  parse_html_entrypoint(cwd, path, contents)
+}
+
+pub struct HtmlOutputFiles<'a, 'f> {
+  output_files: &'f mut Vec<OutputFile<'a>>,
+  index: HashMap<String, PathBuf>,
+}
+
+impl<'a, 'f> HtmlOutputFiles<'a, 'f> {
+  pub fn new(output_files: &'f mut Vec<OutputFile<'a>>) -> Self {
+    let mut index = std::collections::HashMap::new();
+    for f in output_files.iter() {
+      if let Some(name) = f.path.file_name().and_then(|s| s.to_str()) {
+        index.insert(name.to_string(), f.path.clone());
+      }
+    }
+    Self {
+      output_files,
+      index,
+    }
+  }
 }
 
 impl HtmlEntrypoint {
   pub fn patch_html_with_response<'a>(
     self,
-    response: &'a esbuild_client::protocol::BuildResponse,
+    cwd: &Path,
     outdir: &Path,
-  ) -> anyhow::Result<Vec<OutputFile<'a>>> {
+    html_output_files: &mut HtmlOutputFiles<'a, '_>,
+  ) -> anyhow::Result<()> {
+    eprintln!("outdir: {:?}; self.path: {:?}", outdir, self.path);
+    let html_out_path = {
+      outdir.join(&format!("{}.html", desanitize_entry_name(&self.entry_name)))
+    };
+    eprintln!("html_out_path: {:?}", html_out_path);
+
+    if self.scripts.is_empty() {
+      html_output_files.output_files.push(OutputFile {
+        path: html_out_path,
+        contents: Cow::Owned(self.contents.into_bytes()),
+        hash: None,
+      });
+      return Ok(());
+    }
+
+    // With hashed patterns enabled, the output names will be
+    //   <entry>-<hash>.js and optionally <entry>-<hash>.css
+    // Fallback to non-hashed names if patterns are not applied.
+    let js_out = html_output_files
+      .index
+      .get(&format!("{}.js", self.entry_name))
+      .cloned();
+    let css_out = html_output_files
+      .index
+      .get(&format!("{}.css", self.entry_name))
+      .cloned();
+
+    eprintln!("js_out: {:?}", js_out);
+    eprintln!("css_out: {:?}", css_out);
+
+    let script_src = js_out.as_ref().map(|p| {
+      let base = html_out_path.parent().unwrap_or(outdir);
+      let mut rel = pathdiff::diff_paths(p, base)
+        .unwrap_or_else(|| p.clone())
+        .to_string_lossy()
+        .to_string();
+      if std::path::MAIN_SEPARATOR != '/' {
+        rel = rel.replace('\\', "/");
+      }
+      rel
+    });
+    eprintln!("script_src: {:?}", script_src);
     let any_async = self.scripts.iter().any(|s| s.is_async);
     let any_module = self.scripts.iter().any(|s| s.is_module);
 
-    let output_files = response.output_files.as_ref().unwrap();
+    if let Some(script_src) = script_src {
+      let to_inject = Script {
+        src: Some(
+          if !script_src.starts_with(".") && !script_src.starts_with("/") {
+            format!("./{}", script_src)
+          } else {
+            script_src
+          },
+        ),
+        is_async: any_async,
+        is_module: any_module,
+        resolved_path: None,
+      };
 
-    let entrypoint_js = output_files
-      .iter()
-      .find(|f| {
-        f.path
-          .ends_with(&format!("{}stdin.js", std::path::MAIN_SEPARATOR))
-      })
-      .unwrap();
-
-    let out_name = format!("index-{}.js", reencode_hash(&entrypoint_js.hash));
-    let out_path = outdir.join(&out_name);
-
-    let entrypoint_css_maybe = output_files.iter().find(|f| {
-      f.path
-        .ends_with(&format!("{}stdin.css", std::path::MAIN_SEPARATOR))
-    });
-
-    let to_inject = Script {
-      src: Some(format!("./{}", out_name)),
-      is_async: any_async,
-      is_module: any_module,
-      resolved_path: None,
-    };
-
-    let css_to_inject_path = entrypoint_css_maybe
-      .map(|f| format!("./index-{}.css", reencode_hash(&f.hash)));
-
-    let patched_contents = inject_scripts_and_css(
-      &self.contents,
-      to_inject,
-      &self.scripts,
-      css_to_inject_path,
-    )?;
-
-    let mut output_files = Vec::new();
-    output_files.push(OutputFile {
-      path: out_path,
-      contents: Cow::Borrowed(&entrypoint_js.contents),
-    });
-
-    if let Some(css_to_inject_path) = entrypoint_css_maybe {
-      let css_path = outdir.join(format!(
-        "index-{}.css",
-        reencode_hash(&css_to_inject_path.hash)
-      ));
-      output_files.push(OutputFile {
-        path: css_path,
-        contents: Cow::Borrowed(&css_to_inject_path.contents),
+      let css_href = css_out.as_ref().map(|p| {
+        let base = html_out_path.parent().unwrap_or(outdir);
+        let mut rel = pathdiff::diff_paths(p, base)
+          .unwrap_or_else(|| p.clone())
+          .to_string_lossy()
+          .to_string();
+        if std::path::MAIN_SEPARATOR != '/' {
+          rel = rel.replace('\\', "/");
+        }
+        rel
       });
+
+      let patched = inject_scripts_and_css(
+        &self.contents,
+        to_inject,
+        &self.scripts,
+        css_href,
+      )?;
+
+      html_output_files.output_files.push(OutputFile {
+        path: html_out_path,
+        contents: Cow::Owned(patched.into_bytes()),
+        hash: None,
+      });
+    } else {
+      // Missing JS output for the page's entry
+      return Err(deno_core::anyhow::anyhow!(
+        "failed to locate output for HTML entry '{}'",
+        self.entry_name
+      ));
     }
 
-    output_files.push(OutputFile {
-      path: outdir.join("index.html"),
-      contents: patched_contents.into_bytes().into(),
-    });
-
-    Ok(output_files)
+    Ok(())
   }
 }
 
@@ -315,7 +393,8 @@ fn inject_scripts_and_css(
 }
 
 fn reencode_hash(hash: &str) -> String {
-  use base64::prelude::*;
-  let bytes = BASE64_STANDARD_NO_PAD.decode(hash).unwrap();
-  BASE64_URL_SAFE_NO_PAD.encode(bytes)
+  base32::encode(
+    base32::Alphabet::Rfc4648 { padding: false },
+    hash.as_bytes(),
+  )
 }

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use deno_ast::EmitOptions;
@@ -46,7 +47,6 @@ use deno_resolver::loader::RequestedModuleType;
 use deno_resolver::npm::managed::ResolvePkgFolderFromDenoModuleError;
 use deno_runtime::deno_permissions::PermissionsContainer;
 use deno_semver::npm::NpmPackageReqReference;
-use esbuild_client::EsbuildFlags;
 use esbuild_client::EsbuildFlagsBuilder;
 use esbuild_client::EsbuildService;
 use esbuild_client::protocol;
@@ -81,6 +81,108 @@ use crate::util::file_watcher::WatcherRestartMode;
 static DISABLE_HACK: LazyLock<bool> =
   LazyLock::new(|| std::env::var("NO_DENO_BUNDLE_HACK").is_err());
 
+const VIRTUAL_ENTRY_PREFIX: &str = "\0\0deno-bundle-html:";
+
+pub async fn prepare_inputs(
+  resolver: &CliResolver,
+  sys: CliSys,
+  npm_resolver: &CliNpmResolver,
+  node_resolver: &CliNodeResolver,
+  init_cwd: &Path,
+  bundle_flags: &BundleFlags,
+  plugin_handler: &mut DenoPluginHandler,
+) -> Result<BundlerInput, AnyError> {
+  let resolved_entrypoints =
+    resolve_entrypoints(resolver, init_cwd, &bundle_flags.entrypoints)?;
+
+  // Partition into HTML and non-HTML entrypoints
+  let mut html_paths = Vec::new();
+  let mut script_entry_urls = Vec::new();
+  for url in &resolved_entrypoints {
+    if url.as_str().to_lowercase().ends_with(".html") {
+      html_paths.push(url.to_file_path().unwrap());
+    } else {
+      script_entry_urls.push(url.clone());
+    }
+  }
+
+  if html_paths.is_empty() {
+    let _ = plugin_handler
+      .prepare_module_load(&resolved_entrypoints)
+      .await;
+
+    let roots =
+      resolve_roots(resolved_entrypoints, sys, npm_resolver, node_resolver);
+    let _ = plugin_handler.prepare_module_load(&roots).await;
+    Ok(BundlerInput::Entrypoints(
+      roots.into_iter().map(|e| ("".into(), e.into())).collect(),
+    ))
+  } else {
+    // require an outdir when any HTML is present
+    if bundle_flags.output_dir.is_none() {
+      return Err(deno_core::anyhow::anyhow!(
+        "--outdir is required when bundling HTML entrypoints",
+      ));
+    }
+    if bundle_flags.output_path.is_some() {
+      return Err(deno_core::anyhow::anyhow!(
+        "--output is not supported with HTML entrypoints; use --outdir",
+      ));
+    }
+
+    // Prepare HTML pages and temp entry modules
+    let mut html_pages = Vec::new();
+    let mut to_cache_urls = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut virtual_modules = VirtualModules::new();
+
+    for html_path in &html_paths {
+      let entry = html::load_html_entrypoint(&init_cwd, html_path)?;
+
+      let entry_name = &entry.entry_name;
+
+      // Write a temporary module that imports each script src
+      let virtual_module_path =
+        format!("{VIRTUAL_ENTRY_PREFIX}{entry_name}.entry.js");
+      virtual_modules.insert(
+        virtual_module_path.clone(),
+        VirtualModule::new(
+          entry.temp_module.as_bytes().to_vec(),
+          esbuild_client::BuiltinLoader::Js,
+        ),
+      );
+
+      for script in &entry.scripts {
+        if let Some(path) = &script.resolved_path {
+          to_cache_urls.push(Url::from_file_path(path).unwrap());
+        }
+      }
+
+      entries.push((entry_name.clone(), virtual_module_path));
+      html_pages.push(entry);
+    }
+
+    plugin_handler.virtual_modules = Some(Arc::new(virtual_modules));
+
+    // Prepare non-HTML entries too
+    let _ = plugin_handler.prepare_module_load(&script_entry_urls).await;
+    let roots =
+      resolve_roots(script_entry_urls, sys, npm_resolver, node_resolver);
+    let _ = plugin_handler.prepare_module_load(&roots).await;
+    for url in roots {
+      entries.push(("".into(), url.into()));
+    }
+
+    // Pre-cache modules referenced by HTML pages
+    let _ = plugin_handler.prepare_module_load(&to_cache_urls).await;
+
+    Ok(BundlerInput::EntrypointsWithHtml {
+      entries,
+      html_pages,
+    })
+  }
+}
+
 pub async fn bundle_init(
   mut flags: Arc<Flags>,
   bundle_flags: &BundleFlags,
@@ -107,7 +209,7 @@ pub async fn bundle_init(
 
   let (on_end_tx, on_end_rx) = tokio::sync::mpsc::channel(10);
   #[allow(clippy::arc_with_non_send_sync)]
-  let plugin_handler = Arc::new(DenoPluginHandler {
+  let mut plugin_handler = Arc::new(DenoPluginHandler {
     file_fetcher: factory.file_fetcher()?.clone(),
     resolver: resolver.clone(),
     module_load_preparer,
@@ -124,37 +226,19 @@ pub async fn bundle_init(
     cjs_tracker: factory.cjs_tracker()?.clone(),
     emitter: factory.emitter()?.clone(),
     deferred_resolve_errors: Default::default(),
+    virtual_modules: None,
   });
 
-  let resolved_entrypoints =
-    resolve_entrypoints(&resolver, &init_cwd, &bundle_flags.entrypoints)?;
-
-  let input = if resolved_entrypoints.len() == 1
-    && resolved_entrypoints[0].as_str().ends_with(".html")
-  {
-    let path = resolved_entrypoints[0].to_file_path().unwrap();
-    let entrypoint = html::load_html_entrypoint(&path)?;
-    let mut to_cache = vec![];
-    for script in &entrypoint.scripts {
-      if let Some(path) = &script.resolved_path {
-        to_cache.push(Url::from_file_path(path).unwrap());
-      }
-    }
-    let _ = plugin_handler.prepare_module_load(&to_cache).await;
-    // let entrypoint = entrypoint.temp_module;
-    BundlerInput::HtmlEntrypoint(entrypoint)
-  } else {
-    let _ = plugin_handler
-      .prepare_module_load(&resolved_entrypoints)
-      .await;
-
-    let roots =
-      resolve_roots(resolved_entrypoints, sys, npm_resolver, node_resolver);
-    let _ = plugin_handler.prepare_module_load(&roots).await;
-    BundlerInput::Entrypoints(
-      roots.into_iter().map(|e| ("".into(), e.into())).collect(),
-    )
-  };
+  let input = prepare_inputs(
+    &resolver,
+    sys,
+    &npm_resolver,
+    &node_resolver,
+    &init_cwd,
+    bundle_flags,
+    Arc::get_mut(&mut plugin_handler).unwrap(),
+  )
+  .await?;
 
   let esbuild = EsbuildService::new(
     esbuild_path,
@@ -170,10 +254,9 @@ pub async fn bundle_init(
     let res = esbuild.wait_for_exit().await;
     log::warn!("esbuild exited: {:?}", res);
   });
-
   let esbuild_flags = configure_esbuild_flags(
     bundle_flags,
-    matches!(input, BundlerInput::HtmlEntrypoint(_)),
+    matches!(input, BundlerInput::EntrypointsWithHtml { .. }),
   );
   let bundler = EsbuildBundler::new(
     client,
@@ -284,8 +367,23 @@ async fn bundle_watch(
         .collect::<Vec<_>>(),
       vec![],
     ),
-    BundlerInput::HtmlEntrypoint(entrypoint) => {
-      (vec![entrypoint.path.clone()], vec![entrypoint.path.clone()])
+    BundlerInput::EntrypointsWithHtml {
+      entries,
+      html_pages,
+    } => {
+      let mut roots = entries
+        .iter()
+        .filter_map(|(_, root)| {
+          let url = Url::parse(root).ok()?;
+          deno_path_util::url_to_file_path(&url).ok()
+        })
+        .collect::<Vec<_>>();
+      let always = html_pages
+        .iter()
+        .map(|p| p.path.clone())
+        .collect::<Vec<_>>();
+      roots.extend(always.iter().cloned());
+      (roots, always)
     }
   };
   let always_watch = Rc::new(always_watch);
@@ -383,8 +481,13 @@ pub enum BundlingMode {
 #[derive(Debug, Clone)]
 pub enum BundlerInput {
   Entrypoints(Vec<(String, String)>),
-  HtmlEntrypoint(html::HtmlEntrypoint),
+  EntrypointsWithHtml {
+    entries: Vec<(String, String)>,
+    html_pages: Vec<html::HtmlEntrypoint>,
+  },
 }
+
+pub type EsbuildFlags = Vec<String>;
 
 pub struct EsbuildBundler {
   client: esbuild_client::ProtocolClient,
@@ -423,28 +526,17 @@ impl EsbuildBundler {
   // doesn't actually do anything, it's just registering the args/flags
   // we're going to use for all of the rebuilds.
   fn make_build_request(&self) -> protocol::BuildRequest {
-    let (stdin, resolve_dir, entries) = match &self.input {
-      BundlerInput::Entrypoints(entries) => (None, None, entries.clone()),
-      BundlerInput::HtmlEntrypoint(entrypoint) => (
-        Some(entrypoint.temp_module.as_bytes().to_vec()),
-        Some(
-          entrypoint
-            .path
-            .parent()
-            .unwrap()
-            .to_string_lossy()
-            .to_string(),
-        ),
-        vec![],
-      ),
+    let entries = match &self.input {
+      BundlerInput::Entrypoints(entries) => entries.clone(),
+      BundlerInput::EntrypointsWithHtml { entries, .. } => entries.clone(),
     };
     protocol::BuildRequest {
       entries,
       key: 0,
-      flags: self.flags.to_flags(),
+      flags: self.flags.clone(),
       write: false,
-      stdin_contents: stdin.into(),
-      stdin_resolve_dir: resolve_dir.into(),
+      stdin_contents: None.into(),
+      stdin_resolve_dir: None.into(),
       abs_working_dir: self.cwd.to_string_lossy().into_owned(),
       context: matches!(self.mode, BundlingMode::Watch),
       mangle_cache: None,
@@ -651,6 +743,41 @@ fn requested_type_from_map(
   }
 }
 
+pub struct VirtualModule {
+  contents: Vec<u8>,
+  loader: esbuild_client::BuiltinLoader,
+}
+
+impl VirtualModule {
+  pub fn new(contents: Vec<u8>, loader: esbuild_client::BuiltinLoader) -> Self {
+    Self { contents, loader }
+  }
+}
+
+pub struct VirtualModules {
+  modules: IndexMap<String, VirtualModule>,
+}
+
+impl VirtualModules {
+  pub fn new() -> Self {
+    Self {
+      modules: IndexMap::new(),
+    }
+  }
+
+  pub fn insert(&mut self, path: String, contents: VirtualModule) {
+    self.modules.insert(path, contents);
+  }
+
+  pub fn get(&self, path: &str) -> Option<&VirtualModule> {
+    self.modules.get(path)
+  }
+
+  pub fn contains(&self, path: &str) -> bool {
+    self.modules.contains_key(path)
+  }
+}
+
 pub struct DeferredResolveError {
   path: String,
   error: ResolveWithGraphError,
@@ -666,7 +793,7 @@ pub struct DenoPluginHandler {
   externals_matcher: Option<ExternalsMatcher>,
   on_end_tx: tokio::sync::mpsc::Sender<esbuild_client::OnEndArgs>,
   deferred_resolve_errors: Arc<Mutex<Vec<DeferredResolveError>>>,
-
+  virtual_modules: Option<Arc<VirtualModules>>,
   parsed_source_cache: Arc<ParsedSourceCache>,
   cjs_tracker: Arc<CliCjsTracker>,
   emitter: Arc<CliEmitter>,
@@ -735,6 +862,18 @@ impl esbuild_client::PluginHandler for DenoPluginHandler {
     args: esbuild_client::OnResolveArgs,
   ) -> Result<Option<esbuild_client::OnResolveResult>, AnyError> {
     log::debug!("{}: {args:?}", deno_terminal::colors::cyan("on_resolve"));
+
+    if let Some(virtual_modules) = &self.virtual_modules
+      && virtual_modules.contains(&args.path)
+    {
+      return Ok(Some(esbuild_client::OnResolveResult {
+        path: Some(args.path),
+        plugin_name: Some("deno".to_string()),
+        namespace: Some("deno".to_string()),
+        ..Default::default()
+      }));
+    }
+
     if let Some(matcher) = &self.externals_matcher
       && matcher.is_pre_resolve_match(&args.path)
     {
@@ -805,6 +944,15 @@ impl esbuild_client::PluginHandler for DenoPluginHandler {
     args: esbuild_client::OnLoadArgs,
   ) -> Result<Option<esbuild_client::OnLoadResult>, AnyError> {
     log::debug!("{}: {args:?}", deno_terminal::colors::cyan("on_load"));
+    if let Some(virtual_modules) = &self.virtual_modules
+      && let Some(module) = virtual_modules.get(&args.path)
+    {
+      return Ok(Some(esbuild_client::OnLoadResult {
+        contents: Some(module.contents.clone()),
+        loader: Some(module.loader),
+        ..Default::default()
+      }));
+    }
     let result = self
       .bundle_load(&args.path, &requested_type_from_map(&args.with))
       .await;
@@ -1562,14 +1710,14 @@ async fn ensure_esbuild_downloaded(
 fn configure_esbuild_flags(
   bundle_flags: &BundleFlags,
   is_html: bool,
-) -> EsbuildFlags {
+) -> Vec<String> {
   let mut builder = EsbuildFlagsBuilder::default();
 
   builder
     .bundle(bundle_flags.inline_imports)
     .minify(bundle_flags.minify)
     .splitting(bundle_flags.code_splitting)
-    .external(bundle_flags.external.clone())
+    .externals(bundle_flags.external.clone())
     .tree_shaking(true)
     .format(match bundle_flags.format {
       BundleFormat::Esm => esbuild_client::Format::Esm,
@@ -1599,6 +1747,9 @@ fn configure_esbuild_flags(
   if is_html {
     builder.platform(esbuild_client::Platform::Browser);
     builder.splitting(true);
+    builder.entry_names("[name]");
+    builder.chunk_names("[name]-[hash]");
+    builder.asset_names("[name]-[hash]");
     builder.metafile(true);
   }
   match bundle_flags.platform {
@@ -1608,7 +1759,7 @@ fn configure_esbuild_flags(
     deno_bundle_runtime::BundlePlatform::Deno => {}
   }
 
-  builder.build().unwrap()
+  builder.build()
 }
 
 // extract the path from a message like "Could not resolve "path/to/file.ts""
@@ -1709,6 +1860,7 @@ pub fn maybe_process_contents(
 pub struct OutputFile<'a> {
   pub path: PathBuf,
   pub contents: Cow<'a, [u8]>,
+  pub hash: Option<String>,
 }
 
 impl<'a> From<&'a esbuild_client::protocol::BuildOutputFile>
@@ -1718,6 +1870,7 @@ impl<'a> From<&'a esbuild_client::protocol::BuildOutputFile>
     OutputFile {
       path: PathBuf::from(&file.path),
       contents: Cow::Borrowed(&file.contents),
+      hash: Some(file.hash.clone()),
     }
   }
 }
@@ -1727,6 +1880,7 @@ impl<'a> From<esbuild_client::protocol::BuildOutputFile> for OutputFile<'a> {
     OutputFile {
       path: PathBuf::from(&file.path),
       contents: Cow::Owned(file.contents),
+      hash: Some(file.hash),
     }
   }
 }
@@ -1739,24 +1893,42 @@ pub fn process_result(
   input: BundlerInput,
   outdir: Option<&Path>,
 ) -> Result<Vec<OutputFileInfo>, AnyError> {
-  let output_files = match input {
-    BundlerInput::HtmlEntrypoint(entrypoint) => {
-      entrypoint.patch_html_with_response(response, outdir.unwrap())?
-    }
-    _ => response
-      .output_files
-      .as_ref()
-      .map(|files| {
-        files
-          .iter()
-          .map(|f| OutputFile {
-            path: PathBuf::from(&f.path),
-            contents: Cow::Borrowed(&f.contents),
-          })
-          .collect::<Vec<_>>()
-      })
-      .unwrap_or_default(),
+  let outdir = if let Some(outdir) = outdir {
+    Some(outdir.canonicalize()?)
+  } else {
+    None
   };
+  let mut output_files: Vec<OutputFile> = response
+    .output_files
+    .as_ref()
+    .map(|fs| {
+      fs.iter()
+        .map(|f| OutputFile {
+          path: PathBuf::from(&f.path),
+          contents: Cow::Borrowed(&f.contents),
+          hash: Some(f.hash.clone()),
+        })
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+
+  if let BundlerInput::EntrypointsWithHtml {
+    entries: _,
+    html_pages,
+  } = input
+  {
+    let outdir = outdir.ok_or_else(|| {
+      deno_core::anyhow::anyhow!(
+        "--outdir is required when bundling HTML entrypoints",
+      )
+    })?;
+
+    let mut html_output_files = html::HtmlOutputFiles::new(&mut output_files);
+    for page in html_pages {
+      page.patch_html_with_response(cwd, &outdir, &mut html_output_files)?;
+    }
+  }
+
   let mut exists_cache = std::collections::HashSet::new();
   let mut output_infos = Vec::new();
   for file in output_files.iter() {

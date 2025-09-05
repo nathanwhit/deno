@@ -99,6 +99,7 @@ node_resolver = { workspace = true, features = ["graph", "sync"] }
 anstream.workspace = true
 async-trait.workspace = true
 aws-lc-rs.workspace = true
+base32.workspace = true
 base64.workspace = true
 bincode.workspace = true
 boxed_error.workspace = true
@@ -121,7 +122,7 @@ dprint-plugin-json.workspace = true
 dprint-plugin-jupyter.workspace = true
 dprint-plugin-markdown.workspace = true
 dprint-plugin-typescript.workspace = true
-esbuild_client = { version = "0.6.0", features = ["serde"] }
+esbuild_client = { version = "0.7.1", features = ["serde"] }
 fancy-regex.workspace = true
 faster-hex.workspace = true
 # If you disable the default __vendored_zlib_ng feature above, you _must_ be able to link against `-lz`.

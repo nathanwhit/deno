@@ -1562,6 +1562,7 @@ dependencies = [
  "anstream",
  "async-trait",
  "aws-lc-rs",
+ "base32",
  "base64 0.22.1",
  "bincode",
  "boxed_error",
@@ -3852,14 +3853,13 @@ checksum = "31ae425815400e5ed474178a7a22e275a9687086a12ca63ec793ff292d8fdae8"
 
 [[package]]
 name = "esbuild_client"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "456b3d661f00dac26314d27da56eb41e0e43f270251fe8c53686bb1e32205863"
+checksum = "97ec79be0f4b20864729b38953ad77c7f347e436a7532c5f332dce9736aa4b5c"
 dependencies = [
  "anyhow",
  "async-trait",
  "deno_unsync",
- "derive_builder",
  "indexmap 2.9.0",
  "log",
  "parking_lot",
