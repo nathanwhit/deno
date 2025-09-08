@@ -1,0 +1,7 @@
+[WILDCARD]
+Bundled 4 modules in [WILDLINE]
+  dist/index-[WILDLINE].js [WILDLINE]
+  dist/multiple-html-[WILDLINE].js [WILDLINE]
+  dist/index.html [WILDLINE]
+  dist/multiple-html.html [WILDLINE]
+
