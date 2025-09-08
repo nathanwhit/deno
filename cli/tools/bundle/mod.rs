@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use deno_ast::EmitOptions;
@@ -81,8 +80,6 @@ use crate::util::file_watcher::WatcherRestartMode;
 static DISABLE_HACK: LazyLock<bool> =
   LazyLock::new(|| std::env::var("NO_DENO_BUNDLE_HACK").is_err());
 
-const VIRTUAL_ENTRY_PREFIX: &str = "\0\0deno-bundle-html:";
-
 pub async fn prepare_inputs(
   resolver: &CliResolver,
   sys: CliSys,
@@ -139,11 +136,9 @@ pub async fn prepare_inputs(
     for html_path in &html_paths {
       let entry = html::load_html_entrypoint(&init_cwd, html_path)?;
 
-      let entry_name = &entry.entry_name;
-
-      // Write a temporary module that imports each script src
       let virtual_module_path =
-        format!("{VIRTUAL_ENTRY_PREFIX}{entry_name}.entry.js");
+        deno_path_util::url_from_file_path(&entry.virtual_module_path)?;
+      let virtual_module_path = virtual_module_path.to_string();
       virtual_modules.insert(
         virtual_module_path.clone(),
         VirtualModule::new(
@@ -158,7 +153,7 @@ pub async fn prepare_inputs(
         }
       }
 
-      entries.push((entry_name.clone(), virtual_module_path));
+      entries.push(("".into(), virtual_module_path));
       html_pages.push(entry);
     }
 
@@ -1747,9 +1742,9 @@ fn configure_esbuild_flags(
   if is_html {
     builder.platform(esbuild_client::Platform::Browser);
     builder.splitting(true);
-    builder.entry_names("[name]");
-    builder.chunk_names("[name]-[hash]");
-    builder.asset_names("[name]-[hash]");
+    builder.entry_names("[dir]/[name]-[hash]");
+    builder.chunk_names("[dir]/[name]-[hash]");
+    builder.asset_names("[dir]/[name]-[hash]");
     builder.metafile(true);
   }
   match bundle_flags.platform {
@@ -1863,6 +1858,15 @@ pub struct OutputFile<'a> {
   pub hash: Option<String>,
 }
 
+impl<'a> std::fmt::Debug for OutputFile<'a> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("OutputFile")
+      .field("path", &self.path)
+      .field("hash", &self.hash)
+      .finish()
+  }
+}
+
 impl<'a> From<&'a esbuild_client::protocol::BuildOutputFile>
   for OutputFile<'a>
 {
@@ -1894,6 +1898,9 @@ pub fn process_result(
   outdir: Option<&Path>,
 ) -> Result<Vec<OutputFileInfo>, AnyError> {
   let outdir = if let Some(outdir) = outdir {
+    if !outdir.exists() {
+      std::fs::create_dir_all(outdir)?;
+    }
     Some(outdir.canonicalize()?)
   } else {
     None

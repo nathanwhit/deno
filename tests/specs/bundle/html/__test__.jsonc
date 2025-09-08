@@ -1,0 +1,23 @@
+{
+  "tempDir": true,
+  "tests": {
+    "basic": {
+      "steps": [
+        {
+          "args": "bundle --outdir ./dist index.html",
+          "output": "basic-bundle.out"
+        },
+        {
+          "args": [
+            "run",
+            "-A",
+            "file-has.ts",
+            "./dist/index.html",
+            "regex:src=\"./index-[^.]+.js\""
+          ],
+          "output": "true\n"
+        }
+      ]
+    }
+  }
+}

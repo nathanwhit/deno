@@ -139,7 +139,11 @@ pub struct HtmlEntrypoint {
   pub temp_module: String,
   pub contents: String,
   pub entry_name: String,
+
+  pub virtual_module_path: PathBuf,
 }
+
+const VIRTUAL_ENTRY_SUFFIX: &str = ".deno-bundle-html.entry";
 
 // Helper to create a filesystem-friendly name based on a path
 fn sanitize_entry_name(cwd: &Path, path: &Path) -> String {
@@ -148,16 +152,12 @@ fn sanitize_entry_name(cwd: &Path, path: &Path) -> String {
   let stem = rel
     .with_extension("")
     .to_string_lossy()
-    .replace(['\\', '/'], "$PATHSEP$");
+    .replace(['\\', '/'], "_");
   if stem.is_empty() {
     "entry".to_string()
   } else {
     stem
   }
-}
-
-fn desanitize_entry_name(name: &str) -> String {
-  name.replace("$PATHSEP$", std::path::MAIN_SEPARATOR_STR)
 }
 
 fn parse_html_entrypoint(
@@ -179,12 +179,19 @@ fn parse_html_entrypoint(
     }
   }
 
+  let entry_name = sanitize_entry_name(cwd, path);
+  let virtual_module_path = path
+    .parent()
+    .unwrap()
+    .join(format!("{}{}.js", entry_name, VIRTUAL_ENTRY_SUFFIX));
+
   Ok(HtmlEntrypoint {
     path: path.to_path_buf(),
     scripts,
     temp_module,
     contents,
-    entry_name: sanitize_entry_name(cwd, path),
+    entry_name,
+    virtual_module_path,
   })
 }
 
@@ -196,17 +203,41 @@ pub fn load_html_entrypoint(
   parse_html_entrypoint(cwd, path, contents)
 }
 
+#[derive(Debug, Clone)]
+pub struct ParsedOutput {
+  path: PathBuf,
+  index: usize,
+  hash: String,
+}
+
+#[derive(Debug)]
 pub struct HtmlOutputFiles<'a, 'f> {
   output_files: &'f mut Vec<OutputFile<'a>>,
-  index: HashMap<String, PathBuf>,
+  index: HashMap<String, ParsedOutput>,
 }
 
 impl<'a, 'f> HtmlOutputFiles<'a, 'f> {
   pub fn new(output_files: &'f mut Vec<OutputFile<'a>>) -> Self {
+    let re =
+      lazy_regex::regex!(r"(^.+\.deno-bundle-html.entry)-([^.]+)(\..+)$");
     let mut index = std::collections::HashMap::new();
-    for f in output_files.iter() {
-      if let Some(name) = f.path.file_name().and_then(|s| s.to_str()) {
-        index.insert(name.to_string(), f.path.clone());
+    for (i, f) in output_files.iter().enumerate() {
+      if let Some(name) = f.path.file_name().map(|s| s.to_string_lossy()) {
+        let Some(captures) = re.captures(&name) else {
+          continue;
+        };
+        let mut entry_name = captures.get(1).unwrap().as_str().to_string();
+        let ext = captures.get(3).unwrap().as_str();
+        entry_name.push_str(ext);
+
+        index.insert(
+          entry_name,
+          ParsedOutput {
+            path: f.path.clone(),
+            index: i,
+            hash: captures.get(2).unwrap().as_str().to_string(),
+          },
+        );
       }
     }
     Self {
@@ -214,22 +245,36 @@ impl<'a, 'f> HtmlOutputFiles<'a, 'f> {
       index,
     }
   }
+
+  pub fn get_and_update_path(
+    &mut self,
+    name: &str,
+    f: impl FnOnce(PathBuf, &ParsedOutput) -> PathBuf,
+  ) -> Option<PathBuf> {
+    let parsed_output = self.index.get_mut(name)?;
+    let new_path = f(parsed_output.path.clone(), parsed_output);
+    parsed_output.path = new_path.clone();
+    self.output_files[parsed_output.index].path = new_path.clone();
+    Some(new_path)
+  }
 }
 
 impl HtmlEntrypoint {
+  fn original_entry_name(&self) -> String {
+    self.path.file_stem().unwrap().to_string_lossy().to_string()
+  }
   pub fn patch_html_with_response<'a>(
     self,
-    cwd: &Path,
+    _cwd: &Path,
     outdir: &Path,
     html_output_files: &mut HtmlOutputFiles<'a, '_>,
   ) -> anyhow::Result<()> {
-    eprintln!("outdir: {:?}; self.path: {:?}", outdir, self.path);
-    let html_out_path = {
-      outdir.join(&format!("{}.html", desanitize_entry_name(&self.entry_name)))
-    };
-    eprintln!("html_out_path: {:?}", html_out_path);
+    let original_entry_name = self.original_entry_name();
 
     if self.scripts.is_empty() {
+      let html_out_path =
+        // TODO(nathanwhit): not really correct
+        { outdir.join(&format!("{}.html", &original_entry_name)) };
       html_output_files.output_files.push(OutputFile {
         path: html_out_path,
         contents: Cow::Owned(self.contents.into_bytes()),
@@ -238,81 +283,93 @@ impl HtmlEntrypoint {
       return Ok(());
     }
 
-    // With hashed patterns enabled, the output names will be
-    //   <entry>-<hash>.js and optionally <entry>-<hash>.css
-    // Fallback to non-hashed names if patterns are not applied.
+    let entry_name = format!("{}{}", self.entry_name, VIRTUAL_ENTRY_SUFFIX);
+    let js_entry_name = format!("{}.js", entry_name);
+
+    let mut js_out_no_hash = None;
     let js_out = html_output_files
-      .index
-      .get(&format!("{}.js", self.entry_name))
-      .cloned();
-    let css_out = html_output_files
-      .index
-      .get(&format!("{}.css", self.entry_name))
-      .cloned();
+      .get_and_update_path(&js_entry_name, |p, f| {
+        let p = p.to_string_lossy();
+        js_out_no_hash = Some(
+          p.replace(entry_name.as_str(), &original_entry_name)
+            .replace(&format!("-{}", f.hash), "")
+            .into(),
+        );
 
-    eprintln!("js_out: {:?}", js_out);
-    eprintln!("css_out: {:?}", css_out);
+        p.replace(entry_name.as_str(), &original_entry_name).into()
+      })
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "failed to locate output for HTML entry '{}'; {js_entry_name}",
+          self.entry_name
+        )
+      })?;
+    let html_out_path = js_out_no_hash
+      .unwrap_or_else(|| js_out.clone())
+      .with_extension("html");
 
-    let script_src = js_out.as_ref().map(|p| {
+    let css_entry_name = format!("{}.css", entry_name);
+    let css_out =
+      html_output_files.get_and_update_path(&css_entry_name, |p, _| {
+        p.to_string_lossy()
+          .replace(entry_name.as_str(), &original_entry_name)
+          .into()
+      });
+
+    let script_src = {
       let base = html_out_path.parent().unwrap_or(outdir);
-      let mut rel = pathdiff::diff_paths(p, base)
-        .unwrap_or_else(|| p.clone())
+      let mut rel = pathdiff::diff_paths(&js_out, base)
+        .unwrap_or_else(|| js_out.clone())
         .to_string_lossy()
-        .to_string();
+        .into_owned();
       if std::path::MAIN_SEPARATOR != '/' {
         rel = rel.replace('\\', "/");
       }
       rel
-    });
-    eprintln!("script_src: {:?}", script_src);
+    };
     let any_async = self.scripts.iter().any(|s| s.is_async);
     let any_module = self.scripts.iter().any(|s| s.is_module);
 
-    if let Some(script_src) = script_src {
-      let to_inject = Script {
-        src: Some(
-          if !script_src.starts_with(".") && !script_src.starts_with("/") {
-            format!("./{}", script_src)
-          } else {
-            script_src
-          },
-        ),
-        is_async: any_async,
-        is_module: any_module,
-        resolved_path: None,
-      };
+    let to_inject = Script {
+      src: Some(
+        if !script_src.starts_with(".") && !script_src.starts_with("/") {
+          format!("./{}", script_src)
+        } else {
+          script_src
+        },
+      ),
+      is_async: any_async,
+      is_module: any_module,
+      resolved_path: None,
+    };
 
-      let css_href = css_out.as_ref().map(|p| {
-        let base = html_out_path.parent().unwrap_or(outdir);
-        let mut rel = pathdiff::diff_paths(p, base)
-          .unwrap_or_else(|| p.clone())
-          .to_string_lossy()
-          .to_string();
-        if std::path::MAIN_SEPARATOR != '/' {
-          rel = rel.replace('\\', "/");
-        }
-        rel
-      });
+    let css_href = css_out.as_ref().map(|p| {
+      let base = html_out_path.parent().unwrap_or(outdir);
+      let mut rel = pathdiff::diff_paths(p, base)
+        .unwrap_or_else(|| p.clone())
+        .to_string_lossy()
+        .into_owned();
+      if std::path::MAIN_SEPARATOR != '/' {
+        rel = rel.replace('\\', "/");
+      }
+      if !rel.starts_with(".") && !rel.starts_with("/") {
+        rel = format!("./{}", rel);
+      }
+      rel
+    });
 
-      let patched = inject_scripts_and_css(
-        &self.contents,
-        to_inject,
-        &self.scripts,
-        css_href,
-      )?;
+    let patched = inject_scripts_and_css(
+      &self.contents,
+      to_inject,
+      &self.scripts,
+      css_href,
+    )?;
 
-      html_output_files.output_files.push(OutputFile {
-        path: html_out_path,
-        contents: Cow::Owned(patched.into_bytes()),
-        hash: None,
-      });
-    } else {
-      // Missing JS output for the page's entry
-      return Err(deno_core::anyhow::anyhow!(
-        "failed to locate output for HTML entry '{}'",
-        self.entry_name
-      ));
-    }
+    html_output_files.output_files.push(OutputFile {
+      path: html_out_path,
+      contents: Cow::Owned(patched.into_bytes()),
+      hash: None,
+    });
 
     Ok(())
   }
@@ -390,11 +447,4 @@ fn inject_scripts_and_css(
     },
   )?;
   Ok(rewritten)
-}
-
-fn reencode_hash(hash: &str) -> String {
-  base32::encode(
-    base32::Alphabet::Rfc4648 { padding: false },
-    hash.as_bytes(),
-  )
 }
