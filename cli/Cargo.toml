@@ -99,7 +99,6 @@ node_resolver = { workspace = true, features = ["graph", "sync"] }
 anstream.workspace = true
 async-trait.workspace = true
 aws-lc-rs.workspace = true
-base32.workspace = true
 base64.workspace = true
 bincode.workspace = true
 boxed_error.workspace = true
@@ -184,6 +183,7 @@ tower-lsp.workspace = true
 tracing = { workspace = true, features = ["log"], optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
+twox-hash.workspace = true
 typed-arena.workspace = true
 unicode-width.workspace = true
 uuid = { workspace = true, features = ["serde"] }

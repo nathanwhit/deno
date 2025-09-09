@@ -171,7 +171,7 @@ fn parse_html_entrypoint(
   for script in &mut scripts {
     if let Some(src) = &mut script.src {
       let src = src.trim_start_matches('/');
-      let path = path.parent().unwrap().join(src);
+      let path = path.parent().unwrap_or(Path::new("")).join(src);
 
       temp_module
         .push_str(&format!("import \"{}\";\n", path.to_string_lossy()));
@@ -182,7 +182,7 @@ fn parse_html_entrypoint(
   let entry_name = sanitize_entry_name(cwd, path);
   let virtual_module_path = path
     .parent()
-    .unwrap()
+    .unwrap_or(Path::new(""))
     .join(format!("{}{}.js", entry_name, VIRTUAL_ENTRY_SUFFIX));
 
   Ok(HtmlEntrypoint {

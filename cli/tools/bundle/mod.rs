@@ -149,7 +149,8 @@ pub async fn prepare_inputs(
 
       for script in &entry.scripts {
         if let Some(path) = &script.resolved_path {
-          to_cache_urls.push(Url::from_file_path(path).unwrap());
+          let url = deno_path_util::url_from_file_path(path)?;
+          to_cache_urls.push(url);
         }
       }
 
@@ -1889,25 +1890,22 @@ impl<'a> From<esbuild_client::protocol::BuildOutputFile> for OutputFile<'a> {
   }
 }
 
-pub fn process_result(
-  response: &BuildResponse,
+pub fn collect_output_files<'a>(
+  response_output_files: Option<&'a [protocol::BuildOutputFile]>,
   cwd: &Path,
-  should_replace_require_shim: bool,
-  minified: bool,
   input: BundlerInput,
   outdir: Option<&Path>,
-) -> Result<Vec<OutputFileInfo>, AnyError> {
+) -> Result<Vec<OutputFile<'a>>, AnyError> {
   let outdir = if let Some(outdir) = outdir {
-    if !outdir.exists() {
-      std::fs::create_dir_all(outdir)?;
+    if outdir.is_absolute() {
+      Some(outdir.to_path_buf())
+    } else {
+      Some(cwd.join(outdir))
     }
-    Some(outdir.canonicalize()?)
   } else {
     None
   };
-  let mut output_files: Vec<OutputFile> = response
-    .output_files
-    .as_ref()
+  let mut output_files: Vec<OutputFile> = response_output_files
     .map(|fs| {
       fs.iter()
         .map(|f| OutputFile {
@@ -1935,7 +1933,19 @@ pub fn process_result(
       page.patch_html_with_response(cwd, &outdir, &mut html_output_files)?;
     }
   }
+  Ok(output_files)
+}
 
+pub fn process_result(
+  response: &BuildResponse,
+  cwd: &Path,
+  should_replace_require_shim: bool,
+  minified: bool,
+  input: BundlerInput,
+  outdir: Option<&Path>,
+) -> Result<Vec<OutputFileInfo>, AnyError> {
+  let output_files =
+    collect_output_files(response.output_files.as_deref(), cwd, input, outdir)?;
   let mut exists_cache = std::collections::HashSet::new();
   let mut output_infos = Vec::new();
   for file in output_files.iter() {

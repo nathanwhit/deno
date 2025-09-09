@@ -91,13 +91,29 @@ pub fn convert_build_response(
   }
 }
 
+fn hash_contents(contents: &[u8]) -> String {
+  use base64::prelude::*;
+  let hash = twox_hash::XxHash64::oneshot(0, contents);
+  let bytes = hash.to_le_bytes();
+  base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
+
 fn process_output_files(
   bundle_flags: &crate::args::BundleFlags,
   response: &mut esbuild_client::protocol::BuildResponse,
+  cwd: &Path,
+  input: super::BundlerInput,
 ) -> Result<(), AnyError> {
-  if let Some(files) = &mut response.output_files {
-    for file in files {
-      let output_file = crate::tools::bundle::OutputFile::from(&*file);
+  if let Some(files) = std::mem::take(&mut response.output_files) {
+    let output_files = super::collect_output_files(
+      Some(&*files),
+      cwd,
+      input,
+      bundle_flags.output_dir.as_ref().map(Path::new),
+    )?;
+    let mut new_files = Vec::new();
+
+    for output_file in output_files {
       let processed_contents = crate::tools::bundle::maybe_process_contents(
         &output_file,
         crate::tools::bundle::should_replace_require_shim(
@@ -105,10 +121,16 @@ fn process_output_files(
         ),
         bundle_flags.minify,
       )?;
-      if let Some(contents) = processed_contents.contents {
-        file.contents = contents;
-      }
+      let contents = processed_contents
+        .contents
+        .unwrap_or_else(|| output_file.contents.into_owned());
+      new_files.push(esbuild_client::protocol::BuildOutputFile {
+        path: output_file.path.to_string_lossy().into_owned(),
+        hash: hash_contents(&contents),
+        contents,
+      });
     }
+    response.output_files = Some(new_files);
   }
   Ok(())
 }
@@ -158,7 +180,12 @@ impl BundleProvider for CliBundleProvider {
           )?;
           result.output_files = None;
         } else {
-          process_output_files(&bundle_flags, &mut result)?;
+          process_output_files(
+            &bundle_flags,
+            &mut result,
+            &bundler.cwd,
+            bundler.input,
+          )?;
         }
         log::trace!("convert_build_response");
         let result = convert_build_response(result);
