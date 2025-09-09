@@ -59,12 +59,12 @@ where
   }
 
   out.append(' ');
-  for i in 0..attrs.len() - 1 {
-    attrs[i].write_out(out);
+  for item in attrs.iter().take(attrs.len() - 1) {
+    item.write_out(out);
     out.append(' ');
   }
 
-  attrs[attrs.len() - 1].write_out(out);
+  attrs.last().unwrap().write_out(out);
 }
 
 impl Script {
@@ -274,7 +274,7 @@ impl HtmlEntrypoint {
     if self.scripts.is_empty() {
       let html_out_path =
         // TODO(nathanwhit): not really correct
-        { outdir.join(&format!("{}.html", &original_entry_name)) };
+        { outdir.join(format!("{}.html", &original_entry_name)) };
       html_output_files.output_files.push(OutputFile {
         path: html_out_path,
         contents: Cow::Owned(self.contents.into_bytes()),

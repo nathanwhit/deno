@@ -134,7 +134,7 @@ pub async fn prepare_inputs(
     let mut virtual_modules = VirtualModules::new();
 
     for html_path in &html_paths {
-      let entry = html::load_html_entrypoint(&init_cwd, html_path)?;
+      let entry = html::load_html_entrypoint(init_cwd, html_path)?;
 
       let virtual_module_path =
         deno_path_util::url_from_file_path(&entry.virtual_module_path)?;
@@ -227,8 +227,8 @@ pub async fn bundle_init(
   let input = prepare_inputs(
     &resolver,
     sys,
-    &npm_resolver,
-    &node_resolver,
+    npm_resolver,
+    node_resolver,
     &init_cwd,
     bundle_flags,
     Arc::get_mut(&mut plugin_handler).unwrap(),

@@ -21,7 +21,7 @@ export function assertFileDoesNotContain(
 ) {
   try {
     assertFileContains(path, pattern);
-  } catch (e) {
+  } catch (_e) {
     return;
   }
   let message = "";
