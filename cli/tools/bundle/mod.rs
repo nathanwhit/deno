@@ -5,6 +5,7 @@ mod externals;
 mod html;
 mod provider;
 mod transform;
+mod serve;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -115,16 +116,20 @@ pub async fn prepare_inputs(
       roots.into_iter().map(|e| ("".into(), e.into())).collect(),
     ))
   } else {
-    // require an outdir when any HTML is present
-    if bundle_flags.output_dir.is_none() {
-      return Err(deno_core::anyhow::anyhow!(
-        "--outdir is required when bundling HTML entrypoints",
-      ));
-    }
-    if bundle_flags.output_path.is_some() {
-      return Err(deno_core::anyhow::anyhow!(
-        "--output is not supported with HTML entrypoints; use --outdir",
-      ));
+    // In non-serve mode, HTML requires an outdir and does not support --output.
+    let is_serve =
+      bundle_flags.serve_addr.is_some() || bundle_flags.dev_addr.is_some();
+    if !is_serve {
+      if bundle_flags.output_dir.is_none() {
+        return Err(deno_core::anyhow::anyhow!(
+          "--outdir is required when bundling HTML entrypoints",
+        ));
+      }
+      if bundle_flags.output_path.is_some() {
+        return Err(deno_core::anyhow::anyhow!(
+          "--output is not supported with HTML entrypoints; use --outdir",
+        ));
+      }
     }
 
     // Prepare HTML pages and temp entry modules
@@ -253,6 +258,7 @@ pub async fn bundle_init(
   let esbuild_flags = configure_esbuild_flags(
     bundle_flags,
     matches!(input, BundlerInput::EntrypointsWithHtml { .. }),
+    bundle_flags.dev_addr.is_some() || bundle_flags.serve_addr.is_some(),
   );
   let bundler = EsbuildBundler::new(
     client,
@@ -285,6 +291,31 @@ pub async fn bundle(
   let end = std::time::Instant::now();
   let duration = end.duration_since(start);
 
+  // New serve/dev path (Phase 0: one-shot serve, no watch)
+  if bundle_flags.dev_addr.is_some() || bundle_flags.serve_addr.is_some() {
+    handle_esbuild_errors_and_warnings(
+      &response,
+      &init_cwd,
+      &bundler.plugin_handler.take_deferred_resolve_errors(),
+    );
+
+    if !response.errors.is_empty() {
+      deno_core::anyhow::bail!("bundling failed");
+    }
+
+    return serve::bundle_serve(
+      flags,
+      bundler,
+      response,
+      bundle_flags.minify,
+      bundle_flags.platform,
+      bundle_flags.dev_addr.or(bundle_flags.serve_addr).unwrap(),
+      bundle_flags.watch,
+      bundle_flags.dev_addr.is_some(),
+    )
+    .await;
+  }
+
   if bundle_flags.watch {
     if !response.errors.is_empty() || !response.warnings.is_empty() {
       handle_esbuild_errors_and_warnings(
@@ -302,6 +333,7 @@ pub async fn bundle(
       bundle_flags.minify,
       bundle_flags.platform,
       bundle_flags.output_dir.as_ref().map(Path::new),
+      None,
     )
     .await;
   }
@@ -351,6 +383,7 @@ async fn bundle_watch(
   minified: bool,
   platform: BundlePlatform,
   output_dir: Option<&Path>,
+  dev_controller: Option<crate::tools::bundle::serve::DevServerController>,
 ) -> Result<(), AnyError> {
   let (initial_roots, always_watch) = match &bundler.input {
     BundlerInput::Entrypoints(entries) => (
@@ -401,7 +434,9 @@ async fn bundle_watch(
       let current_roots = current_roots.clone();
       let input = input.clone();
       let always_watch = always_watch.clone();
-      Ok(async move {
+      Ok({
+        let dev_controller = dev_controller.clone();
+        async move {
         let mut bundler = bundler.lock().await;
         let start = std::time::Instant::now();
         if let Some(changed_paths) = changed_paths {
@@ -418,15 +453,23 @@ async fn bundle_watch(
         );
         if response.errors.is_empty() {
           let metafile = metafile_from_response(&response)?;
-          let output_infos = process_result(
-            &response,
-            &bundler.cwd,
-            should_replace_require_shim(platform),
-            minified,
-            input,
-            output_dir,
-          )?;
-          print_finished_message(&metafile, &output_infos, start.elapsed())?;
+          if let Some(controller) = &dev_controller {
+            controller.apply_response(&response, &bundler.cwd, input.clone(), platform, minified).await?;
+            // Print summary like normal for consistency (no file writes)
+            // We supply no output_infos since we didn't write files; still show timing + module count
+            let output_infos: Vec<OutputFileInfo> = Vec::new();
+            print_finished_message(&metafile, &output_infos, start.elapsed())?;
+          } else {
+            let output_infos = process_result(
+              &response,
+              &bundler.cwd,
+              should_replace_require_shim(platform),
+              minified,
+              input,
+              output_dir,
+            )?;
+            print_finished_message(&metafile, &output_infos, start.elapsed())?;
+          }
 
           let mut new_watched = get_input_paths_for_watch(&response);
           new_watched.extend(always_watch.iter().cloned());
@@ -438,7 +481,7 @@ async fn bundle_watch(
         }
 
         Ok(())
-      })
+      }})
     },
   )
   .boxed_local()
@@ -1706,6 +1749,7 @@ async fn ensure_esbuild_downloaded(
 fn configure_esbuild_flags(
   bundle_flags: &BundleFlags,
   is_html: bool,
+  needs_virtual_outdir: bool,
 ) -> Vec<String> {
   let mut builder = EsbuildFlagsBuilder::default();
 
@@ -1733,10 +1777,25 @@ fn configure_esbuild_flags(
     });
   }
 
-  if let Some(outdir) = bundle_flags.output_dir.clone() {
-    builder.outdir(outdir);
-  } else if let Some(output_path) = bundle_flags.output_path.clone() {
-    builder.outfile(output_path);
+  // Choose how to specify output locations for esbuild
+  // - For HTML entrypoints, always prefer an outdir (ignore outfile), because
+  //   we want splitting + assets with stable names. When serving, default to ".".
+  // - For non-HTML entries, respect outfile if provided; otherwise use outdir
+  //   (and default to "." when serving).
+  if is_html {
+    let outdir = bundle_flags
+      .output_dir
+      .clone()
+      .or_else(|| if needs_virtual_outdir { Some(".".to_string()) } else { None });
+    if let Some(outdir) = outdir { builder.outdir(outdir); }
+  } else {
+    if let Some(output_path) = bundle_flags.output_path.clone() {
+      builder.outfile(output_path);
+    } else if let Some(outdir) = bundle_flags.output_dir.clone() {
+      builder.outdir(outdir);
+    } else if needs_virtual_outdir {
+      builder.outdir(".".to_string());
+    }
   }
   builder.metafile(true);
 

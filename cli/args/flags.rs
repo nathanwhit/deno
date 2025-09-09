@@ -492,6 +492,9 @@ pub struct BundleFlags {
   pub sourcemap: Option<SourceMapType>,
   pub platform: BundlePlatform,
   pub watch: bool,
+  // New flags for dev server
+  pub serve_addr: Option<SocketAddr>,
+  pub dev_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2007,6 +2010,26 @@ If no output file is given, the output is written to standard output:
           .num_args(1..)
           .required_unless_present("help")
           .value_hint(ValueHint::FilePath),
+      )
+      .arg(
+        Arg::new("serve")
+          .long("serve")
+          .help("Serve the bundle from memory at <host:port> [default: 127.0.0.1:5173]")
+          .require_equals(true)
+          .num_args(0..=1)
+          .default_missing_value("127.0.0.1:5173")
+          .value_parser(value_parser!(SocketAddr))
+          .action(ArgAction::Set),
+      )
+      .arg(
+        Arg::new("dev")
+          .long("dev")
+          .help("Dev server (serve + watch) at <host:port> [default: 127.0.0.1:5173]")
+          .require_equals(true)
+          .num_args(0..=1)
+          .default_missing_value("127.0.0.1:5173")
+          .value_parser(value_parser!(SocketAddr))
+          .action(ArgAction::Set),
       )
       .arg(
         Arg::new("output")
@@ -5047,12 +5070,15 @@ fn bundle_parse(
   let file = matches.remove_many::<String>("file").unwrap();
   let output = matches.remove_one::<String>("output");
   let outdir = matches.remove_one::<String>("outdir");
+  let serve_addr = matches.remove_one::<SocketAddr>("serve");
+  let dev_addr = matches.remove_one::<SocketAddr>("dev");
   compile_args_without_check_parse(flags, matches)?;
   unstable_args_parse(flags, matches, UnstableArgsConfig::ResolutionAndRuntime);
   allow_and_deny_import_parse(flags, matches)?;
   flags.subcommand = DenoSubcommand::Bundle(BundleFlags {
     entrypoints: file.collect(),
-    watch: matches.get_flag("watch"),
+    // dev implies watch
+    watch: matches.get_flag("watch") || dev_addr.is_some(),
     output_path: output,
     output_dir: outdir,
     external: matches
@@ -5066,6 +5092,8 @@ fn bundle_parse(
     inline_imports: matches.get_flag("inline-imports"),
     platform: matches.remove_one::<BundlePlatform>("platform").unwrap(),
     sourcemap: matches.remove_one::<SourceMapType>("sourcemap"),
+    serve_addr,
+    dev_addr,
   });
   Ok(())
 }
