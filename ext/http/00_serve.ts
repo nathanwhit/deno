@@ -825,17 +825,21 @@ function serve(arg1, arg2) {
   op_serve2(arg1, (reqId) => {
     // const req = new NewInnerRequest(reqId);
     // const r = fromInnerRequest(req, "immutable");
-    const result = arg2({});
-    if ("then" in result) {
-      console.log("thenable");
-      return PromisePrototypeThen(result, (response) => {
-        console.log("thenable resolved");
-        return handleResponse(reqId, response);
-      });
+    try {
+      const result = arg2({});
+      if ("then" in result) {
+        // console.log("thenable");
+        return PromisePrototypeThen(result, (response) => {
+          // console.log("thenable resolved");
+          return handleResponse(reqId, response);
+        });
+      }
+      return handleResponse(reqId, result);
+    } catch (error) {
+      return handleResponse(reqId, new Response("Internal Server Error"));
     }
-    return handleResponse(reqId, result);
   }, (error) => {
-    return handleResponse(reqId, internalServerError());
+    return handleResponse(reqId, new Response("Internal Server Error"));
   });
 }
 

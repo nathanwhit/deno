@@ -77,6 +77,7 @@ use smallvec::SmallVec;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 
 use super::fly_accept_encoding;
 use crate::LocalExecutor;
@@ -1582,7 +1583,7 @@ macro_rules! lazy_strings {
       )*
     }
     impl $name {
-      fn new(scope: &mut v8::HandleScope) -> Self {
+      fn new<'a>(scope: &mut v8::PinScope<'a, '_>) -> Self {
         $(
           let $field = v8::String::new_from_utf8(scope, $value.as_bytes(), v8::NewStringType::Internalized).unwrap();
           let $field = v8::Global::new(scope, $field);
@@ -1594,7 +1595,7 @@ macro_rules! lazy_strings {
         }
       }
 
-      fn get_or_init(scope: &mut v8::HandleScope, op_state: &mut deno_core::OpState) -> Self {
+      fn get_or_init<'a>(scope: &mut v8::PinScope<'a, '_>, op_state: &mut deno_core::OpState) -> Self {
         if let Some(strings) = op_state.try_borrow::<Self>() {
           strings.clone()
         } else {
@@ -1604,7 +1605,7 @@ macro_rules! lazy_strings {
         }
       }
 
-      fn to_local<'scope>(string: &v8::Global<v8::String>, scope: &mut v8::HandleScope<'scope>) -> v8::Local<'scope, v8::String> {
+      fn to_local<'scope>(string: &v8::Global<v8::String>, scope: &mut v8::PinScope<'scope, '_>) -> v8::Local<'scope, v8::String> {
         v8::Local::new(scope, string)
       }
     }
@@ -1634,12 +1635,12 @@ lazy_strings!(Strings {
 });
 
 #[op2(fast, reentrant)]
-pub fn op_serve2(
+pub fn op_serve2<'a>(
   state: &mut OpState,
-  scope: &mut v8::HandleScope,
-  arg1: v8::Local<v8::Value>,
-  arg2: v8::Local<v8::Value>,
-  on_error_handler: v8::Local<v8::Function>,
+  scope: &mut v8::PinScope<'a, '_>,
+  arg1: v8::Local<'a, v8::Value>,
+  arg2: v8::Local<'a, v8::Value>,
+  on_error_handler: v8::Local<'a, v8::Function>,
 ) {
   // let strings = Strings::get_or_init(scope, state);
   let request_storage =
@@ -1670,17 +1671,17 @@ pub fn op_serve2(
   );
 }
 
-fn serve(
-  scope: &mut v8::HandleScope,
+fn serve<'a>(
+  scope: &mut v8::PinScope<'a, '_>,
   // strings: Strings,
   request_storage: RequestStorage,
   response_storage: ResponseStorage,
-  arg1: v8::Local<v8::Value>,
-  arg2: v8::Local<v8::Value>,
-  on_error_handler: v8::Local<v8::Function>,
+  arg1: v8::Local<'a, v8::Value>,
+  arg2: v8::Local<'a, v8::Value>,
+  on_error_handler: v8::Local<'a, v8::Function>,
 ) {
   let isolate: &mut v8::Isolate = scope.as_mut();
-  let isolate = isolate as *mut v8::Isolate;
+  let isolate = unsafe { isolate.as_raw_isolate_ptr() };
   let mut options: Option<v8::Local<v8::Object>> = None;
   let mut handler: Option<v8::Local<v8::Function>> = None;
 
@@ -1697,9 +1698,9 @@ fn serve(
   let addr = resolve_addr_sync("0.0.0.0", 8000).unwrap().next().unwrap();
 
   let listener = if load_balanced {
-    TcpListener::bind_load_balanced(addr)
+    TcpListener::bind_load_balanced(addr, 512)
   } else {
-    TcpListener::bind_direct(addr, false)
+    TcpListener::bind_direct(addr, false, 512)
   }
   .unwrap();
   let local_addr = listener.local_addr().unwrap();
@@ -1724,7 +1725,7 @@ fn serve_http_on_listener(
   // strings: Strings,
   handler: v8::Global<v8::Function>,
   on_error_handler: v8::Global<v8::Function>,
-  isolate: *mut v8::Isolate,
+  isolate: v8::UnsafeRawIsolatePtr,
   context: v8::Global<v8::Context>,
   request_storage: RequestStorage,
   response_storage: ResponseStorage,
@@ -1748,53 +1749,42 @@ fn serve_http_on_listener(
         let on_error_handler = on_error_handler.clone();
 
         async move {
-          let scope = &mut unsafe {
-            v8::HandleScope::with_context(unsafe { &mut *isolate }, context)
-          };
-
-          let recv = v8::null(scope).into();
-          let handler = v8::Local::new(scope, handler);
-
+          let (done_tx, done_rx) = oneshot::channel();
           let inner_request = RequestData {
             url: req.uri().to_string(),
             headers: std::mem::take(req.headers_mut()),
             response: None,
+            done: Some(done_tx),
           };
           // eprintln!("inner_request: {:?}", inner_request);
           let request_id =
             request_storage.requests.borrow_mut().insert(inner_request);
           // eprintln!("request_id: {:?}", request_id);
 
-          let request_id_number = v8::Number::new(scope, request_id as f64);
+          let (response, is_promise) = {
+            let mut isolate =
+              unsafe { v8::Isolate::from_raw_isolate_ptr(isolate) };
+            v8::make_handle_scope_with_context!(scope, &mut isolate, context,);
 
-          let tc = &mut v8::TryCatch::new(scope);
+            let recv = v8::null(scope).into();
+            let handler = v8::Local::new(scope, handler);
+            let request_id_number = v8::Number::new(scope, request_id as f64);
 
-          let response = handler.call(tc, recv, &[request_id_number.into()]);
-          if tc.has_caught() {
-            let exception = tc.exception().unwrap();
-            let local = v8::Local::new(tc, on_error_handler);
-            let _ = local.call(tc, recv, &[exception.into()]);
-            return Ok::<_, HttpNextError>(response_from_data(ResponseData {
-              status: 500,
-              status_message: "Internal Server Error".to_string(),
-              body: ResponseBytesInner::Bytes(
-                b"Internal Server Error".to_vec().into(),
-              ),
-              headers: HeaderMap::new(),
-            }));
-          }
+            let response =
+              handler.call(scope, recv, &[request_id_number.into()]);
+            if let Some(response) = response {
+              (
+                Some(v8::Global::new(scope, response)),
+                response.is_promise(),
+              )
+            } else {
+              (None, false)
+            }
+          };
           if let Some(response) = response {
-            let global = v8::Global::new(tc, response);
-
-            if response.is_promise() {
-              let promise = response.cast::<v8::Promise>();
-
+            if is_promise {
               // eprintln!("resolving promise: {:?}", promise.state());
-              let _response = scoped_resolve(tc, global);
-              // eprintln!("spawned");
-              let foo = spawn(_response);
-              // eprintln!("awaiting");
-              let _ = foo.await.unwrap().unwrap();
+              done_rx.await.unwrap();
               // eprintln!("resolved promise");
             }
           }
@@ -1850,6 +1840,7 @@ struct RequestData {
   url: String,
   headers: HeaderMap,
   response: Option<ResponseData>,
+  done: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1926,14 +1917,14 @@ pub fn op_get_inner_request_header_list(
 }
 
 #[op2(fast)]
-pub fn op_set_response_text(
+pub fn op_set_response_text<'a>(
   state: &mut OpState,
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'a, '_>,
   #[smi] response_id: u32,
   #[smi] status: u16,
   #[string] status_message: &str,
   #[string] text: String,
-  header_list: v8::Local<v8::Array>,
+  header_list: v8::Local<'a, v8::Array>,
 ) {
   let storage = state.borrow::<RequestStorage>();
   let mut headers = HeaderMap::with_capacity(10);
@@ -1955,24 +1946,25 @@ pub fn op_set_response_text(
     HeaderName::from_static("vary"),
     HeaderValue::from_static("accept-encoding"),
   );
+
+  let mut requests = storage.requests.borrow_mut();
   // eprintln!("setting response text: {:?}; {response_id}", text);
-  storage
-    .requests
-    .borrow_mut()
-    .get_mut(response_id as usize)
-    .unwrap()
-    .response = Some(ResponseData {
+  let request = requests.get_mut(response_id as usize).unwrap();
+  request.response = Some(ResponseData {
     status,
     status_message: status_message.to_string(),
     body: ResponseBytesInner::Bytes(text.into_bytes().into()),
     headers,
   });
+  if let Some(done) = request.done.take() {
+    done.send(()).unwrap();
+  }
 }
 
-fn response_from_value(
-  scope: &mut v8::HandleScope,
+fn response_from_value<'a>(
+  scope: &mut v8::PinScope<'a, '_>,
   strings: &Strings,
-  value: v8::Local<v8::Value>,
+  value: v8::Local<'a, v8::Value>,
 ) -> hyper::Response<Resp> {
   let value = value.cast::<v8::Object>();
 
@@ -2162,238 +2154,3 @@ impl Drop for Resp {
 }
 
 struct Context {}
-
-// fn make_callback(
-//   handler: v8::Local<v8::Function>,
-// ) -> impl FnOnce(Request) -> Response {
-// }
-
-/// Wrap a promise with `then` handlers allowing us to watch the resolution progress from a Rust closure.
-/// This has a side-effect of preventing unhandled rejection handlers from triggering. If that is
-/// desired, the final handler may choose to rethrow the exception.
-pub(crate) fn watch_promise<'s, F>(
-  scope: &mut v8::HandleScope<'s>,
-  promise: v8::Local<'s, v8::Promise>,
-  f: F,
-) -> Option<v8::Local<'s, v8::Promise>>
-where
-  F: FnOnce(
-      &mut v8::HandleScope,
-      v8::ReturnValue,
-      Result<v8::Local<v8::Value>, v8::Local<v8::Value>>,
-    ) + 'static,
-{
-  let external =
-    v8::External::new(scope, Box::into_raw(Box::new(Some(f))) as _);
-
-  fn get_handler<F>(external: v8::Local<v8::External>) -> F {
-    unsafe { Box::<Option<F>>::from_raw(external.value() as _) }
-      .take()
-      .unwrap()
-  }
-
-  let on_fulfilled = v8::Function::builder(
-    |scope: &mut v8::HandleScope,
-     args: v8::FunctionCallbackArguments,
-     rv: v8::ReturnValue| {
-      // eprintln!("on_fulfilled");
-      let data = v8::Local::<v8::External>::try_from(args.data()).unwrap();
-      let f = get_handler::<F>(data);
-      f(scope, rv, Ok(args.get(0)));
-    },
-  )
-  .data(external.into())
-  .build(scope);
-
-  let on_rejected = v8::Function::builder(
-    |scope: &mut v8::HandleScope,
-     args: v8::FunctionCallbackArguments,
-     rv: v8::ReturnValue| {
-      // eprintln!("on_rejected");
-      let data = v8::Local::<v8::External>::try_from(args.data()).unwrap();
-      let f = get_handler::<F>(data);
-      f(scope, rv, Err(args.get(0)));
-    },
-  )
-  .data(external.into())
-  .build(scope);
-
-  // function builders will return None if the runtime is shutting down
-  let (Some(on_fulfilled), Some(on_rejected)) = (on_fulfilled, on_rejected)
-  else {
-    _ = get_handler::<F>(external);
-    return None;
-  };
-
-  // then2 will return None if the runtime is shutting down
-  let Some(promise) = promise.then2(scope, on_fulfilled, on_rejected) else {
-    _ = get_handler::<F>(external);
-    return None;
-  };
-
-  // eprintln!("watch_promise: {:?}", promise);
-
-  Some(promise)
-}
-
-/// Given a promise, returns a future that resolves when it does.
-fn resolve_promise_inner<'s>(
-  scope: &mut v8::HandleScope<'s>,
-  promise: v8::Local<'s, v8::Promise>,
-) -> RcPromiseFuture {
-  let future = RcPromiseFuture::default();
-  let f = future.clone();
-  match promise.state() {
-    v8::PromiseState::Fulfilled => {
-      let value = promise.result(scope);
-      f.0.resolved.set(Some(Ok(v8::Global::new(scope, value))));
-      if let Some(waker) = f.0.waker.take() {
-        waker.wake();
-      }
-      return f;
-    }
-    v8::PromiseState::Rejected => {
-      let value = promise.result(scope);
-      f.0
-        .resolved
-        .set(Some(exception_to_err_result(scope, value, true, true)));
-      if let Some(waker) = f.0.waker.take() {
-        waker.wake();
-      }
-      return f;
-    }
-    v8::PromiseState::Pending => {}
-  }
-  watch_promise(scope, promise, move |scope, _rv, res| {
-    // eprintln!("resolve_promise_inner: {:?}", res);
-    let res = match res {
-      Ok(l) => Ok(v8::Global::new(scope, l)),
-      Err(e) => exception_to_err_result(scope, e, true, true),
-    };
-    f.0.resolved.set(Some(res));
-    if let Some(waker) = f.0.waker.take() {
-      waker.wake();
-    }
-  });
-
-  future
-}
-
-pub fn scoped_resolve(
-  scope: &mut v8::HandleScope,
-  promise: v8::Global<v8::Value>,
-) -> impl Future<Output = Result<v8::Global<v8::Value>, JsError>> + use<> {
-  let promise = v8::Local::new(scope, promise);
-  if !promise.is_promise() {
-    return RcPromiseFuture::new(Ok(v8::Global::new(scope, promise)));
-  }
-  let promise = v8::Local::<v8::Promise>::try_from(promise).unwrap();
-  resolve_promise_inner(scope, promise)
-}
-
-#[derive(Default)]
-struct PromiseFuture {
-  resolved: Cell<Option<Result<v8::Global<v8::Value>, JsError>>>,
-  waker: Cell<Option<Waker>>,
-}
-
-#[derive(Clone, Default)]
-struct RcPromiseFuture(Rc<PromiseFuture>);
-
-impl RcPromiseFuture {
-  pub fn new(res: Result<v8::Global<v8::Value>, JsError>) -> Self {
-    Self(Rc::new(PromiseFuture {
-      resolved: Some(res).into(),
-      ..Default::default()
-    }))
-  }
-}
-
-impl Future for RcPromiseFuture {
-  type Output = Result<v8::Global<v8::Value>, JsError>;
-
-  fn poll(
-    self: Pin<&mut Self>,
-    cx: &mut std::task::Context<'_>,
-  ) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    match this.0.resolved.take() {
-      Some(resolved) => Poll::Ready(resolved),
-      _ => {
-        this.0.waker.set(Some(cx.waker().clone()));
-        Poll::Pending
-      }
-    }
-  }
-}
-
-pub(crate) fn exception_to_err_result<T>(
-  scope: &mut v8::HandleScope,
-  exception: v8::Local<v8::Value>,
-  in_promise: bool,
-  clear_error: bool,
-) -> Result<T, JsError> {
-  Err(exception_to_err(scope, exception, in_promise, clear_error))
-}
-
-pub(crate) fn exception_to_err(
-  scope: &mut v8::HandleScope,
-  exception: v8::Local<v8::Value>,
-  mut in_promise: bool,
-  clear_error: bool,
-) -> JsError {
-  // let state = deno_core::JsRealm::exception_state_from_scope(scope);
-
-  // let mut was_terminating_execution = scope.is_execution_terminating();
-
-  // // Disable running microtasks for a moment. When upgrading to V8 v11.4
-  // // we discovered that canceling termination here will cause the queued
-  // // microtasks to run which breaks some tests.
-  // scope.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-  // // If TerminateExecution was called, cancel isolate termination so that the
-  // // exception can be created. Note that `scope.is_execution_terminating()` may
-  // // have returned false if TerminateExecution was indeed called but there was
-  // // no JS to execute after the call.
-  // scope.cancel_terminate_execution();
-  // let exception = match state.get_dispatched_exception_as_local(scope) {
-  //   Some(dispatched_exception) => {
-  //     // If termination is the result of a `reportUnhandledException` call, we want
-  //     // to use the exception that was passed to it rather than the exception that
-  //     // was passed to this function.
-  //     in_promise = state.is_dispatched_exception_promise();
-  //     if clear_error {
-  //       state.clear_error();
-  //       was_terminating_execution = false;
-  //     }
-  //     dispatched_exception
-  //   }
-  //   _ => {
-  //     if was_terminating_execution && exception.is_null_or_undefined() {
-  //       // If we are terminating and there is no exception, throw `new Error("execution terminated")``.
-  //       let message = v8::String::new(scope, "execution terminated").unwrap();
-  //       v8::Exception::error(scope, message)
-  //     } else {
-  //       // Otherwise re-use the exception
-  //       exception
-  //     }
-  //   }
-  // };
-
-  // let mut js_error = JsError::from_v8_exception(scope, exception);
-  // if in_promise {
-  //   js_error.exception_message = format!(
-  //     "Uncaught (in promise) {}",
-  //     js_error.exception_message.trim_start_matches("Uncaught ")
-  //   );
-  // }
-
-  // if was_terminating_execution {
-  //   // Resume exception termination.
-  //   scope.terminate_execution();
-  // }
-  // scope.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
-
-  // js_error
-
-  todo!()
-}
