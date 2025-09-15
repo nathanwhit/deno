@@ -11,6 +11,7 @@
 /// <reference lib="esnext" />
 
 import { core, primordials } from "ext:core/mod.js";
+import { Response as RustResponse } from "ext:core/ops";
 import * as webidl from "ext:deno_webidl/00_webidl.js";
 import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
 import {
@@ -235,8 +236,11 @@ function initializeAResponse(response, init, bodyWithType) {
 }
 
 class Response {
-  constructor(bodyText) {
+  constructor(bodyText, { status = 200, statusText = "OK", headers = undefined } = {}) {
     this.bodyText = bodyText;
+    this.status = status;
+    this.statusText = statusText;
+    this.headers = headers;
   }
 }
 
@@ -532,4 +536,5 @@ export {
   Response,
   ResponsePrototype,
   toInnerResponse,
+  RustResponse,
 };

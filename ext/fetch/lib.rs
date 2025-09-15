@@ -144,6 +144,76 @@ impl Default for Options {
   }
 }
 
+pub struct ResponseIn {
+  pub status: u16,
+  pub status_text: String,
+  pub headers: Vec<(String, String)>,
+  pub body: String,
+}
+
+pub struct Response {
+  pub inner: RefCell<ResponseIn>,
+}
+
+unsafe impl deno_core::GarbageCollected for Response {
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"Response"
+  }
+  fn trace(&self, visitor: &mut v8::cppgc::Visitor) {}
+}
+
+#[derive(serde::Deserialize)]
+struct ResponseOptions {
+  #[serde(default = "default_status")]
+  status: u16,
+  #[serde(default = "default_status_text")]
+  status_text: String,
+  #[serde(default = "default_headers")]
+  headers: Vec<(String, String)>,
+}
+
+fn default_status() -> u16 {
+  200
+}
+
+fn default_status_text() -> String {
+  "OK".to_string()
+}
+
+fn default_headers() -> Vec<(String, String)> {
+  Vec::new()
+}
+
+impl Default for ResponseOptions {
+  fn default() -> Self {
+    Self {
+      status: default_status(),
+      status_text: default_status_text(),
+      headers: default_headers(),
+    }
+  }
+}
+
+#[op2]
+impl Response {
+  #[constructor]
+  #[cppgc]
+  pub fn new(
+    #[string] body: String,
+    #[serde] options: Option<ResponseOptions>,
+  ) -> Response {
+    let options = options.unwrap_or_default();
+    Response {
+      inner: RefCell::new(ResponseIn {
+        status: options.status,
+        status_text: options.status_text,
+        headers: options.headers,
+        body,
+      }),
+    }
+  }
+}
+
 deno_core::extension!(deno_fetch,
   deps = [ deno_webidl, deno_web, deno_url, deno_console ],
   parameters = [FP: FetchPermissions],
@@ -154,6 +224,7 @@ deno_core::extension!(deno_fetch,
     op_fetch_custom_client<FP>,
     op_fetch_promise_is_settled,
   ],
+  objects = [Response],
   esm = [
     "20_headers.js",
     "21_formdata.js",

@@ -849,10 +849,10 @@ function handleResponse(reqId, response) {
   // console.log("setting response text");
   op_set_response_text(
     reqId,
-    200,
-    "OK",
+    response.status,
+    response.statusText,
     response.bodyText,
-    [],
+    response.headers ?? [],
   );
   // console.log("set response text");
   // } else {

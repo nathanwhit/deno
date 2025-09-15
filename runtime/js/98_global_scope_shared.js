@@ -90,6 +90,7 @@ const windowOrWorkerGlobalScope = {
   ),
   Request: core.propNonEnumerable(request.Request),
   Response: core.propNonEnumerable(response.Response),
+  RustResponse: core.propNonEnumerable(response.RustResponse),
   TextDecoder: core.propNonEnumerable(encoding.TextDecoder),
   TextEncoder: core.propNonEnumerable(encoding.TextEncoder),
   TextDecoderStream: core.propNonEnumerable(encoding.TextDecoderStream),
