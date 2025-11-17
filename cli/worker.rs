@@ -478,7 +478,7 @@ mod tests {
   use deno_resolver::npm::DenoInNpmPackageChecker;
   use deno_runtime::deno_fs::RealFs;
   use deno_runtime::deno_permissions::Permissions;
-  use deno_runtime::permissions::RuntimePermissionDescriptorParser;
+  use deno_runtime::deno_permissions::RuntimePermissionDescriptorParser;
   use deno_runtime::worker::WorkerOptions;
   use deno_runtime::worker::WorkerServiceOptions;
 
