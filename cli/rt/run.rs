@@ -593,18 +593,18 @@ impl ModuleLoader for EmbeddedModuleLoader {
     Some(Cow::Owned(data.data.to_vec()))
   }
 
-  fn source_map_source_exists(&self, source_url: &str) -> Option<bool> {
-    use sys_traits::FsMetadata;
-    let specifier = Url::parse(source_url).ok()?;
-    // only bother checking this for npm packages that might depend on this
-    if self.shared.node_resolver.in_npm_package(&specifier)
-      && let Ok(path) = deno_path_util::url_to_file_path(&specifier)
-    {
-      return self.sys.fs_is_file(path).ok();
-    }
+  // fn source_map_source_exists(&self, source_url: &str) -> Option<bool> {
+  //   use sys_traits::FsMetadata;
+  //   let specifier = Url::parse(source_url).ok()?;
+  //   // only bother checking this for npm packages that might depend on this
+  //   if self.shared.node_resolver.in_npm_package(&specifier)
+  //     && let Ok(path) = deno_path_util::url_to_file_path(&specifier)
+  //   {
+  //     return self.sys.fs_is_file(path).ok();
+  //   }
 
-    Some(true)
-  }
+  //   Some(true)
+  // }
 
   fn get_source_mapped_source_line(
     &self,

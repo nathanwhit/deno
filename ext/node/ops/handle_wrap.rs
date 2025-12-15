@@ -38,6 +38,9 @@ pub fn op_node_new_async_id(state: &mut OpState) -> f64 {
   next_async_id(state) as f64
 }
 
+#[derive(deno_core::CppgcBase)]
+#[cppgc_inheritors(HandleWrap)]
+#[repr(C)]
 pub struct AsyncWrap {
   provider: i32,
   async_id: i64,
@@ -86,7 +89,11 @@ enum State {
   Closed,
 }
 
+#[derive(deno_core::CppgcInherits)]
+#[cppgc_base(AsyncWrap)]
+#[repr(C)]
 pub struct HandleWrap {
+  base: AsyncWrap,
   handle: Option<ResourceId>,
   state: Rc<Cell<State>>,
 }
@@ -101,8 +108,13 @@ unsafe impl GarbageCollected for HandleWrap {
 }
 
 impl HandleWrap {
-  pub(crate) fn create(handle: Option<ResourceId>) -> Self {
+  pub(crate) fn create(
+    state: &mut OpState,
+    provider: i32,
+    handle: Option<ResourceId>,
+  ) -> Self {
     Self {
+      base: AsyncWrap::create(state, provider),
       handle,
       state: Rc::new(Cell::new(State::Initialized)),
     }
@@ -124,11 +136,8 @@ impl HandleWrap {
     state: &mut OpState,
     #[smi] provider: i32,
     #[smi] handle: Option<ResourceId>,
-  ) -> (AsyncWrap, HandleWrap) {
-    (
-      AsyncWrap::create(state, provider),
-      HandleWrap::create(handle),
-    )
+  ) -> HandleWrap {
+    HandleWrap::create(state, provider, handle)
   }
 
   // Ported from Node.js
