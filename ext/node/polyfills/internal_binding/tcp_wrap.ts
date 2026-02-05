@@ -27,11 +27,27 @@
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
-import { op_net_connect_tcp } from "ext:core/ops";
-import { TcpConn } from "ext:deno_net/01_net.js";
+import {
+  op_uv_net_accept_tcp,
+  op_uv_net_connect_tcp,
+  op_uv_net_listen_tcp,
+  op_uv_net_listener_ref,
+  op_uv_net_listener_unref,
+  op_uv_net_read,
+  op_uv_net_ref,
+  op_uv_net_unref,
+  op_uv_net_write,
+} from "ext:core/ops";
 import { core, primordials } from "ext:core/mod.js";
-const { internalFdSymbol } = core;
-const { Error } = primordials;
+const { internalFdSymbol, internalRidSymbol } = core;
+const {
+  Error,
+  ObjectDefineProperty,
+  SafeSet,
+  SetPrototypeAdd,
+  SetPrototypeDelete,
+  SetPrototypeForEach,
+} = primordials;
 import { notImplemented } from "ext:deno_node/_utils.ts";
 import { ConnectionWrap } from "ext:deno_node/internal_binding/connection_wrap.ts";
 import {
@@ -61,6 +77,138 @@ interface AddressInfo {
   address: string;
   family?: string;
   port: number;
+}
+
+class LibuvTcpConn {
+  #rid = 0;
+  #unref = false;
+  #pendingReadPromises = new SafeSet();
+
+  constructor(rid: number) {
+    this.#rid = rid;
+    ObjectDefineProperty(this, internalRidSymbol, {
+      __proto__: null,
+      enumerable: false,
+      value: rid,
+    });
+    ObjectDefineProperty(this, internalFdSymbol, {
+      __proto__: null,
+      enumerable: false,
+      value: undefined,
+    });
+  }
+
+  async read(buffer: Uint8Array): Promise<number | null> {
+    if (buffer.length === 0) {
+      return 0;
+    }
+    const promise = op_uv_net_read(this.#rid, buffer);
+    if (this.#unref) {
+      core.unrefOpPromise(promise);
+    }
+    SetPrototypeAdd(this.#pendingReadPromises, promise);
+    try {
+      const nread = await promise;
+      return nread === 0 ? null : nread;
+    } finally {
+      SetPrototypeDelete(this.#pendingReadPromises, promise);
+    }
+  }
+
+  write(data: Uint8Array): Promise<number> {
+    return op_uv_net_write(this.#rid, data);
+  }
+
+  close(): void {
+    core.tryClose(this.#rid);
+  }
+
+  ref(): void {
+    this.#unref = false;
+    op_uv_net_ref(this.#rid);
+    SetPrototypeForEach(
+      this.#pendingReadPromises,
+      (promise) => core.refOpPromise(promise),
+    );
+  }
+
+  unref(): void {
+    this.#unref = true;
+    op_uv_net_unref(this.#rid);
+    SetPrototypeForEach(
+      this.#pendingReadPromises,
+      (promise) => core.unrefOpPromise(promise),
+    );
+  }
+}
+
+class LibuvTcpListener {
+  #rid = 0;
+  #unref = false;
+  #pendingAcceptPromise?: Promise<{
+    rid: number;
+    localAddr: { hostname: string; port: number };
+    remoteAddr: { hostname: string; port: number };
+  }>;
+
+  constructor(rid: number) {
+    this.#rid = rid;
+    ObjectDefineProperty(this, internalRidSymbol, {
+      __proto__: null,
+      enumerable: false,
+      value: rid,
+    });
+    ObjectDefineProperty(this, internalFdSymbol, {
+      __proto__: null,
+      enumerable: false,
+      value: undefined,
+    });
+  }
+
+  accept(): Promise<{
+    rid: number;
+    localAddr: { hostname: string; port: number };
+    remoteAddr: { hostname: string; port: number };
+  }> {
+    const promise = op_uv_net_accept_tcp(this.#rid).then(
+      ({ 0: rid, 1: localAddr, 2: remoteAddr }) => ({
+        rid,
+        localAddr,
+        remoteAddr,
+      }),
+    );
+
+    this.#pendingAcceptPromise = promise;
+    if (this.#unref) {
+      core.unrefOpPromise(promise);
+    }
+
+    return promise.finally(() => {
+      if (this.#pendingAcceptPromise === promise) {
+        this.#pendingAcceptPromise = undefined;
+      }
+    });
+  }
+
+  close(): void {
+    core.tryClose(this.#rid);
+  }
+
+  ref(): void {
+    this.#unref = false;
+    op_uv_net_listener_ref(this.#rid);
+    if (this.#pendingAcceptPromise) {
+      core.refOpPromise(this.#pendingAcceptPromise);
+    }
+  }
+
+  unref(): void {
+    this.#unref = true;
+    op_uv_net_listener_unref(this.#rid);
+    if (this.#pendingAcceptPromise) {
+      core.unrefOpPromise(this.#pendingAcceptPromise);
+    }
+  }
 }
 
 export class TCPConnectWrap extends AsyncWrap {
@@ -99,7 +247,7 @@ export class TCP extends ConnectionWrap {
   #remotePort?: number;
 
   #backlog?: number;
-  #listener!: Deno.Listener;
+  #listener!: LibuvTcpListener;
   #connections = 0;
 
   #closed = false;
@@ -211,27 +359,22 @@ export class TCP extends ConnectionWrap {
   listen(backlog: number): number {
     this.#backlog = ceilPowOf2(backlog + 1);
 
-    const listenOptions = {
-      hostname: this.#address!,
-      port: this.#port!,
-      transport: "tcp" as const,
-    };
-
-    let listener;
-
     try {
-      listener = Deno.listen(listenOptions);
+      const { 0: rid, 1: localAddr } = op_uv_net_listen_tcp(
+        this.#address!,
+        this.#port!,
+        this.#backlog,
+      );
+      this.#listener = new LibuvTcpListener(rid);
+      this.#address = localAddr.hostname;
+      this.#port = localAddr.port;
     } catch (e) {
+      console.error(e);
       if (e instanceof Deno.errors.NotCapable) {
         throw e;
       }
       return codeMap.get(e.code ?? "UNKNOWN") ?? codeMap.get("UNKNOWN")!;
     }
-
-    const address = listener.addr as Deno.NetAddr;
-    this.#address = address.hostname;
-    this.#port = address.port;
-    this.#listener = listener;
 
     // TODO(kt3k): Delays the accept() call 2 ticks. Deno.Listener can't be closed
     // synchronously when accept() is called. By delaying the accept() call,
@@ -377,16 +520,13 @@ export class TCP extends ConnectionWrap {
     this.#remotePort = port;
     this.#remoteFamily = getIPFamily(address);
 
-    op_net_connect_tcp(
-      { hostname: address ?? "127.0.0.1", port },
-      this.#netPermToken,
-    ).then(
-      ({ 0: rid, 1: localAddr, 2: remoteAddr }) => {
+    op_uv_net_connect_tcp(address ?? "127.0.0.1", port).then(
+      ({ 0: rid, 1: localAddr }) => {
         // Incorrect / backwards, but correcting the local address and port with
         // what was actually used given we can't actually specify these in Deno.
         this.#address = req.localAddress = localAddr.hostname;
         this.#port = req.localPort = localAddr.port;
-        this[kStreamBaseField] = new TcpConn(rid, remoteAddr, localAddr);
+        this[kStreamBaseField] = new LibuvTcpConn(rid);
 
         try {
           this.afterConnect(req, 0);
@@ -439,7 +579,11 @@ export class TCP extends ConnectionWrap {
       return;
     }
 
-    let connection: Deno.Conn;
+    let connection: {
+      rid: number;
+      localAddr: { hostname: string; port: number };
+      remoteAddr: { hostname: string; port: number };
+    };
 
     try {
       connection = await this.#listener.accept();
@@ -463,7 +607,15 @@ export class TCP extends ConnectionWrap {
 
     // Reset the backoff delay upon successful accept.
     this.#acceptBackoffDelay = undefined;
-    const connectionHandle = new TCP(socketType.SOCKET, connection);
+    const connectionHandle = new TCP(socketType.SOCKET);
+    connectionHandle.#address = connection.localAddr.hostname;
+    connectionHandle.#port = connection.localAddr.port;
+    connectionHandle.#remoteAddress = connection.remoteAddr.hostname;
+    connectionHandle.#remotePort = connection.remoteAddr.port;
+    connectionHandle.#remoteFamily = getIPFamily(
+      connection.remoteAddr.hostname,
+    );
+    connectionHandle[kStreamBaseField] = new LibuvTcpConn(connection.rid);
     this.#connections++;
 
     try {

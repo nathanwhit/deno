@@ -5,6 +5,9 @@ use std::rc::Rc;
 
 use crate::error::UvError;
 use crate::error::check;
+use crate::sys::uv_close;
+use crate::sys::uv_handle_t;
+use crate::sys::uv_is_closing;
 use crate::sys::uv_loop_alive;
 use crate::sys::uv_loop_close;
 use crate::sys::uv_loop_init;
@@ -14,6 +17,20 @@ use crate::sys::uv_run_mode_UV_RUN_DEFAULT;
 use crate::sys::uv_run_mode_UV_RUN_NOWAIT;
 use crate::sys::uv_run_mode_UV_RUN_ONCE;
 use crate::sys::uv_stop;
+use crate::sys::uv_walk;
+
+unsafe extern "C" fn close_walk_cb(
+  handle: *mut uv_handle_t,
+  _arg: *mut std::ffi::c_void,
+) {
+  // SAFETY: libuv guarantees this callback receives a valid handle pointer.
+  // uv_close must only be called for handles that are not already closing.
+  unsafe {
+    if uv_is_closing(handle) == 0 {
+      uv_close(handle, None);
+    }
+  }
+}
 
 /// Mode for `UvLoop::run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +125,14 @@ impl UvLoop {
 impl Drop for UvLoop {
   fn drop(&mut self) {
     unsafe {
-      let rc = uv_loop_close(self.ptr.as_ptr());
+      let mut rc = uv_loop_close(self.ptr.as_ptr());
+      if rc != 0 {
+        // Force close any leaked handles and drive close callbacks so the loop
+        // can be closed cleanly on shutdown.
+        uv_walk(self.ptr.as_ptr(), Some(close_walk_cb), std::ptr::null_mut());
+        uv_run(self.ptr.as_ptr(), uv_run_mode_UV_RUN_DEFAULT);
+        rc = uv_loop_close(self.ptr.as_ptr());
+      }
       debug_assert_eq!(rc, 0, "uv_loop_close failed (active handles remain?)");
       // Reclaim the Box allocation.
       drop(Box::from_raw(self.ptr.as_ptr()));

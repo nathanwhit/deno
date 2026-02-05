@@ -44,35 +44,35 @@ struct uv_mutex_t {
   }],
 }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_mutex_init(lock: *mut uv_mutex_t) -> c_int {
-  unsafe {
-    addr_of_mut!((*lock).mutex).write(Mutex::new(()));
-    0
-  }
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_mutex_init(lock: *mut uv_mutex_t) -> c_int {
+//   unsafe {
+//     addr_of_mut!((*lock).mutex).write(Mutex::new(()));
+//     0
+//   }
+// }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_mutex_lock(lock: *mut uv_mutex_t) {
-  unsafe {
-    let guard = (*lock).mutex.lock();
-    // forget the guard so it doesn't unlock when it goes out of scope.
-    // we're going to unlock it manually
-    std::mem::forget(guard);
-  }
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_mutex_lock(lock: *mut uv_mutex_t) {
+//   unsafe {
+//     let guard = (*lock).mutex.lock();
+//     // forget the guard so it doesn't unlock when it goes out of scope.
+//     // we're going to unlock it manually
+//     std::mem::forget(guard);
+//   }
+// }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_mutex_unlock(lock: *mut uv_mutex_t) {
-  unsafe {
-    (*lock).mutex.force_unlock();
-  }
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_mutex_unlock(lock: *mut uv_mutex_t) {
+//   unsafe {
+//     (*lock).mutex.force_unlock();
+//   }
+// }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_mutex_destroy(_lock: *mut uv_mutex_t) {
-  // no cleanup required
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_mutex_destroy(_lock: *mut uv_mutex_t) {
+//   // no cleanup required
+// }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -145,68 +145,68 @@ struct uv_async_t {
 
 type uv_loop_t = Env;
 type uv_async_cb = extern "C" fn(handle: *mut uv_async_t);
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_async_init(
-  r#loop: *mut uv_loop_t,
-  // probably uninitialized
-  r#async: *mut uv_async_t,
-  async_cb: uv_async_cb,
-) -> c_int {
-  unsafe {
-    addr_of_mut!((*r#async).r#loop).write(r#loop);
-    addr_of_mut!((*r#async).r#type).write(uv_handle_type::UV_ASYNC);
-    addr_of_mut!((*r#async).async_cb).write(async_cb);
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_async_init(
+//   r#loop: *mut uv_loop_t,
+//   // probably uninitialized
+//   r#async: *mut uv_async_t,
+//   async_cb: uv_async_cb,
+// ) -> c_int {
+//   unsafe {
+//     addr_of_mut!((*r#async).r#loop).write(r#loop);
+//     addr_of_mut!((*r#async).r#type).write(uv_handle_type::UV_ASYNC);
+//     addr_of_mut!((*r#async).async_cb).write(async_cb);
 
-    let mut resource_name: MaybeUninit<napi_value> = MaybeUninit::uninit();
-    assert_ok(napi_create_string_utf8(
-      r#loop,
-      c"uv_async".as_ptr(),
-      usize::MAX,
-      resource_name.as_mut_ptr(),
-    ));
-    let resource_name = resource_name.assume_init();
+//     let mut resource_name: MaybeUninit<napi_value> = MaybeUninit::uninit();
+//     assert_ok(napi_create_string_utf8(
+//       r#loop,
+//       c"uv_async".as_ptr(),
+//       usize::MAX,
+//       resource_name.as_mut_ptr(),
+//     ));
+//     let resource_name = resource_name.assume_init();
 
-    let res = napi_create_async_work(
-      r#loop,
-      None::<v8::Local<'static, v8::Value>>.into(),
-      resource_name,
-      Some(async_exec_wrap),
-      None,
-      r#async.cast(),
-      addr_of_mut!((*r#async).work),
-    );
-    -res
-  }
-}
+//     let res = napi_create_async_work(
+//       r#loop,
+//       None::<v8::Local<'static, v8::Value>>.into(),
+//       resource_name,
+//       Some(async_exec_wrap),
+//       None,
+//       r#async.cast(),
+//       addr_of_mut!((*r#async).work),
+//     );
+//     -res
+//   }
+// }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_async_send(handle: *mut uv_async_t) -> c_int {
-  unsafe { -napi_queue_async_work((*handle).r#loop, (*handle).work) }
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_async_send(handle: *mut uv_async_t) -> c_int {
+//   unsafe { -napi_queue_async_work((*handle).r#loop, (*handle).work) }
+// }
 
 type uv_close_cb = unsafe extern "C" fn(*mut uv_handle_t);
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn uv_close(handle: *mut uv_handle_t, close: uv_close_cb) {
-  unsafe {
-    if handle.is_null() {
-      close(handle);
-      return;
-    }
-    if let uv_handle_type::UV_ASYNC = (*handle).r#type {
-      let handle: *mut uv_async_t = handle.cast();
-      napi_delete_async_work((*handle).r#loop, (*handle).work);
-    }
-    close(handle);
-  }
-}
+// #[unsafe(no_mangle)]
+// unsafe extern "C" fn uv_close(handle: *mut uv_handle_t, close: uv_close_cb) {
+//   unsafe {
+//     if handle.is_null() {
+//       close(handle);
+//       return;
+//     }
+//     if let uv_handle_type::UV_ASYNC = (*handle).r#type {
+//       let handle: *mut uv_async_t = handle.cast();
+//       napi_delete_async_work((*handle).r#loop, (*handle).work);
+//     }
+//     close(handle);
+//   }
+// }
 
-unsafe extern "C" fn async_exec_wrap(_env: napi_env, data: *mut c_void) {
-  let data: *mut uv_async_t = data.cast();
-  unsafe {
-    ((*data).async_cb)(data);
-  }
-}
+// unsafe extern "C" fn async_exec_wrap(_env: napi_env, data: *mut c_void) {
+//   let data: *mut uv_async_t = data.cast();
+//   unsafe {
+//     ((*data).async_cb)(data);
+//   }
+// }
 
 #[cfg(test)]
 mod tests {
