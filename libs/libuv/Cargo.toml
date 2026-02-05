@@ -1,0 +1,17 @@
+# Copyright 2018-2026 the Deno authors. MIT license.
+
+[package]
+name = "deno-libuv"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust bindings to libuv"
+
+[lib]
+path = "lib.rs"
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1.2"
