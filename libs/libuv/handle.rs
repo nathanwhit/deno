@@ -6,29 +6,29 @@ use std::rc::Rc;
 use crate::error::check;
 use crate::error::UvError;
 use crate::loop_::UvLoop;
-use crate::uv_check_init;
-use crate::uv_check_start;
-use crate::uv_check_stop;
-use crate::uv_check_t;
-use crate::uv_close;
-use crate::uv_handle_get_data;
-use crate::uv_handle_set_data;
-use crate::uv_handle_t;
-use crate::uv_idle_init;
-use crate::uv_idle_start;
-use crate::uv_idle_stop;
-use crate::uv_idle_t;
-use crate::uv_prepare_init;
-use crate::uv_prepare_start;
-use crate::uv_prepare_stop;
-use crate::uv_prepare_t;
-use crate::uv_timer_again;
-use crate::uv_timer_get_repeat;
-use crate::uv_timer_init;
-use crate::uv_timer_set_repeat;
-use crate::uv_timer_start;
-use crate::uv_timer_stop;
-use crate::uv_timer_t;
+use crate::sys::uv_check_init;
+use crate::sys::uv_check_start;
+use crate::sys::uv_check_stop;
+use crate::sys::uv_check_t;
+use crate::sys::uv_close;
+use crate::sys::uv_handle_get_data;
+use crate::sys::uv_handle_set_data;
+use crate::sys::uv_handle_t;
+use crate::sys::uv_idle_init;
+use crate::sys::uv_idle_start;
+use crate::sys::uv_idle_stop;
+use crate::sys::uv_idle_t;
+use crate::sys::uv_prepare_init;
+use crate::sys::uv_prepare_start;
+use crate::sys::uv_prepare_stop;
+use crate::sys::uv_prepare_t;
+use crate::sys::uv_timer_again;
+use crate::sys::uv_timer_get_repeat;
+use crate::sys::uv_timer_init;
+use crate::sys::uv_timer_set_repeat;
+use crate::sys::uv_timer_start;
+use crate::sys::uv_timer_stop;
+use crate::sys::uv_timer_t;
 
 // ---------------------------------------------------------------------------
 // Callback data stored in each handle's `data` field
@@ -36,6 +36,16 @@ use crate::uv_timer_t;
 
 struct HandleData {
   callback: Option<Box<dyn FnMut()>>,
+}
+
+/// Install a fresh `HandleData` in the handle's `data` field.
+///
+/// SAFETY: `handle` must be a valid, initialized libuv handle.
+unsafe fn init_handle_data(handle: *mut uv_handle_t) {
+  let hd = Box::new(HandleData { callback: None });
+  unsafe {
+    uv_handle_set_data(handle, Box::into_raw(hd) as *mut c_void);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,8 +84,7 @@ unsafe fn dealloc_check(ptr: *mut c_void) {
   drop(unsafe { Box::from_raw(ptr as *mut uv_check_t) });
 }
 
-/// Helper: set up the `HandleData` in the handle's data field, install a
-/// callback, and call a libuv start function.
+/// Helper: install a callback in the handle's `HandleData`.
 ///
 /// SAFETY: `handle` must be a valid, initialized libuv handle whose `data`
 /// field currently points to a `HandleData`.
@@ -142,20 +151,42 @@ impl UvIdle {
     let boxed = Box::new(unsafe { std::mem::zeroed::<uv_idle_t>() });
     let raw = Box::into_raw(boxed);
     check(unsafe { uv_idle_init(loop_.as_mut_ptr(), raw) })?;
-
-    let hd = Box::new(HandleData { callback: None });
-    unsafe {
-      uv_handle_set_data(
-        raw as *mut uv_handle_t,
-        Box::into_raw(hd) as *mut c_void,
-      );
-    }
+    unsafe { init_handle_data(raw as *mut uv_handle_t) };
 
     Ok(UvIdle {
       handle: raw,
       loop_: Rc::clone(loop_),
       closed: false,
     })
+  }
+
+  /// Wrap an already-initialized `uv_idle_t` pointer.
+  ///
+  /// # Safety
+  ///
+  /// - `handle` must point to a live, heap-allocated (`Box::into_raw`)
+  ///   `uv_idle_t` that has been initialized with `uv_idle_init`.
+  /// - The handle's `data` field will be overwritten — any previous value
+  ///   is the caller's responsibility to clean up beforehand.
+  /// - The caller transfers ownership of the handle allocation.
+  pub unsafe fn from_raw(
+    handle: *mut uv_idle_t,
+    loop_: &Rc<UvLoop>,
+  ) -> Self {
+    unsafe { init_handle_data(handle as *mut uv_handle_t) };
+    UvIdle {
+      handle,
+      loop_: Rc::clone(loop_),
+      closed: false,
+    }
+  }
+
+  /// Returns the raw pointer to the underlying `uv_idle_t`.
+  ///
+  /// The pointer is valid until `close()` is called. Use it to call
+  /// [`sys`](crate::sys) functions directly.
+  pub fn as_mut_ptr(&self) -> *mut uv_idle_t {
+    self.handle
   }
 
   /// Start the idle handle with the given callback.
@@ -225,20 +256,42 @@ impl UvTimer {
     let boxed = Box::new(unsafe { std::mem::zeroed::<uv_timer_t>() });
     let raw = Box::into_raw(boxed);
     check(unsafe { uv_timer_init(loop_.as_mut_ptr(), raw) })?;
-
-    let hd = Box::new(HandleData { callback: None });
-    unsafe {
-      uv_handle_set_data(
-        raw as *mut uv_handle_t,
-        Box::into_raw(hd) as *mut c_void,
-      );
-    }
+    unsafe { init_handle_data(raw as *mut uv_handle_t) };
 
     Ok(UvTimer {
       handle: raw,
       loop_: Rc::clone(loop_),
       closed: false,
     })
+  }
+
+  /// Wrap an already-initialized `uv_timer_t` pointer.
+  ///
+  /// # Safety
+  ///
+  /// - `handle` must point to a live, heap-allocated (`Box::into_raw`)
+  ///   `uv_timer_t` that has been initialized with `uv_timer_init`.
+  /// - The handle's `data` field will be overwritten — any previous value
+  ///   is the caller's responsibility to clean up beforehand.
+  /// - The caller transfers ownership of the handle allocation.
+  pub unsafe fn from_raw(
+    handle: *mut uv_timer_t,
+    loop_: &Rc<UvLoop>,
+  ) -> Self {
+    unsafe { init_handle_data(handle as *mut uv_handle_t) };
+    UvTimer {
+      handle,
+      loop_: Rc::clone(loop_),
+      closed: false,
+    }
+  }
+
+  /// Returns the raw pointer to the underlying `uv_timer_t`.
+  ///
+  /// The pointer is valid until `close()` is called. Use it to call
+  /// [`sys`](crate::sys) functions directly.
+  pub fn as_mut_ptr(&self) -> *mut uv_timer_t {
+    self.handle
   }
 
   /// Start the timer.
@@ -335,20 +388,42 @@ impl UvPrepare {
     let boxed = Box::new(unsafe { std::mem::zeroed::<uv_prepare_t>() });
     let raw = Box::into_raw(boxed);
     check(unsafe { uv_prepare_init(loop_.as_mut_ptr(), raw) })?;
-
-    let hd = Box::new(HandleData { callback: None });
-    unsafe {
-      uv_handle_set_data(
-        raw as *mut uv_handle_t,
-        Box::into_raw(hd) as *mut c_void,
-      );
-    }
+    unsafe { init_handle_data(raw as *mut uv_handle_t) };
 
     Ok(UvPrepare {
       handle: raw,
       loop_: Rc::clone(loop_),
       closed: false,
     })
+  }
+
+  /// Wrap an already-initialized `uv_prepare_t` pointer.
+  ///
+  /// # Safety
+  ///
+  /// - `handle` must point to a live, heap-allocated (`Box::into_raw`)
+  ///   `uv_prepare_t` that has been initialized with `uv_prepare_init`.
+  /// - The handle's `data` field will be overwritten — any previous value
+  ///   is the caller's responsibility to clean up beforehand.
+  /// - The caller transfers ownership of the handle allocation.
+  pub unsafe fn from_raw(
+    handle: *mut uv_prepare_t,
+    loop_: &Rc<UvLoop>,
+  ) -> Self {
+    unsafe { init_handle_data(handle as *mut uv_handle_t) };
+    UvPrepare {
+      handle,
+      loop_: Rc::clone(loop_),
+      closed: false,
+    }
+  }
+
+  /// Returns the raw pointer to the underlying `uv_prepare_t`.
+  ///
+  /// The pointer is valid until `close()` is called. Use it to call
+  /// [`sys`](crate::sys) functions directly.
+  pub fn as_mut_ptr(&self) -> *mut uv_prepare_t {
+    self.handle
   }
 
   /// Start the prepare handle with the given callback.
@@ -420,20 +495,42 @@ impl UvCheck {
     let boxed = Box::new(unsafe { std::mem::zeroed::<uv_check_t>() });
     let raw = Box::into_raw(boxed);
     check(unsafe { uv_check_init(loop_.as_mut_ptr(), raw) })?;
-
-    let hd = Box::new(HandleData { callback: None });
-    unsafe {
-      uv_handle_set_data(
-        raw as *mut uv_handle_t,
-        Box::into_raw(hd) as *mut c_void,
-      );
-    }
+    unsafe { init_handle_data(raw as *mut uv_handle_t) };
 
     Ok(UvCheck {
       handle: raw,
       loop_: Rc::clone(loop_),
       closed: false,
     })
+  }
+
+  /// Wrap an already-initialized `uv_check_t` pointer.
+  ///
+  /// # Safety
+  ///
+  /// - `handle` must point to a live, heap-allocated (`Box::into_raw`)
+  ///   `uv_check_t` that has been initialized with `uv_check_init`.
+  /// - The handle's `data` field will be overwritten — any previous value
+  ///   is the caller's responsibility to clean up beforehand.
+  /// - The caller transfers ownership of the handle allocation.
+  pub unsafe fn from_raw(
+    handle: *mut uv_check_t,
+    loop_: &Rc<UvLoop>,
+  ) -> Self {
+    unsafe { init_handle_data(handle as *mut uv_handle_t) };
+    UvCheck {
+      handle,
+      loop_: Rc::clone(loop_),
+      closed: false,
+    }
+  }
+
+  /// Returns the raw pointer to the underlying `uv_check_t`.
+  ///
+  /// The pointer is valid until `close()` is called. Use it to call
+  /// [`sys`](crate::sys) functions directly.
+  pub fn as_mut_ptr(&self) -> *mut uv_check_t {
+    self.handle
   }
 
   /// Start the check handle with the given callback.

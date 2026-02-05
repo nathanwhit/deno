@@ -19,7 +19,7 @@ impl UvError {
   pub fn name(&self) -> &str {
     // SAFETY: uv_err_name returns a static string for known error codes.
     unsafe {
-      let ptr = crate::uv_err_name(self.0);
+      let ptr = crate::sys::uv_err_name(self.0);
       CStr::from_ptr(ptr).to_str().unwrap_or("unknown")
     }
   }
@@ -28,7 +28,7 @@ impl UvError {
   pub fn message(&self) -> &str {
     // SAFETY: uv_strerror returns a static string for known error codes.
     unsafe {
-      let ptr = crate::uv_strerror(self.0);
+      let ptr = crate::sys::uv_strerror(self.0);
       CStr::from_ptr(ptr).to_str().unwrap_or("unknown error")
     }
   }

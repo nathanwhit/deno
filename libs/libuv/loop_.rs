@@ -5,15 +5,15 @@ use std::rc::Rc;
 
 use crate::error::check;
 use crate::error::UvError;
-use crate::uv_loop_alive;
-use crate::uv_loop_close;
-use crate::uv_loop_init;
-use crate::uv_loop_t;
-use crate::uv_run;
-use crate::uv_run_mode_UV_RUN_DEFAULT;
-use crate::uv_run_mode_UV_RUN_NOWAIT;
-use crate::uv_run_mode_UV_RUN_ONCE;
-use crate::uv_stop;
+use crate::sys::uv_loop_alive;
+use crate::sys::uv_loop_close;
+use crate::sys::uv_loop_init;
+use crate::sys::uv_loop_t;
+use crate::sys::uv_run;
+use crate::sys::uv_run_mode_UV_RUN_DEFAULT;
+use crate::sys::uv_run_mode_UV_RUN_NOWAIT;
+use crate::sys::uv_run_mode_UV_RUN_ONCE;
+use crate::sys::uv_stop;
 
 /// Mode for `UvLoop::run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +57,26 @@ impl UvLoop {
     }))
   }
 
+  /// Wrap an already-initialized `uv_loop_t` pointer.
+  ///
+  /// # Safety
+  ///
+  /// - `ptr` must point to a live, initialized `uv_loop_t` that was
+  ///   heap-allocated (e.g. via `Box::into_raw`).
+  /// - The caller transfers ownership of the allocation — the returned
+  ///   `UvLoop` will call `uv_loop_close` and free the memory on drop.
+  /// - No other code may close or free this loop.
+  pub unsafe fn from_raw(ptr: *mut uv_loop_t) -> Rc<UvLoop> {
+    Rc::new(UvLoop {
+      ptr: unsafe { NonNull::new_unchecked(ptr) },
+    })
+  }
+
   /// Returns the raw pointer to the underlying `uv_loop_t`.
-  pub(crate) fn as_mut_ptr(&self) -> *mut uv_loop_t {
+  ///
+  /// The pointer is valid for the lifetime of this `UvLoop`. Use it to
+  /// call [`sys`](crate::sys) functions directly.
+  pub fn as_mut_ptr(&self) -> *mut uv_loop_t {
     self.ptr.as_ptr()
   }
 
