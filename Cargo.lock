@@ -1764,14 +1764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deno-libuv"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.71.1",
- "cc",
-]
-
-[[package]]
 name = "deno-tower-lsp-macros"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2391,6 +2383,14 @@ dependencies = [
  "thiserror 2.0.12",
  "twox-hash 2.1.0",
  "url",
+]
+
+[[package]]
+name = "deno_libuv"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.71.1",
+ "cc",
 ]
 
 [[package]]

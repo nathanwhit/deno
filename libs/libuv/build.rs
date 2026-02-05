@@ -19,7 +19,8 @@ fn main() {
     .include(&include_dir)
     .include(&src_dir)
     .flag_if_supported("-fno-strict-aliasing")
-    .flag_if_supported("-Wno-unused-parameter");
+    .flag_if_supported("-Wno-unused-parameter")
+    .flag_if_supported("-Wno-gnu-folding-constant");
 
   // Common sources
   let common_sources = [
