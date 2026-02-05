@@ -174,7 +174,12 @@ impl UvIdle {
     }
   }
 
-  /// Returns the raw pointer to the underlying `uv_idle_t`.
+  /// Returns a const raw pointer to the underlying `uv_idle_t`.
+  pub fn as_ptr(&self) -> *const uv_idle_t {
+    self.handle
+  }
+
+  /// Returns a mutable raw pointer to the underlying `uv_idle_t`.
   ///
   /// The pointer is valid until `close()` is called. Use it to call
   /// [`sys`](crate::sys) functions directly.
@@ -273,7 +278,12 @@ impl UvTimer {
     }
   }
 
-  /// Returns the raw pointer to the underlying `uv_timer_t`.
+  /// Returns a const raw pointer to the underlying `uv_timer_t`.
+  pub fn as_ptr(&self) -> *const uv_timer_t {
+    self.handle
+  }
+
+  /// Returns a mutable raw pointer to the underlying `uv_timer_t`.
   ///
   /// The pointer is valid until `close()` is called. Use it to call
   /// [`sys`](crate::sys) functions directly.
@@ -400,7 +410,12 @@ impl UvPrepare {
     }
   }
 
-  /// Returns the raw pointer to the underlying `uv_prepare_t`.
+  /// Returns a const raw pointer to the underlying `uv_prepare_t`.
+  pub fn as_ptr(&self) -> *const uv_prepare_t {
+    self.handle
+  }
+
+  /// Returns a mutable raw pointer to the underlying `uv_prepare_t`.
   ///
   /// The pointer is valid until `close()` is called. Use it to call
   /// [`sys`](crate::sys) functions directly.
@@ -499,7 +514,12 @@ impl UvCheck {
     }
   }
 
-  /// Returns the raw pointer to the underlying `uv_check_t`.
+  /// Returns a const raw pointer to the underlying `uv_check_t`.
+  pub fn as_ptr(&self) -> *const uv_check_t {
+    self.handle
+  }
+
+  /// Returns a mutable raw pointer to the underlying `uv_check_t`.
   ///
   /// The pointer is valid until `close()` is called. Use it to call
   /// [`sys`](crate::sys) functions directly.

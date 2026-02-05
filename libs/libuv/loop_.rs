@@ -72,7 +72,12 @@ impl UvLoop {
     })
   }
 
-  /// Returns the raw pointer to the underlying `uv_loop_t`.
+  /// Returns a const raw pointer to the underlying `uv_loop_t`.
+  pub fn as_ptr(&self) -> *const uv_loop_t {
+    self.ptr.as_ptr()
+  }
+
+  /// Returns a mutable raw pointer to the underlying `uv_loop_t`.
   ///
   /// The pointer is valid for the lifetime of this `UvLoop`. Use it to
   /// call [`sys`](crate::sys) functions directly.
