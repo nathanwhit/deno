@@ -2526,6 +2526,7 @@ dependencies = [
  "deno_fs",
  "deno_inspector_server",
  "deno_io",
+ "deno_libuv",
  "deno_net",
  "deno_package_json",
  "deno_path_util",

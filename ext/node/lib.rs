@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::rc::Rc;
 
 use deno_core::FastString;
 use deno_core::OpState;

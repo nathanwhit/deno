@@ -36,6 +36,7 @@ deno_fetch.workspace = true
 deno_fs.workspace = true
 deno_inspector_server.workspace = true
 deno_io.workspace = true
+deno_libuv.workspace = true
 deno_net.workspace = true
 deno_package_json.workspace = true
 deno_path_util.workspace = true
