@@ -3,8 +3,8 @@
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::error::check;
 use crate::error::UvError;
+use crate::error::check;
 use crate::sys::uv_loop_alive;
 use crate::sys::uv_loop_close;
 use crate::sys::uv_loop_init;

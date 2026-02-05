@@ -29,7 +29,6 @@ pub use loop_::UvLoop;
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use std::cell::Cell;
   use std::ffi::CStr;
   use std::mem::MaybeUninit;
@@ -37,6 +36,8 @@ mod tests {
   use std::sync::atomic::AtomicBool;
   use std::sync::atomic::AtomicI64;
   use std::sync::atomic::Ordering;
+
+  use super::*;
 
   // =========================================================================
   // Raw binding tests (use sys::*)
@@ -124,13 +125,11 @@ mod tests {
       let result = sys::uv_idle_init(loop_, idler.as_mut_ptr());
       assert_eq!(result, 0);
 
-      let result =
-        sys::uv_idle_start(idler.as_mut_ptr(), Some(idle_callback));
+      let result = sys::uv_idle_start(idler.as_mut_ptr(), Some(idle_callback));
       assert_eq!(result, 0);
 
       // Run the loop
-      let result =
-        sys::uv_run(loop_, sys::uv_run_mode_UV_RUN_DEFAULT);
+      let result = sys::uv_run(loop_, sys::uv_run_mode_UV_RUN_DEFAULT);
       assert_eq!(result, 0);
 
       // Verify the callback ran the expected number of times
@@ -171,17 +170,12 @@ mod tests {
       assert_eq!(result, 0);
 
       // Start timer with 1ms timeout, no repeat
-      let result = sys::uv_timer_start(
-        timer.as_mut_ptr(),
-        Some(timer_callback),
-        1,
-        0,
-      );
+      let result =
+        sys::uv_timer_start(timer.as_mut_ptr(), Some(timer_callback), 1, 0);
       assert_eq!(result, 0);
 
       // Run the loop
-      let result =
-        sys::uv_run(loop_, sys::uv_run_mode_UV_RUN_DEFAULT);
+      let result = sys::uv_run(loop_, sys::uv_run_mode_UV_RUN_DEFAULT);
       assert_eq!(result, 0);
 
       assert!(TIMER_FIRED.load(Ordering::SeqCst));
@@ -206,8 +200,7 @@ mod tests {
       let tcp_size = sys::uv_handle_size(sys::uv_handle_type_UV_TCP);
       assert!(tcp_size > 0);
 
-      let timer_size =
-        sys::uv_handle_size(sys::uv_handle_type_UV_TIMER);
+      let timer_size = sys::uv_handle_size(sys::uv_handle_type_UV_TIMER);
       assert!(timer_size > 0);
 
       let idle_size = sys::uv_handle_size(sys::uv_handle_type_UV_IDLE);
@@ -289,8 +282,7 @@ mod tests {
     let lp = UvLoop::new().unwrap();
 
     // We use a shared Vec to record the order of callbacks.
-    let order: Rc<Cell<Vec<&'static str>>> =
-      Rc::new(Cell::new(Vec::new()));
+    let order: Rc<Cell<Vec<&'static str>>> = Rc::new(Cell::new(Vec::new()));
 
     let prepare = UvPrepare::new(&lp).unwrap();
     let check = UvCheck::new(&lp).unwrap();

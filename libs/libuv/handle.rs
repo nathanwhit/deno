@@ -3,8 +3,8 @@
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use crate::error::check;
 use crate::error::UvError;
+use crate::error::check;
 use crate::loop_::UvLoop;
 use crate::sys::uv_check_init;
 use crate::sys::uv_check_start;
@@ -88,12 +88,8 @@ unsafe fn dealloc_check(ptr: *mut c_void) {
 ///
 /// SAFETY: `handle` must be a valid, initialized libuv handle whose `data`
 /// field currently points to a `HandleData`.
-unsafe fn set_callback(
-  handle: *mut uv_handle_t,
-  cb: impl FnMut() + 'static,
-) {
-  let data =
-    unsafe { &mut *(uv_handle_get_data(handle) as *mut HandleData) };
+unsafe fn set_callback(handle: *mut uv_handle_t, cb: impl FnMut() + 'static) {
+  let data = unsafe { &mut *(uv_handle_get_data(handle) as *mut HandleData) };
   data.callback = Some(Box::new(cb));
 }
 
@@ -169,10 +165,7 @@ impl UvIdle {
   /// - The handle's `data` field will be overwritten — any previous value
   ///   is the caller's responsibility to clean up beforehand.
   /// - The caller transfers ownership of the handle allocation.
-  pub unsafe fn from_raw(
-    handle: *mut uv_idle_t,
-    loop_: &Rc<UvLoop>,
-  ) -> Self {
+  pub unsafe fn from_raw(handle: *mut uv_idle_t, loop_: &Rc<UvLoop>) -> Self {
     unsafe { init_handle_data(handle as *mut uv_handle_t) };
     UvIdle {
       handle,
@@ -190,10 +183,7 @@ impl UvIdle {
   }
 
   /// Start the idle handle with the given callback.
-  pub fn start(
-    &self,
-    cb: impl FnMut() + 'static,
-  ) -> Result<(), UvError> {
+  pub fn start(&self, cb: impl FnMut() + 'static) -> Result<(), UvError> {
     unsafe { set_callback(self.handle as *mut uv_handle_t, cb) };
     check(unsafe { uv_idle_start(self.handle, Some(idle_trampoline)) })
   }
@@ -274,10 +264,7 @@ impl UvTimer {
   /// - The handle's `data` field will be overwritten — any previous value
   ///   is the caller's responsibility to clean up beforehand.
   /// - The caller transfers ownership of the handle allocation.
-  pub unsafe fn from_raw(
-    handle: *mut uv_timer_t,
-    loop_: &Rc<UvLoop>,
-  ) -> Self {
+  pub unsafe fn from_raw(handle: *mut uv_timer_t, loop_: &Rc<UvLoop>) -> Self {
     unsafe { init_handle_data(handle as *mut uv_handle_t) };
     UvTimer {
       handle,
@@ -306,12 +293,7 @@ impl UvTimer {
   ) -> Result<(), UvError> {
     unsafe { set_callback(self.handle as *mut uv_handle_t, cb) };
     check(unsafe {
-      uv_timer_start(
-        self.handle,
-        Some(timer_trampoline),
-        timeout_ms,
-        repeat_ms,
-      )
+      uv_timer_start(self.handle, Some(timer_trampoline), timeout_ms, repeat_ms)
     })
   }
 
@@ -427,14 +409,9 @@ impl UvPrepare {
   }
 
   /// Start the prepare handle with the given callback.
-  pub fn start(
-    &self,
-    cb: impl FnMut() + 'static,
-  ) -> Result<(), UvError> {
+  pub fn start(&self, cb: impl FnMut() + 'static) -> Result<(), UvError> {
     unsafe { set_callback(self.handle as *mut uv_handle_t, cb) };
-    check(unsafe {
-      uv_prepare_start(self.handle, Some(prepare_trampoline))
-    })
+    check(unsafe { uv_prepare_start(self.handle, Some(prepare_trampoline)) })
   }
 
   /// Stop the prepare handle.
@@ -513,10 +490,7 @@ impl UvCheck {
   /// - The handle's `data` field will be overwritten — any previous value
   ///   is the caller's responsibility to clean up beforehand.
   /// - The caller transfers ownership of the handle allocation.
-  pub unsafe fn from_raw(
-    handle: *mut uv_check_t,
-    loop_: &Rc<UvLoop>,
-  ) -> Self {
+  pub unsafe fn from_raw(handle: *mut uv_check_t, loop_: &Rc<UvLoop>) -> Self {
     unsafe { init_handle_data(handle as *mut uv_handle_t) };
     UvCheck {
       handle,
@@ -534,10 +508,7 @@ impl UvCheck {
   }
 
   /// Start the check handle with the given callback.
-  pub fn start(
-    &self,
-    cb: impl FnMut() + 'static,
-  ) -> Result<(), UvError> {
+  pub fn start(&self, cb: impl FnMut() + 'static) -> Result<(), UvError> {
     unsafe { set_callback(self.handle as *mut uv_handle_t, cb) };
     check(unsafe { uv_check_start(self.handle, Some(check_trampoline)) })
   }

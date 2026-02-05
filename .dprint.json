@@ -43,6 +43,7 @@
     "ext/websocket/autobahn/reports",
     "gh-pages",
     "libs/config/testdata",
+    "libs/libuv/vendor",
     "target",
     "tests/ffi/tests/test.js",
     "tests/node_compat/runner/suite",
