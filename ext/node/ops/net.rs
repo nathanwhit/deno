@@ -33,6 +33,8 @@ use std::os::fd::RawFd;
 use tokio::io::Interest;
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
+#[cfg(unix)]
+use std::os::fd::RawFd as StdRawFd;
 
 #[cfg(unix)]
 /// Newtype wrapper around a raw fd that does NOT close on drop.
@@ -1248,4 +1250,35 @@ pub fn op_uv_net_listener_unref(
     .map_err(JsErrorBox::from_err)?;
   resource.set_refed(false);
   Ok(())
+}
+
+#[op2(fast)]
+pub fn op_uv_net_get_fd(
+  op_state: &mut OpState,
+  #[smi] rid: ResourceId,
+) -> Result<i32, JsErrorBox> {
+  let resource = op_state
+    .resource_table
+    .get::<UvTcpStreamResource>(rid)
+    .map_err(JsErrorBox::from_err)?;
+
+  #[cfg(unix)]
+  {
+    let mut fd: StdRawFd = -1;
+    // SAFETY: `resource.tcp` is a valid libuv tcp handle while resource exists.
+    let rc = unsafe { deno_libuv::sys::uv_fileno(resource.tcp.cast(), &mut fd) };
+    if rc < 0 {
+      return Err(uv_status_to_js_error(
+        rc,
+        "failed to get libuv tcp file descriptor",
+      ));
+    }
+    return Ok(fd);
+  }
+
+  #[cfg(not(unix))]
+  {
+    let _ = resource;
+    Ok(-1)
+  }
 }

@@ -33,6 +33,7 @@ import {
   op_uv_net_listen_tcp,
   op_uv_net_listener_ref,
   op_uv_net_listener_unref,
+  op_uv_net_get_fd,
   op_uv_net_read,
   op_uv_net_ref,
   op_uv_net_unref,
@@ -86,6 +87,15 @@ class LibuvTcpConn {
 
   constructor(rid: number) {
     this.#rid = rid;
+    let fd;
+    try {
+      fd = op_uv_net_get_fd(rid);
+      if (fd < 0) {
+        fd = undefined;
+      }
+    } catch {
+      fd = undefined;
+    }
     ObjectDefineProperty(this, internalRidSymbol, {
       __proto__: null,
       enumerable: false,
@@ -94,7 +104,7 @@ class LibuvTcpConn {
     ObjectDefineProperty(this, internalFdSymbol, {
       __proto__: null,
       enumerable: false,
-      value: undefined,
+      value: fd,
     });
   }
 
