@@ -118,6 +118,7 @@ impl LibUvLoopDriver {
 
       #[cfg(not(unix))]
       {
+        // TODO: poll the handle or whatever on windows, idk if that's a thing
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
       }
     }
