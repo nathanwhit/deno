@@ -182,6 +182,9 @@ enum ReadEvent {
 
 struct UvTcpHandleData {
   read_tx: mpsc::UnboundedSender<ReadEvent>,
+  /// Cached buffer reused across alloc_cb/read_cb cycles to avoid
+  /// allocating a fresh ~64 KB Vec on every read.
+  read_buf: Option<Vec<u8>>,
 }
 
 enum AcceptEvent {
@@ -204,12 +207,30 @@ struct WriteReqData {
 }
 
 unsafe extern "C" fn uv_tcp_alloc_cb(
-  _handle: *mut deno_libuv::sys::uv_handle_t,
+  handle: *mut deno_libuv::sys::uv_handle_t,
   suggested_size: usize,
   buf: *mut deno_libuv::sys::uv_buf_t,
 ) {
   let size = suggested_size.max(1);
-  let mut bytes = Vec::<u8>::with_capacity(size);
+
+  // Reuse the cached buffer from handle data when available to avoid
+  // allocating a fresh Vec on every read.
+  // SAFETY: handle and its data pointer are valid; set by us.
+  let data_ptr = unsafe { deno_libuv::sys::uv_handle_get_data(handle) };
+  let mut bytes = if !data_ptr.is_null() {
+    let handle_data = unsafe { &mut *(data_ptr as *mut UvTcpHandleData) };
+    handle_data
+      .read_buf
+      .take()
+      .unwrap_or_else(|| Vec::with_capacity(size))
+  } else {
+    Vec::with_capacity(size)
+  };
+
+  if bytes.capacity() < size {
+    bytes.reserve(size - bytes.capacity());
+  }
+
   let base = bytes.as_mut_ptr();
   let len = bytes.capacity();
   mem::forget(bytes);
@@ -231,8 +252,9 @@ unsafe extern "C" fn uv_tcp_read_cb(
     // SAFETY: `buf` and its `base` were allocated in `uv_tcp_alloc_cb`.
     let (base, len) = unsafe { ((*buf).base, (*buf).len) };
     if !base.is_null() && len > 0 {
-      // SAFETY: Reclaim the allocation made in alloc_cb.
-      let bytes = unsafe { Vec::from_raw_parts(base.cast::<u8>(), len, len) };
+      // SAFETY: Reclaim the allocation made in alloc_cb. Length is set
+      // to 0 because the bytes are not yet initialized at this point.
+      let bytes = unsafe { Vec::from_raw_parts(base.cast::<u8>(), 0, len) };
       allocated = Some(bytes);
     }
   }
@@ -251,14 +273,23 @@ unsafe extern "C" fn uv_tcp_read_cb(
   let handle_data = unsafe { &mut *(data_ptr as *mut UvTcpHandleData) };
 
   if nread > 0 {
-    let mut bytes = allocated.unwrap_or_default();
-    bytes.truncate(nread as usize);
-    let _ = handle_data.read_tx.send(ReadEvent::Data(bytes));
+    if let Some(alloc_buf) = allocated {
+      // Copy only the bytes that were actually read into a right-sized
+      // Vec, then return the large buffer for reuse in the next alloc_cb.
+      let n = (nread as usize).min(alloc_buf.capacity());
+      // SAFETY: libuv guarantees that `n` bytes at the start of the
+      // buffer are properly initialized.
+      let data =
+        unsafe { std::slice::from_raw_parts(alloc_buf.as_ptr(), n) }.to_vec();
+      handle_data.read_buf = Some(alloc_buf);
+      let _ = handle_data.read_tx.send(ReadEvent::Data(data));
+    }
     return;
   }
 
-  if let Some(bytes) = allocated {
-    drop(bytes);
+  // nread <= 0: return the buffer for reuse.
+  if let Some(alloc_buf) = allocated {
+    handle_data.read_buf = Some(alloc_buf);
   }
 
   if nread == 0 {
@@ -402,7 +433,16 @@ unsafe extern "C" fn uv_tcp_server_connection_cb(
     return;
   }
 
-  let _ = handle_data.accept_tx.send(AcceptEvent::Connection(client));
+  if handle_data
+    .accept_tx
+    .send(AcceptEvent::Connection(client))
+    .is_err()
+  {
+    // Receiver dropped; close the accepted handle to avoid leaking it.
+    unsafe {
+      deno_libuv::sys::uv_close(client.cast(), Some(uv_tcp_close_cb));
+    }
+  }
 }
 
 fn sockaddr_to_ip_addr(
@@ -541,6 +581,7 @@ fn setup_uv_tcp_stream_resource(
   let (read_tx, read_rx) = mpsc::unbounded_channel::<ReadEvent>();
   let handle_data = Box::new(UvTcpHandleData {
     read_tx: read_tx.clone(),
+    read_buf: None,
   });
 
   // SAFETY: tcp handle is valid and data pointer is owned by libuv close callback.
@@ -749,14 +790,12 @@ impl UvTcpStreamResource {
       return Ok(0);
     }
 
-    if let Some(buffered) = self.read_buffer.borrow_mut().pop_front() {
+    if let Some(mut buffered) = self.read_buffer.borrow_mut().pop_front() {
       let nread = buffered.len().min(data.len());
       data[..nread].copy_from_slice(&buffered[..nread]);
       if nread < buffered.len() {
-        self
-          .read_buffer
-          .borrow_mut()
-          .push_front(buffered[nread..].to_vec());
+        buffered.drain(..nread);
+        self.read_buffer.borrow_mut().push_front(buffered);
       }
       return Ok(nread);
     }
@@ -769,14 +808,12 @@ impl UvTcpStreamResource {
     };
 
     match event {
-      Some(ReadEvent::Data(bytes)) => {
+      Some(ReadEvent::Data(mut bytes)) => {
         let nread = bytes.len().min(data.len());
         data[..nread].copy_from_slice(&bytes[..nread]);
         if nread < bytes.len() {
-          self
-            .read_buffer
-            .borrow_mut()
-            .push_front(bytes[nread..].to_vec());
+          bytes.drain(..nread);
+          self.read_buffer.borrow_mut().push_front(bytes);
         }
         Ok(nread)
       }
