@@ -47,6 +47,7 @@ members = [
   "runtime/features",
   "runtime/permissions",
   "runtime/subprocess_windows",
+  "socket_benchmark/echo_server",
   "tests",
   "tests/bench_util",
   "tests/ffi",
