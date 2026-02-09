@@ -22,6 +22,10 @@ import {
   op_immediate_count,
   op_immediate_ref_count,
   op_immediate_set_has_outstanding,
+  op_node_timer_now,
+  op_node_timer_schedule,
+  op_node_timer_setup,
+  op_node_timer_toggle_ref,
 } from "ext:core/ops";
 import { inspect } from "ext:deno_node/internal/util/inspect.mjs";
 import {
@@ -30,11 +34,6 @@ import {
 } from "ext:deno_node/internal/validators.mjs";
 import { ERR_OUT_OF_RANGE } from "ext:deno_node/internal/errors.ts";
 import { emitWarning } from "node:process";
-import {
-  clearTimeout as clearTimeout_,
-  setInterval as setInterval_,
-  setTimeout as setTimeout_,
-} from "ext:deno_web/02_timers.js";
 import { runNextTicks } from "ext:deno_node/_next_tick.ts";
 
 // Timeout values > TIMEOUT_MAX are set to 1.
@@ -44,7 +43,11 @@ export const kDestroy = Symbol("destroy");
 export const kTimerId = Symbol("timerId");
 export const kTimeout = Symbol("timeout");
 export const kRefed = Symbol("refed");
-const createTimer = Symbol("createTimer");
+
+let nextTimerId = 1;
+let nextExpiry = Infinity;
+let refCount = 0;
+let setupDone = false;
 
 /**
  * The keys in this map correspond to the key ID's in the spec's map of active
@@ -62,9 +65,146 @@ export function getActiveTimer(id) {
   return MapPrototypeGet(activeTimers, id);
 }
 
+function ensureSetup() {
+  if (!setupDone) {
+    setupDone = true;
+    op_node_timer_setup(processTimers);
+  }
+}
+
+function incRefCount() {
+  if (refCount === 0) {
+    op_node_timer_toggle_ref(true);
+  }
+  refCount++;
+}
+
+function decRefCount() {
+  refCount--;
+  if (refCount === 0) {
+    op_node_timer_toggle_ref(false);
+  }
+}
+
+/**
+ * Called from the C timer callback when the single native timer fires.
+ * Processes expired timers one at a time so that if a callback throws,
+ * the remaining timers stay in the map and are processed on the next tick.
+ *
+ * Returns the next expiry encoding:
+ *   0  = no more timers
+ *   >0 = next absolute expiry (has ref'd timers)
+ *   <0 = next absolute expiry (all unref'd timers)
+ */
+function processTimers(now) {
+  // Reset nextExpiry so that any timer created by a callback during
+  // processing will see Infinity and call op_node_timer_schedule().
+  nextExpiry = Infinity;
+
+  // Process one expired timer per scan, then rescan.
+  // This ensures unprocessed timers remain in activeTimers if a callback throws.
+  let foundExpired = true;
+  while (foundExpired) {
+    foundExpired = false;
+
+    for (const [id, timer] of activeTimers) {
+      if (timer._destroyed) {
+        MapPrototypeDelete(activeTimers, id);
+        continue;
+      }
+      const expiry = timer._idleStart + timer._idleTimeout;
+      if (expiry <= now) {
+        foundExpired = true;
+
+        if (timer._isRepeat) {
+          // Repeating: update start time, keep in map
+          timer._idleStart = now;
+        } else {
+          // One-shot: remove from map and adjust refcount,
+          // but don't set _destroyed so refresh() can re-insert.
+          MapPrototypeDelete(activeTimers, id);
+          if (timer[kRefed]) {
+            decRefCount();
+          }
+        }
+
+        // Fire callback, catching exceptions so we can continue processing
+        // remaining timers and report the error via the standard path
+        // (which routes to process.on('uncaughtException') in Node compat).
+        const callback = timer._onTimeout;
+        const args = timer._timerArgs;
+        try {
+          FunctionPrototypeBind(callback, timer)(
+            ...new SafeArrayIterator(args),
+          );
+        } catch (e) {
+          // If a one-shot wasn't refreshed, mark destroyed.
+          // The callback may have called ref() (incrementing refCount),
+          // so undo that if needed since the timer is being discarded.
+          if (!timer._isRepeat && !MapPrototypeGet(activeTimers, id)) {
+            timer._destroyed = true;
+            if (timer[kRefed]) {
+              decRefCount();
+            }
+          }
+          // Route through globalThis error event dispatch so that Node's
+          // process.on('uncaughtException') handler can intercept it.
+          globalThis.reportError(e);
+          // Rescan from beginning after reporting
+          break;
+        }
+
+        // If a one-shot wasn't refreshed (not re-inserted), mark destroyed.
+        // Refcount was already adjusted before the callback ran.
+        if (!timer._isRepeat && !MapPrototypeGet(activeTimers, id)) {
+          timer._destroyed = true;
+        }
+
+        // Rescan from beginning (map may have changed)
+        break;
+      }
+    }
+  }
+
+  // Recompute nextExpiry from remaining active timers
+  nextExpiry = Infinity;
+  for (const [, timer] of activeTimers) {
+    if (timer._destroyed) continue;
+    const expiry = timer._idleStart + timer._idleTimeout;
+    if (expiry < nextExpiry) {
+      nextExpiry = expiry;
+    }
+  }
+
+  // Return encoding for the C callback
+  if (nextExpiry === Infinity) {
+    return 0;
+  }
+  return refCount > 0 ? nextExpiry : -nextExpiry;
+}
+
+function insert(timer) {
+  ensureSetup();
+  timer._idleStart = op_node_timer_now();
+  MapPrototypeSet(activeTimers, timer[kTimerId], timer);
+  if (timer[kRefed]) {
+    incRefCount();
+  }
+  const expiry = timer._idleStart + timer._idleTimeout;
+  if (expiry < nextExpiry) {
+    nextExpiry = expiry;
+    op_node_timer_schedule(expiry - op_node_timer_now());
+  }
+}
+
 // Timer constructor function.
 export function Timeout(callback, after, args, isRepeat, isRefed) {
-  if (typeof after === "number" && after > TIMEOUT_MAX) {
+  // Coerce to number, matching Node.js behavior:
+  // NaN, undefined, null, booleans, objects, etc. become 1
+  // Negative values become 1
+  // Values > TIMEOUT_MAX become 1
+  after *= 1;
+  if (!(after >= 1 && after <= TIMEOUT_MAX)) {
     after = 1;
   }
   this._idleTimeout = after;
@@ -72,41 +212,21 @@ export function Timeout(callback, after, args, isRepeat, isRefed) {
   this._timerArgs = args;
   this._isRepeat = isRepeat;
   this._destroyed = false;
+  this._idleStart = 0;
   this[kRefed] = isRefed;
-  this[kTimerId] = this[createTimer]();
+  this[kTimerId] = nextTimerId++;
+  insert(this);
 }
 
-Timeout.prototype[createTimer] = function () {
-  const callback = this._onTimeout;
-  const cb = (...args) => {
-    if (!this._isRepeat) {
-      MapPrototypeDelete(activeTimers, this[kTimerId]);
-    }
-    return FunctionPrototypeBind(callback, this)(
-      ...new SafeArrayIterator(args),
-    );
-  };
-  const id = this._isRepeat
-    ? setInterval_(
-      cb,
-      this._idleTimeout,
-      ...new SafeArrayIterator(this._timerArgs),
-    )
-    : setTimeout_(
-      cb,
-      this._idleTimeout,
-      ...new SafeArrayIterator(this._timerArgs),
-    );
-  if (!this[kRefed]) {
-    Deno.unrefTimer(id);
-  }
-  MapPrototypeSet(activeTimers, id, this);
-  return id;
-};
-
 Timeout.prototype[kDestroy] = function () {
+  if (this._destroyed) {
+    return;
+  }
   this._destroyed = true;
   MapPrototypeDelete(activeTimers, this[kTimerId]);
+  if (this[kRefed]) {
+    decRefCount();
+  }
 };
 
 // Make sure the linked list only shows the minimal necessary information.
@@ -121,10 +241,27 @@ Timeout.prototype[inspect.custom] = function (_, options) {
 };
 
 Timeout.prototype.refresh = function () {
-  if (!this._destroyed) {
-    clearTimeout_(this[kTimerId]);
+  // Allow refresh to resurrect a completed one-shot timer,
+  // matching Node.js behavior.
+  this._destroyed = false;
+  ensureSetup();
+  this._idleStart = op_node_timer_now();
+  // Re-insert into activeTimers if not present (e.g. fired one-shot).
+  // Delete and re-insert to move to end of map iteration order,
+  // ensuring refreshed timers fire after same-expiry timers.
+  if (!MapPrototypeGet(activeTimers, this[kTimerId])) {
+    MapPrototypeSet(activeTimers, this[kTimerId], this);
+    if (this[kRefed]) {
+      incRefCount();
+    }
+  } else {
     MapPrototypeDelete(activeTimers, this[kTimerId]);
-    this[kTimerId] = this[createTimer]();
+    MapPrototypeSet(activeTimers, this[kTimerId], this);
+  }
+  const expiry = this._idleStart + this._idleTimeout;
+  if (expiry < nextExpiry) {
+    nextExpiry = expiry;
+    op_node_timer_schedule(expiry - this._idleStart);
   }
   return this;
 };
@@ -132,7 +269,9 @@ Timeout.prototype.refresh = function () {
 Timeout.prototype.unref = function () {
   if (this[kRefed]) {
     this[kRefed] = false;
-    Deno.unrefTimer(this[kTimerId]);
+    if (!this._destroyed) {
+      decRefCount();
+    }
   }
   return this;
 };
@@ -140,7 +279,9 @@ Timeout.prototype.unref = function () {
 Timeout.prototype.ref = function () {
   if (!this[kRefed]) {
     this[kRefed] = true;
-    Deno.refTimer(this[kTimerId]);
+    if (!this._destroyed) {
+      incRefCount();
+    }
   }
   return this;
 };

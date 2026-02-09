@@ -14,6 +14,7 @@ pub mod inspector;
 pub mod ipc;
 pub mod libuv_stream;
 pub mod node_cli_parser;
+pub mod timer_wrap;
 pub mod os;
 pub mod perf_hooks;
 pub mod process;
