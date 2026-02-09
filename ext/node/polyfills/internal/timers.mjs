@@ -89,6 +89,12 @@ let nextExpiry = Infinity;
 let refCount = 0;
 let setupDone = false;
 
+// Cached "now" value. Updated lazily on first access per tick and set
+// directly by processTimers. Avoids repeated op_node_timer_now() op calls
+// (each is a JS->Rust boundary crossing) when multiple timers are
+// created/refreshed in the same event loop tick.
+let cachedNow = 0;
+
 // Priority queue of TimersList objects, ordered by expiry.
 const timerListQueue = new PriorityQueue(compareTimersLists, setPosition);
 
@@ -111,6 +117,13 @@ function ensureSetup() {
     setupDone = true;
     op_node_timer_setup(processTimers);
   }
+}
+
+function getTimerNow() {
+  if (cachedNow === 0) {
+    cachedNow = op_node_timer_now();
+  }
+  return cachedNow;
 }
 
 function incRefCount() {
@@ -137,6 +150,7 @@ function decRefCount() {
 // ---------------------------------------------------------------------------
 
 function processTimers(now) {
+  cachedNow = now;
   nextExpiry = Infinity;
   let list;
   let ranAtLeastOneList = false;
@@ -250,18 +264,19 @@ function listOnTimeout(list, now) {
 function insert(timer) {
   ensureSetup();
   const msecs = MathTrunc(timer._idleTimeout);
-  timer._idleStart = op_node_timer_now();
+  const now = getTimerNow();
+  timer._idleStart = now;
 
   let list = timerListMap[msecs];
   if (list === undefined) {
-    const expiry = MathTrunc(timer._idleStart) + msecs;
+    const expiry = MathTrunc(now) + msecs;
     list = new TimersList(expiry, msecs);
     timerListMap[msecs] = list;
     timerListQueue.insert(list);
 
     if (expiry < nextExpiry) {
       nextExpiry = expiry;
-      op_node_timer_schedule(expiry - op_node_timer_now());
+      op_node_timer_schedule(expiry - now);
     }
   }
 
