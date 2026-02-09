@@ -8,13 +8,14 @@ const {
 } = core;
 const {
   FunctionPrototypeBind,
-  MapPrototypeDelete,
-  MapPrototypeGet,
-  MapPrototypeSet,
+  MathTrunc,
   NumberIsFinite,
   ReflectApply,
   SafeArrayIterator,
   SafeMap,
+  MapPrototypeDelete,
+  MapPrototypeGet,
+  MapPrototypeSet,
   Symbol,
   SymbolToPrimitive,
 } = primordials;
@@ -35,6 +36,8 @@ import {
 import { ERR_OUT_OF_RANGE } from "ext:deno_node/internal/errors.ts";
 import { emitWarning } from "node:process";
 import { runNextTicks } from "ext:deno_node/_next_tick.ts";
+import L from "ext:deno_node/internal/linkedlist.js";
+import PriorityQueue from "ext:deno_node/internal/priority_queue.js";
 
 // Timeout values > TIMEOUT_MAX are set to 1.
 export const TIMEOUT_MAX = 2 ** 31 - 1;
@@ -44,25 +47,63 @@ export const kTimerId = Symbol("timerId");
 export const kTimeout = Symbol("timeout");
 export const kRefed = Symbol("refed");
 
+// ---------------------------------------------------------------------------
+// TimersList -- groups timers with the same duration (msecs).
+// Acts as the circular linked list sentinel for its timers.
+// ---------------------------------------------------------------------------
+
+let timerListId = -Number.MAX_SAFE_INTEGER;
+
+class TimersList {
+  constructor(expiry, msecs) {
+    this._idleNext = this; // Circular list sentinel
+    this._idlePrev = this;
+    this.expiry = expiry;
+    this.id = timerListId++;
+    this.msecs = msecs;
+    this.priorityQueuePosition = null;
+  }
+}
+
+// Compare TimersList entries: first by expiry, then by id (insertion order).
+function compareTimersLists(a, b) {
+  const expiryDiff = a.expiry - b.expiry;
+  if (expiryDiff === 0) {
+    if (a.id < b.id) return -1;
+    if (a.id > b.id) return 1;
+    return 0;
+  }
+  return expiryDiff;
+}
+
+function setPosition(node, pos) {
+  node.priorityQueuePosition = pos;
+}
+
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
 let nextTimerId = 1;
 let nextExpiry = Infinity;
 let refCount = 0;
 let setupDone = false;
 
-/**
- * The keys in this map correspond to the key ID's in the spec's map of active
- * timers. The values are the timeout's status.
- *
- * @type {Map<number, Timeout>}
- */
-const activeTimers = new SafeMap();
+// Priority queue of TimersList objects, ordered by expiry.
+const timerListQueue = new PriorityQueue(compareTimersLists, setPosition);
+
+// Map from msecs -> TimersList. Object with null prototype for fast lookup.
+const timerListMap = { __proto__: null };
+
+// Map from timer ID -> Timeout, for clearTimeout/clearInterval lookup.
+const timerById = new SafeMap();
 
 /**
  * @param {number} id
  * @returns {Timeout | undefined}
  */
 export function getActiveTimer(id) {
-  return MapPrototypeGet(activeTimers, id);
+  return MapPrototypeGet(timerById, id);
 }
 
 function ensureSetup() {
@@ -86,118 +127,151 @@ function decRefCount() {
   }
 }
 
-/**
- * Called from the C timer callback when the single native timer fires.
- * Processes expired timers one at a time so that if a callback throws,
- * the remaining timers stay in the map and are processed on the next tick.
- *
- * Returns the next expiry encoding:
- *   0  = no more timers
- *   >0 = next absolute expiry (has ref'd timers)
- *   <0 = next absolute expiry (all unref'd timers)
- */
+// ---------------------------------------------------------------------------
+// processTimers -- called from the native timer callback.
+//
+// Returns the next expiry encoding:
+//   0  = no more timers
+//   >0 = next absolute expiry (has ref'd timers)
+//   <0 = next absolute expiry (all unref'd timers)
+// ---------------------------------------------------------------------------
+
 function processTimers(now) {
-  // Reset nextExpiry so that any timer created by a callback during
-  // processing will see Infinity and call op_node_timer_schedule().
   nextExpiry = Infinity;
+  let list;
+  let ranAtLeastOneList = false;
+  while ((list = timerListQueue.peek()) != null) {
+    if (list.expiry > now) {
+      nextExpiry = list.expiry;
+      return refCount > 0 ? nextExpiry : -nextExpiry;
+    }
+    if (ranAtLeastOneList) {
+      runNextTicks();
+    } else {
+      ranAtLeastOneList = true;
+    }
+    listOnTimeout(list, now);
+  }
+  return 0;
+}
 
-  // Process one expired timer per scan, then rescan.
-  // This ensures unprocessed timers remain in activeTimers if a callback throws.
-  let foundExpired = true;
-  while (foundExpired) {
-    foundExpired = false;
+function listOnTimeout(list, now) {
+  const msecs = list.msecs;
+  let ranAtLeastOneTimer = false;
+  let timer;
+  while ((timer = L.peek(list)) != null) {
+    const diff = now - timer._idleStart;
+    if (diff < msecs) {
+      // Timer not yet expired. Update list expiry and re-sort in the queue.
+      list.expiry = MathTrunc(timer._idleStart) + msecs;
+      timerListQueue.percolateDown(1);
+      return;
+    }
 
-    for (const [id, timer] of activeTimers) {
-      if (timer._destroyed) {
-        MapPrototypeDelete(activeTimers, id);
+    if (ranAtLeastOneTimer) {
+      runNextTicks();
+    } else {
+      ranAtLeastOneTimer = true;
+    }
+
+    // Remove from the linked list.
+    L.remove(timer);
+
+    const callback = timer._onTimeout;
+    if (!callback) {
+      // Timer was cancelled/destroyed but not yet unlinked.
+      if (!timer._destroyed) {
+        timer._destroyed = true;
+        if (timer[kRefed]) decRefCount();
+      }
+      continue;
+    }
+
+    const args = timer._timerArgs;
+
+    if (timer._isRepeat) {
+      // Repeating timer: re-insert with updated start time.
+      timer._idleStart = now;
+      insert(timer);
+      try {
+        FunctionPrototypeBind(callback, timer)(
+          ...new SafeArrayIterator(args),
+        );
+      } catch (e) {
+        globalThis.reportError(e);
+      }
+    } else {
+      // One-shot timer: fire and check if it was refreshed/re-inserted.
+      try {
+        FunctionPrototypeBind(callback, timer)(
+          ...new SafeArrayIterator(args),
+        );
+      } catch (e) {
+        // If callback threw and timer wasn't re-inserted, destroy it.
+        if (timer._idleNext === timer) {
+          if (!timer._destroyed) {
+            timer._destroyed = true;
+            MapPrototypeDelete(timerById, timer[kTimerId]);
+            if (timer[kRefed]) decRefCount();
+          }
+        }
+        globalThis.reportError(e);
         continue;
       }
-      const expiry = timer._idleStart + timer._idleTimeout;
-      if (expiry <= now) {
-        foundExpired = true;
-
-        if (timer._isRepeat) {
-          // Repeating: update start time, keep in map
-          timer._idleStart = now;
-        } else {
-          // One-shot: remove from map and adjust refcount,
-          // but don't set _destroyed so refresh() can re-insert.
-          MapPrototypeDelete(activeTimers, id);
-          if (timer[kRefed]) {
-            decRefCount();
-          }
-        }
-
-        // Fire callback, catching exceptions so we can continue processing
-        // remaining timers and report the error via the standard path
-        // (which routes to process.on('uncaughtException') in Node compat).
-        const callback = timer._onTimeout;
-        const args = timer._timerArgs;
-        try {
-          FunctionPrototypeBind(callback, timer)(
-            ...new SafeArrayIterator(args),
-          );
-        } catch (e) {
-          // If a one-shot wasn't refreshed, mark destroyed.
-          // The callback may have called ref() (incrementing refCount),
-          // so undo that if needed since the timer is being discarded.
-          if (!timer._isRepeat && !MapPrototypeGet(activeTimers, id)) {
-            timer._destroyed = true;
-            if (timer[kRefed]) {
-              decRefCount();
-            }
-          }
-          // Route through globalThis error event dispatch so that Node's
-          // process.on('uncaughtException') handler can intercept it.
-          globalThis.reportError(e);
-          // Rescan from beginning after reporting
-          break;
-        }
-
-        // If a one-shot wasn't refreshed (not re-inserted), mark destroyed.
-        // Refcount was already adjusted before the callback ran.
-        if (!timer._isRepeat && !MapPrototypeGet(activeTimers, id)) {
+      // If the timer wasn't re-inserted by the callback (via refresh()),
+      // mark it as destroyed.
+      if (timer._idleNext === timer) {
+        if (!timer._destroyed) {
           timer._destroyed = true;
+          MapPrototypeDelete(timerById, timer[kTimerId]);
+          if (timer[kRefed]) decRefCount();
         }
-
-        // Rescan from beginning (map may have changed)
-        break;
       }
     }
   }
 
-  // Recompute nextExpiry from remaining active timers
-  nextExpiry = Infinity;
-  for (const [, timer] of activeTimers) {
-    if (timer._destroyed) continue;
-    const expiry = timer._idleStart + timer._idleTimeout;
-    if (expiry < nextExpiry) {
-      nextExpiry = expiry;
-    }
+  // List is empty -- clean up.
+  // Only delete from the map if the entry still points to THIS list.
+  // A timer callback may have created a new list for the same msecs.
+  if (timerListMap[msecs] === list) {
+    delete timerListMap[msecs];
   }
-
-  // Return encoding for the C callback
-  if (nextExpiry === Infinity) {
-    return 0;
+  // Only shift from queue if this list is still at the top.
+  // kDestroy may have already removed it.
+  if (list.priorityQueuePosition !== null) {
+    timerListQueue.removeAt(list.priorityQueuePosition);
   }
-  return refCount > 0 ? nextExpiry : -nextExpiry;
 }
+
+// ---------------------------------------------------------------------------
+// insert -- add a timer to the appropriate TimersList.
+// ---------------------------------------------------------------------------
 
 function insert(timer) {
   ensureSetup();
+  const msecs = MathTrunc(timer._idleTimeout);
   timer._idleStart = op_node_timer_now();
-  MapPrototypeSet(activeTimers, timer[kTimerId], timer);
-  if (timer[kRefed]) {
-    incRefCount();
+
+  let list = timerListMap[msecs];
+  if (list === undefined) {
+    const expiry = MathTrunc(timer._idleStart) + msecs;
+    list = new TimersList(expiry, msecs);
+    timerListMap[msecs] = list;
+    timerListQueue.insert(list);
+
+    if (expiry < nextExpiry) {
+      nextExpiry = expiry;
+      op_node_timer_schedule(expiry - op_node_timer_now());
+    }
   }
-  const expiry = timer._idleStart + timer._idleTimeout;
-  if (expiry < nextExpiry) {
-    nextExpiry = expiry;
-    op_node_timer_schedule(expiry - op_node_timer_now());
-  }
+
+  L.append(list, timer);
 }
 
-// Timer constructor function.
+// ---------------------------------------------------------------------------
+// Timeout constructor
+// ---------------------------------------------------------------------------
+
 export function Timeout(callback, after, args, isRepeat, isRefed) {
   // Coerce to number, matching Node.js behavior:
   // NaN, undefined, null, booleans, objects, etc. become 1
@@ -213,8 +287,16 @@ export function Timeout(callback, after, args, isRepeat, isRefed) {
   this._isRepeat = isRepeat;
   this._destroyed = false;
   this._idleStart = 0;
+  this._idlePrev = this;
+  this._idleNext = this;
   this[kRefed] = isRefed;
   this[kTimerId] = nextTimerId++;
+
+  ensureSetup();
+  MapPrototypeSet(timerById, this[kTimerId], this);
+  if (isRefed) {
+    incRefCount();
+  }
   insert(this);
 }
 
@@ -223,10 +305,25 @@ Timeout.prototype[kDestroy] = function () {
     return;
   }
   this._destroyed = true;
-  MapPrototypeDelete(activeTimers, this[kTimerId]);
+
+  // Unlink from the TimersList linked list.
+  L.remove(this);
+
+  const msecs = MathTrunc(this._idleTimeout);
+  const list = timerListMap[msecs];
+  if (list !== undefined && L.isEmpty(list)) {
+    // The list is empty -- remove it from the queue and map.
+    if (list.priorityQueuePosition !== null) {
+      timerListQueue.removeAt(list.priorityQueuePosition);
+    }
+    delete timerListMap[msecs];
+  }
+
+  MapPrototypeDelete(timerById, this[kTimerId]);
   if (this[kRefed]) {
     decRefCount();
   }
+  this._idleTimeout = -1;
 };
 
 // Make sure the linked list only shows the minimal necessary information.
@@ -241,28 +338,25 @@ Timeout.prototype[inspect.custom] = function (_, options) {
 };
 
 Timeout.prototype.refresh = function () {
-  // Allow refresh to resurrect a completed one-shot timer,
-  // matching Node.js behavior.
-  this._destroyed = false;
+  if (this._idleTimeout < 0) return this;
+
   ensureSetup();
-  this._idleStart = op_node_timer_now();
-  // Re-insert into activeTimers if not present (e.g. fired one-shot).
-  // Delete and re-insert to move to end of map iteration order,
-  // ensuring refreshed timers fire after same-expiry timers.
-  if (!MapPrototypeGet(activeTimers, this[kTimerId])) {
-    MapPrototypeSet(activeTimers, this[kTimerId], this);
+
+  const wasDestroyed = this._destroyed;
+  this._destroyed = false;
+
+  // If the timer was previously destroyed/fired, we need to re-register it.
+  if (wasDestroyed) {
+    MapPrototypeSet(timerById, this[kTimerId], this);
     if (this[kRefed]) {
       incRefCount();
     }
-  } else {
-    MapPrototypeDelete(activeTimers, this[kTimerId]);
-    MapPrototypeSet(activeTimers, this[kTimerId], this);
   }
-  const expiry = this._idleStart + this._idleTimeout;
-  if (expiry < nextExpiry) {
-    nextExpiry = expiry;
-    op_node_timer_schedule(expiry - this._idleStart);
-  }
+
+  // insert() calls L.append which calls L.remove first, so this handles
+  // both the case where the timer is in a list and where it isn't.
+  insert(this);
+
   return this;
 };
 
@@ -338,7 +432,6 @@ class ImmediateList {
   // Appends an item to the end of the linked list, adjusting the current tail's
   // next pointer and the item's previous pointer where applicable
   append(item) {
-    // console.log("append", this.tail);
     if (this.tail !== null) {
       this.tail._idleNext = item;
       item._idlePrev = this.tail;
