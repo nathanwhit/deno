@@ -4,6 +4,8 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use deno_core::CppgcBase;
+use deno_core::CppgcInherits;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
 use deno_core::ResourceId;
@@ -38,6 +40,8 @@ pub fn op_node_new_async_id(state: &mut OpState) -> f64 {
   next_async_id(state) as f64
 }
 
+#[derive(CppgcBase)]
+#[repr(C)]
 pub struct AsyncWrap {
   provider: i32,
   async_id: i64,
@@ -86,14 +90,20 @@ enum State {
   Closed,
 }
 
+#[derive(CppgcBase, CppgcInherits)]
+#[cppgc_inherits_from(AsyncWrap)]
+#[repr(C)]
 pub struct HandleWrap {
-  handle: Option<ResourceId>,
+  async_wrap: AsyncWrap,
+  handle: Cell<Option<ResourceId>>,
   state: Rc<Cell<State>>,
 }
 
 // SAFETY: we're sure this can be GCed
 unsafe impl GarbageCollected for HandleWrap {
-  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+  fn trace(&self, visitor: &mut deno_core::v8::cppgc::Visitor) {
+    self.async_wrap.trace(visitor);
+  }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
     c"HandleWrap"
@@ -101,22 +111,46 @@ unsafe impl GarbageCollected for HandleWrap {
 }
 
 impl HandleWrap {
-  pub(crate) fn create(handle: Option<ResourceId>) -> Self {
+  pub(crate) fn create(
+    async_wrap: AsyncWrap,
+    handle: Option<ResourceId>,
+  ) -> Self {
     Self {
-      handle,
+      async_wrap,
+      handle: Cell::new(handle),
       state: Rc::new(Cell::new(State::Initialized)),
     }
   }
 
+  pub(crate) fn set_handle(&self, handle: ResourceId) {
+    self.handle.set(Some(handle));
+  }
+
   fn is_alive(&self) -> bool {
     self.state.get() != State::Closed
+  }
+
+  pub(crate) fn ref_handle(&self, state: &mut OpState) {
+    if self.is_alive() {
+      if let Some(handle) = self.handle.get() {
+        state.uv_ref(handle);
+      }
+    }
+  }
+
+  pub(crate) fn unref_handle(&self, state: &mut OpState) {
+    if self.is_alive() {
+      if let Some(handle) = self.handle.get() {
+        state.uv_unref(handle);
+      }
+    }
   }
 }
 
 static ON_CLOSE_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("_onClose");
 
-#[op2(inherit = AsyncWrap)]
+#[op2(base, inherit = AsyncWrap)]
 impl HandleWrap {
   #[constructor]
   #[cppgc]
@@ -124,11 +158,8 @@ impl HandleWrap {
     state: &mut OpState,
     #[smi] provider: i32,
     #[smi] handle: Option<ResourceId>,
-  ) -> (AsyncWrap, HandleWrap) {
-    (
-      AsyncWrap::create(state, provider),
-      HandleWrap::create(handle),
-    )
+  ) -> HandleWrap {
+    HandleWrap::create(AsyncWrap::create(state, provider), handle)
   }
 
   // Ported from Node.js
@@ -166,6 +197,12 @@ impl HandleWrap {
       }
     };
 
+    // Unref the handle so the event loop can exit.
+    // In libuv, uv_close automatically unrefs the handle.
+    if let Some(handle) = self.handle.get() {
+      op_state.borrow_mut().uv_unref(handle);
+    }
+
     uv_close(scope, op_state, this, on_close);
     self.state.set(State::Closing);
 
@@ -177,7 +214,7 @@ impl HandleWrap {
   // https://github.com/nodejs/node/blob/038d82980ab26cd79abe4409adc2fecad94d7c93/src/handle_wrap.cc#L58-L62
   #[fast]
   fn has_ref(&self, state: &mut OpState) -> bool {
-    if let Some(handle) = self.handle {
+    if let Some(handle) = self.handle.get() {
       return state.has_ref(handle);
     }
 
@@ -191,7 +228,7 @@ impl HandleWrap {
   #[rename("ref")]
   fn ref_method(&self, state: &mut OpState) {
     if self.is_alive()
-      && let Some(handle) = self.handle
+      && let Some(handle) = self.handle.get()
     {
       state.uv_ref(handle);
     }
@@ -203,7 +240,7 @@ impl HandleWrap {
   #[fast]
   fn unref(&self, state: &mut OpState) {
     if self.is_alive()
-      && let Some(handle) = self.handle
+      && let Some(handle) = self.handle.get()
     {
       state.uv_unref(handle);
     }

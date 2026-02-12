@@ -155,17 +155,17 @@ function flushStdio(subprocess: ChildProcess) {
 // Wraps a resource in a class that implements
 // StreamBase, so it can be used with node streams
 class StreamResource implements StreamBase {
-  #rid: number;
+  rid: number;
   #isUnref = false;
   #pendingPromises: Set<Promise<number>> = new Set();
   constructor(rid: number) {
-    this.#rid = rid;
+    this.rid = rid;
   }
   close(): void {
-    core.close(this.#rid);
+    core.close(this.rid);
   }
   async read(p: Uint8Array): Promise<number | null> {
-    const readPromise = core.read(this.#rid, p);
+    const readPromise = core.read(this.rid, p);
     this.#pendingPromises.add(readPromise);
     if (this.#isUnref) {
       core.unrefOpPromise(readPromise);
@@ -190,7 +190,7 @@ class StreamResource implements StreamBase {
     }
   }
   async write(p: Uint8Array): Promise<number> {
-    const writePromise = core.write(this.#rid, p);
+    const writePromise = core.write(this.rid, p);
     this.#pendingPromises.add(writePromise);
     if (this.#isUnref) {
       core.unrefOpPromise(writePromise);

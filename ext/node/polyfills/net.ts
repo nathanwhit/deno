@@ -114,7 +114,8 @@ import type { DuplexOptions } from "ext:deno_node/_stream.d.ts";
 import type { BufferEncoding } from "ext:deno_node/_global.d.ts";
 import type { Abortable } from "ext:deno_node/_events.d.ts";
 import { channel } from "node:diagnostics_channel";
-import { primordials } from "ext:core/mod.js";
+import { core, primordials } from "ext:core/mod.js";
+const { getAsyncContext } = core;
 
 const {
   ArrayPrototypeIncludes,
@@ -557,11 +558,15 @@ function _internalConnect(
   if (localAddress || localPort) {
     if (addressType === 4) {
       localAddress = localAddress || DEFAULT_IPV4_ADDR;
-      err = (socket._handle as TCP).bind(localAddress, localPort);
+      err = (socket._handle as TCP).bind(localAddress, localPort || 0);
     } else {
       // addressType === 6
       localAddress = localAddress || DEFAULT_IPV6_ADDR;
-      err = (socket._handle as TCP).bind6(localAddress, localPort, flags);
+      err = (socket._handle as TCP).bind6(
+        localAddress,
+        localPort || 0,
+        flags,
+      );
     }
 
     debug(
@@ -588,6 +593,7 @@ function _internalConnect(
     req.port = port;
     req.localAddress = localAddress;
     req.localPort = localPort;
+    req._asyncContext = getAsyncContext();
 
     if (addressType === 4) {
       err = (socket._handle as TCP).connect(req, address, port);
@@ -598,6 +604,7 @@ function _internalConnect(
     const req = new PipeConnectWrap();
     req.oncomplete = _afterConnect;
     req.address = address;
+    req._asyncContext = getAsyncContext();
 
     err = (socket._handle as Pipe).connect(req, address);
   }
@@ -696,6 +703,7 @@ function _internalConnectMultiple(context, canceled?: boolean) {
   req.localAddress = localAddress;
   req.localPort = localPort;
   req.addressType = addressType;
+  req._asyncContext = getAsyncContext();
 
   ArrayPrototypePush(
     self.autoSelectFamilyAttemptedAddresses,
@@ -1670,18 +1678,22 @@ Socket.prototype._destroy = function (exception, cb) {
   if (this._handle) {
     debug("close handle");
     const isException = exception ? true : false;
+    // `bytesRead` and `kBytesWritten` should be accessible after `.destroy()`
     this[kBytesRead] = this._handle.bytesRead;
     this[kBytesWritten] = this._handle.bytesWritten;
 
-    this._handle.close(() => {
-      this._handle.onread = _noop;
-      this._handle = null;
-      this._sockname = undefined;
+    // Close the handle. In Node.js, uv_close fires the callback on the next
+    // event loop iteration (after nextTick). Our handle.close callback fires
+    // via V8TaskSpawner which runs before nextTick, so we don't emit 'close'
+    // from the callback. Instead we schedule it via nextTick below, after
+    // cb(exception) which schedules 'error' - ensuring correct event order.
+    this._handle.close();
+    this._handle.onread = _noop;
+    this._handle = null;
+    this._sockname = undefined;
 
-      debug("emit close");
-      this.emit("close", isException);
-    });
     cb(exception);
+    nextTick(() => this.emit("close", isException));
   } else {
     cb(exception);
     nextTick(_emitCloseNT, this);

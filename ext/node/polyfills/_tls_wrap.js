@@ -35,14 +35,11 @@ import {
   isAnyArrayBuffer,
   isArrayBufferView,
 } from "ext:deno_node/internal/util/types.ts";
-import { startTlsInternal } from "ext:deno_net/02_tls.js";
 import { core, internals } from "ext:core/mod.js";
 import {
   op_node_tls_handshake,
   op_node_tls_start,
   op_tls_canonicalize_ipv4_address,
-  op_tls_key_null,
-  op_tls_key_static,
 } from "ext:core/ops";
 
 const kConnectOptions = Symbol("connect-options");
@@ -92,11 +89,6 @@ export class TLSSocket extends net.Socket {
 
     const cert = tlsOptions?.secureContext?.cert;
     const key = tlsOptions?.secureContext?.key;
-    const hasTlsKey = key != undefined &&
-      cert != undefined;
-    const keyPair = hasTlsKey
-      ? op_tls_key_static(cert, key)
-      : op_tls_key_null();
     let caCerts = tlsOptions?.secureContext?.ca;
     if (typeof caCerts === "string") {
       caCerts = [caCerts];
@@ -113,7 +105,8 @@ export class TLSSocket extends net.Socket {
       });
     }
 
-    tlsOptions.keyPair = keyPair;
+    tlsOptions.cert = cert;
+    tlsOptions.key = key;
     tlsOptions.caCerts = caCerts;
     tlsOptions.alpnProtocols = opts.ALPNProtocols;
     tlsOptions.rejectUnauthorized = opts.rejectUnauthorized !== false;
@@ -189,8 +182,11 @@ export class TLSSocket extends net.Socket {
       const { promise, resolve } = Promise.withResolvers();
 
       // Set `afterConnectTls` hook. This is called in the `afterConnect` method of net.Socket
-      handle.afterConnectTls = async () => {
-        options.hostname ??= undefined; // coerce to undefined if null, startTls expects hostname to be undefined
+      let afterConnectTlsCalled = false;
+      handle.afterConnectTls = () => {
+        if (afterConnectTlsCalled) return;
+        afterConnectTlsCalled = true;
+        options.hostname ??= undefined;
         if (tlssock._needsSockInitWorkaround) {
           // skips the TLS handshake for @npmcli/agent as it's handled by
           // onSocket handler of ClientRequest object.
@@ -199,37 +195,51 @@ export class TLSSocket extends net.Socket {
           return;
         }
 
-        try {
-          const conn = await startTls(
-            wrap,
-            handle,
-            options,
-          );
-          try {
-            const hs = await conn.handshake();
-            if (hs?.alpnProtocol) {
-              tlssock.alpnProtocol = hs.alpnProtocol;
-            } else {
-              tlssock.alpnProtocol = false;
-            }
-          } catch {
-            // Don't interrupt "secure" event to let the first read/write
-            // operation emit the error.
-          }
-
-          // Assign the TLS connection to the handle and resume reading.
-          handle[kStreamBaseField] = conn;
+        if (wrap instanceof JSStreamSocket) {
+          // Channel-based proxy path for non-TCP streams (e.g. piped through
+          // another socket). Uses the op_node_tls_start / channel approach.
+          options.caCerts ??= [];
+          wrap.init(options);
+          handle[kStreamBaseField] = wrap;
           handle.upgrading = false;
           if (!handle.pauseOnCreate) {
             handle.readStart();
           }
-
           resolve();
-
+          tlssock.alpnProtocol = false;
           tlssock.emit("secure");
           tlssock.removeListener("end", onConnectEnd);
-        } catch {
-          // TODO(kt3k): Handle this
+        } else {
+          // Direct TCP -> TLS upgrade via Rust. The handle's underlying
+          // TCP halves are replaced with TLS halves in-place.
+          const cert = options.cert != null ? String(options.cert) : null;
+          const key = options.key != null ? String(options.key) : null;
+          handle.upgradeTls(
+            options.hostname ?? "localhost",
+            options.caCerts ?? null,
+            options.alpnProtocols ?? null,
+            options.rejectUnauthorized !== false,
+            cert,
+            key,
+            (err, alpnProtocol) => {
+              if (err) {
+                tlssock.destroy(err);
+                return;
+              }
+              if (alpnProtocol) {
+                tlssock.alpnProtocol = alpnProtocol;
+              } else {
+                tlssock.alpnProtocol = false;
+              }
+              handle.upgrading = false;
+              if (!handle.pauseOnCreate) {
+                handle.readStart();
+              }
+              resolve();
+              tlssock.emit("secure");
+              tlssock.removeListener("end", onConnectEnd);
+            },
+          );
         }
       };
 
@@ -285,7 +295,13 @@ export class TLSSocket extends net.Socket {
   }
 
   getPeerCertificate(detailed = false) {
-    const conn = this[kHandle]?.[kStreamBaseField];
+    const handle = this[kHandle];
+    // Direct TLS upgrade path (upgradeTls): peer certs stored in Rust.
+    if (handle?.getPeerCertificate) {
+      return handle.getPeerCertificate(detailed);
+    }
+    // Resource-based TLS path (e.g. Deno.TlsConn from server accept).
+    const conn = handle?.[kStreamBaseField];
     if (conn) return conn[internals.getPeerCertificate](detailed);
   }
 
@@ -338,16 +354,6 @@ class JSStreamSocket {
 
   write(data) {
     return core.write(this.#rid, data);
-  }
-}
-
-function startTls(wrap, handle, options) {
-  if (wrap instanceof JSStreamSocket) {
-    options.caCerts ??= [];
-    wrap.init(options);
-    return wrap;
-  } else {
-    return startTlsInternal(handle[kStreamBaseField], options);
   }
 }
 

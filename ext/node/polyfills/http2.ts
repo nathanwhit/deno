@@ -5,7 +5,6 @@
 // deno-lint-ignore-file prefer-primordials
 
 import { core, primordials } from "ext:core/mod.js";
-const { internalRidSymbol } = core;
 import {
   op_http2_client_get_response,
   op_http2_client_get_response_body_chunk,
@@ -14,9 +13,9 @@ import {
   op_http2_client_reset_stream,
   op_http2_client_send_data,
   op_http2_client_send_trailers,
-  op_http2_connect,
   op_http2_poll_client_connection,
   op_http_set_response_trailers,
+  op_node_http_take_socket,
 } from "ext:core/ops";
 
 import { notImplemented, warnNotImplemented } from "ext:deno_node/_utils.ts";
@@ -484,41 +483,43 @@ export class ClientHttp2Session extends Http2Session {
     socket.on("close", socketOnClose);
 
     socket[kHandle].pauseOnCreate = true;
-    const connPromise = new Promise((resolve) => {
-      const eventName = url.startsWith("https") ? "secureConnect" : "connect";
-      socket.once(eventName, () => {
-        const rid = socket[kHandle][kStreamBaseField][internalRidSymbol];
-        nextTick(() => resolve(rid));
-      });
-    });
+    const eventName = url.startsWith("https") ? "secureConnect" : "connect";
     socket[kSession] = this;
 
-    // TODO(bartlomieju): cleanup
-    this.#connectPromise = (async () => {
-      debugHttp2(">>> before connect");
-      const connRid_ = await connPromise;
-      // console.log(">>>> awaited connRid", connRid_, url);
-      const [clientRid, connRid] = await op_http2_connect(connRid_, url);
-      debugHttp2(">>> after connect", clientRid, connRid);
-      this[kDenoClientRid] = clientRid;
-      this[kDenoConnRid] = connRid;
-      (async () => {
-        try {
-          const promise = op_http2_poll_client_connection(
-            this[kDenoConnRid],
-          );
-          this[kPollConnPromise] = promise;
-          if (!this.#refed) {
-            this.unref();
+    // connectH2 is a reentrant method on LibuvStreamWrap that takes the
+    // TLS halves directly, performs the h2 handshake, and calls back with
+    // (error, clientRid, connRid).  No intermediate storage needed.
+    this.#connectPromise = new Promise<void>((resolve, reject) => {
+      socket.once(eventName, () => {
+        socket[kHandle].connectH2(url, (err, clientRid, connRid) => {
+          if (err) {
+            this.emit("error", err);
+            reject(err);
+            return;
           }
-          await promise;
-        } catch (e) {
-          this.emit("error", e);
-        }
-      })();
-      this[kState].flags |= SESSION_FLAGS_READY;
-      this.emit("connect", this, {});
-    })();
+          debugHttp2(">>> after connectH2", clientRid, connRid);
+          this[kDenoClientRid] = clientRid;
+          this[kDenoConnRid] = connRid;
+          (async () => {
+            try {
+              const promise = op_http2_poll_client_connection(
+                this[kDenoConnRid],
+              );
+              this[kPollConnPromise] = promise;
+              if (!this.#refed) {
+                this.unref();
+              }
+              await promise;
+            } catch (e) {
+              this.emit("error", e);
+            }
+          })();
+          this[kState].flags |= SESSION_FLAGS_READY;
+          this.emit("connect", this, {});
+          resolve();
+        });
+      });
+    });
   }
 
   ref() {
@@ -1688,9 +1689,23 @@ export class Http2Server extends Server {
     }
   }
 
-  // Prevent the TCP server from wrapping this in a socket, since we need it to serve HTTP
+  // Prevent the TCP server from wrapping this in a socket, since we need it
+  // to serve HTTP.  For accepted connections that have native stream halves
+  // instead of a Deno.Conn in kStreamBaseField, export the halves into a
+  // TcpStreamResource so serveHttpOnConnection can use them.
   _createSocket(clientHandle: TCP) {
-    return clientHandle[kStreamBaseField];
+    if (clientHandle[kStreamBaseField]) {
+      return clientHandle[kStreamBaseField];
+    }
+    // Export native TCP halves into a resource.
+    const rid = op_node_http_take_socket(clientHandle);
+    if (rid < 0) return undefined;
+    const sockname = {};
+    clientHandle.getsockname(sockname);
+    return {
+      [core.internalRidSymbol]: rid,
+      localAddr: { hostname: sockname.address, port: sockname.port },
+    };
   }
 
   setTimeout(msecs: number, callback?: () => unknown) {

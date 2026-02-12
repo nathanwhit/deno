@@ -154,6 +154,61 @@ pub enum ConnError {
   Hyper(#[from] hyper::Error),
 }
 
+/// Take the TCP stream from a TCP handle and place it in the resource
+/// table as a `TcpStreamResource`.  Returns the resource ID so it can
+/// be passed to `op_node_http_request_with_conn`.
+///
+/// Also unrefs the TCP handle's ref_tracker since the connection is
+/// being handed off to hyper.
+#[op2(fast)]
+#[smi]
+pub fn op_node_http_take_socket(
+  state: &mut OpState,
+  #[cppgc] tcp: &super::tcp_wrap::TCP,
+) -> i32 {
+  let stream_wrap = &tcp.connection_wrap.stream_wrap;
+  let Some((rd, wr)) = stream_wrap.take_tcp_halves() else {
+    return super::stream_wrap::UV_UNKNOWN;
+  };
+  let Ok(stream) = rd.reunite(wr) else {
+    return super::stream_wrap::UV_UNKNOWN;
+  };
+  tcp.ref_tracker.unref();
+  let rid = state
+    .resource_table
+    .add(TcpStreamResource::new(stream.into_split()));
+  rid as i32
+}
+
+/// Import a TCP connection from the resource table back into native
+/// LibuvStreamWrap halves (for keep-alive reuse after an HTTP exchange).
+///
+/// Also refs the TCP handle's ref_tracker since the connection is
+/// being reclaimed.
+#[op2(fast)]
+#[smi]
+pub fn op_node_http_return_socket(
+  state: &mut OpState,
+  #[cppgc] tcp: &super::tcp_wrap::TCP,
+  #[smi] rid: u32,
+) -> i32 {
+  use super::stream_wrap::{ReadHalf, WriteHalf, UV_UNKNOWN};
+
+  let Ok(resource) = state
+    .resource_table
+    .take::<TcpStreamResource>(rid)
+  else {
+    return UV_UNKNOWN;
+  };
+  let Ok(resource) = Rc::try_unwrap(resource) else {
+    return UV_UNKNOWN;
+  };
+  let (rd, wr) = resource.into_inner();
+  tcp.connection_wrap.stream_wrap.attach_halves(ReadHalf::Tcp(rd), WriteHalf::Tcp(wr));
+  tcp.ref_tracker.ref_();
+  0
+}
+
 #[op2(stack_trace)]
 // This is triggering a known false positive for explicit drop(state) calls.
 // See https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_refcell_ref
@@ -167,6 +222,11 @@ pub async fn op_node_http_request_with_conn(
   #[smi] body: Option<ResourceId>,
   #[smi] conn_rid: ResourceId,
 ) -> Result<FetchReturn, ConnError> {
+  // Yield once so that any cancelled read-loop tasks (from
+  // LibuvStreamWrap.readStop + detachResource) get a chance to drop
+  // their Rc references to the resource before we take it below.
+  tokio::task::yield_now().await;
+
   // Check if this is an upgrade request (e.g., WebSocket)
   let is_upgrade_request = headers.iter().any(|(name, value)| {
     name.eq_ignore_ascii_case(b"connection")

@@ -21,8 +21,11 @@ use deno_core::ToV8;
 use deno_core::convert::ByteString;
 use deno_core::error::ResourceError;
 use deno_core::op2;
-use deno_net::raw::NetworkStream;
-use deno_net::raw::take_network_stream_resource;
+use rustls_tokio_stream::TlsStream;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
+use tokio::net::TcpStream;
 use h2;
 use h2::Reason;
 use h2::RecvStream;
@@ -34,6 +37,71 @@ use http::header::HeaderName;
 use http::header::HeaderValue;
 use http::request::Parts;
 use url::Url;
+
+/// Stream wrapper that can be either plain TCP or TLS-over-TCP.
+/// Used as the transport for h2 connections so both `http:` and `https:`
+/// HTTP/2 work through the same code path.
+pub enum H2Stream {
+  Tcp(TcpStream),
+  Tls(TlsStream<TcpStream>),
+}
+
+impl std::fmt::Debug for H2Stream {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      H2Stream::Tcp(_) => write!(f, "H2Stream::Tcp"),
+      H2Stream::Tls(_) => write!(f, "H2Stream::Tls"),
+    }
+  }
+}
+
+impl AsyncRead for H2Stream {
+  fn poll_read(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+    buf: &mut ReadBuf<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+      H2Stream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+    }
+  }
+}
+
+impl AsyncWrite for H2Stream {
+  fn poll_write(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+    buf: &[u8],
+  ) -> std::task::Poll<std::io::Result<usize>> {
+    match self.get_mut() {
+      H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+      H2Stream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+    }
+  }
+
+  fn poll_flush(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+      H2Stream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+    }
+  }
+
+  fn poll_shutdown(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      H2Stream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+      H2Stream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+    }
+  }
+}
+
+impl Unpin for H2Stream {}
 
 pub struct Http2Client {
   pub client: AsyncRefCell<h2::client::SendRequest<BufView>>,
@@ -48,8 +116,8 @@ impl Resource for Http2Client {
 
 #[derive(Debug)]
 pub struct Http2ClientConn {
-  pub conn: AsyncRefCell<h2::client::Connection<NetworkStream, BufView>>,
-  cancel_handle: CancelHandle,
+  pub conn: AsyncRefCell<h2::client::Connection<H2Stream, BufView>>,
+  pub cancel_handle: CancelHandle,
 }
 
 impl Resource for Http2ClientConn {
@@ -91,7 +159,7 @@ impl Resource for Http2ClientResponseBody {
 
 #[derive(Debug)]
 pub struct Http2ServerConnection {
-  pub conn: AsyncRefCell<h2::server::Connection<NetworkStream, BufView>>,
+  pub conn: AsyncRefCell<h2::server::Connection<H2Stream, BufView>>,
 }
 
 impl Resource for Http2ServerConnection {
@@ -129,62 +197,11 @@ pub enum Http2Error {
   #[class(generic)]
   #[error(transparent)]
   H2(#[from] h2::Error),
-  #[class(inherit)]
-  #[error(transparent)]
-  TakeNetworkStream(
-    #[from]
-    #[inherit]
-    deno_net::raw::TakeNetworkStreamError,
-  ),
 }
 
-#[op2]
-pub async fn op_http2_connect(
-  state: Rc<RefCell<OpState>>,
-  #[smi] rid: ResourceId,
-  #[string] url: String,
-) -> Result<(ResourceId, ResourceId), Http2Error> {
-  // No permission check necessary because we're using an existing connection
-  let network_stream = {
-    let mut state = state.borrow_mut();
-    take_network_stream_resource(&mut state.resource_table, rid)?
-  };
-
-  let url = Url::parse(&url)?;
-
-  let (client, conn) =
-    h2::client::Builder::new().handshake(network_stream).await?;
-  let mut state = state.borrow_mut();
-  let client_rid = state.resource_table.add(Http2Client {
-    client: AsyncRefCell::new(client),
-    url,
-  });
-  let conn_rid = state.resource_table.add(Http2ClientConn {
-    conn: AsyncRefCell::new(conn),
-    cancel_handle: CancelHandle::new(),
-  });
-  Ok((client_rid, conn_rid))
-}
-
-#[op2]
-#[smi]
-pub async fn op_http2_listen(
-  state: Rc<RefCell<OpState>>,
-  #[smi] rid: ResourceId,
-) -> Result<ResourceId, Http2Error> {
-  let stream =
-    take_network_stream_resource(&mut state.borrow_mut().resource_table, rid)?;
-
-  let conn = h2::server::Builder::new().handshake(stream).await?;
-  Ok(
-    state
-      .borrow_mut()
-      .resource_table
-      .add(Http2ServerConnection {
-        conn: AsyncRefCell::new(conn),
-      }),
-  )
-}
+// op_http2_connect and op_http2_listen have been replaced by
+// connectH2 / listenH2 methods on LibuvStreamWrap (stream_wrap.rs)
+// which take the TLS halves directly without intermediate storage.
 
 #[op2]
 pub async fn op_http2_accept(

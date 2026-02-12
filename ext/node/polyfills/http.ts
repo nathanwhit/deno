@@ -10,6 +10,8 @@ import {
   op_node_http_fetch_response_upgrade,
   op_node_http_request_with_conn,
   op_node_http_response_reclaim_conn,
+  op_node_http_take_socket,
+  op_node_http_return_socket,
   op_tls_key_null,
   op_tls_key_static,
   op_tls_start,
@@ -528,12 +530,13 @@ class ClientRequest extends OutgoingMessage {
           span.setAttribute("url.query", parsedUrl.search.slice(1));
         }
 
-        let baseConnRid;
-        try {
-          baseConnRid = handle[kStreamBaseField][internalRidSymbol];
-        } catch (err) {
-          throw (this.socket.errored || err);
+        // Take the TCP stream from the handle and place it in the
+        // resource table for hyper to consume.
+        let baseConnRid = op_node_http_take_socket(handle);
+        if (baseConnRid < 0) {
+          throw (this.socket.errored || new Error("failed to export stream"));
         }
+
         // For reused TLS sockets, the connection is already encrypted.
         // Skip TLS upgrade if the socket is already encrypted (reusedSocket).
         const needsTlsUpgrade = this._encrypted && !this.socket.encrypted;
@@ -561,8 +564,6 @@ class ClientRequest extends OutgoingMessage {
           this.socket.encrypted = true;
         }
 
-        // Stop reading and save handle for keepAlive restoration.
-        this.socket?._handle?.readStop();
         this._socketHandle = this.socket?._handle;
         this._req = await op_node_http_request_with_conn(
           this.method,
@@ -1234,6 +1235,12 @@ export class IncomingMessageForClient extends NodeReadable {
         : new TcpConn(newRid, remoteAddr, localAddr);
 
       handle[kStreamBaseField] = conn;
+      // Import the reclaimed TCP stream back into the handle.
+      if (!isTls) {
+        op_node_http_return_socket(handle, newRid);
+      } else {
+        handle.attachResource?.(newRid);
+      }
       if (!socket._handle) {
         socket._handle = handle;
       }
