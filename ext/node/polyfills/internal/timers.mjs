@@ -54,6 +54,21 @@ const createTimer = Symbol("createTimer");
  */
 const activeTimers = new SafeMap();
 
+// Minimal TimersList model for Node inspector compatibility.
+class TimersList {
+  constructor(timeout) {
+    this._idleNext = timeout;
+    this._idlePrev = timeout;
+  }
+}
+
+TimersList.prototype[inspect.custom] = function (_, options) {
+  if (options.depth <= 0) {
+    return "[TimersList]";
+  }
+  return "TimersList {\n  _idlePrev: [Timeout],\n  _idleNext: [Timeout]\n}";
+};
+
 /**
  * @param {number} id
  * @returns {Timeout | undefined}
@@ -72,6 +87,8 @@ export function Timeout(callback, after, args, isRepeat, isRefed) {
   this._timerArgs = args;
   this._isRepeat = isRepeat;
   this._destroyed = false;
+  this._idleNext = null;
+  this._idlePrev = null;
   this[kRefed] = isRefed;
   this[kTimerId] = this[createTimer]();
 }
@@ -100,12 +117,17 @@ Timeout.prototype[createTimer] = function () {
   if (!this[kRefed]) {
     Deno.unrefTimer(id);
   }
+  const timersList = new TimersList(this);
+  this._idleNext = timersList;
+  this._idlePrev = timersList;
   MapPrototypeSet(activeTimers, id, this);
   return id;
 };
 
 Timeout.prototype[kDestroy] = function () {
   this._destroyed = true;
+  this._idleNext = null;
+  this._idlePrev = null;
   MapPrototypeDelete(activeTimers, this[kTimerId]);
 };
 

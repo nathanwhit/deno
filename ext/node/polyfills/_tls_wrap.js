@@ -36,8 +36,10 @@ import {
   isArrayBufferView,
 } from "ext:deno_node/internal/util/types.ts";
 import { startTlsInternal } from "ext:deno_net/02_tls.js";
+import { TcpConn } from "ext:deno_net/01_net.js";
 import { core, internals } from "ext:core/mod.js";
 import {
+  op_node_http_take_tcp_conn,
   op_node_tls_handshake,
   op_node_tls_start,
   op_tls_canonicalize_ipv4_address,
@@ -347,7 +349,23 @@ function startTls(wrap, handle, options) {
     wrap.init(options);
     return wrap;
   } else {
-    return startTlsInternal(handle[kStreamBaseField], options);
+    let stream = handle[kStreamBaseField];
+    if (!stream) {
+      // Native TCP handles don't expose a JS stream object. Materialize one
+      // for the TLS bootstrap path.
+      const rid = op_node_http_take_tcp_conn(handle);
+      const remote = {
+        hostname: wrap?.remoteAddress ?? "",
+        port: wrap?.remotePort ?? 0,
+      };
+      const local = {
+        hostname: wrap?.localAddress ?? "",
+        port: wrap?.localPort ?? 0,
+      };
+      stream = new TcpConn(rid, remote, local);
+      handle[kStreamBaseField] = stream;
+    }
+    return startTlsInternal(stream, options);
   }
 }
 

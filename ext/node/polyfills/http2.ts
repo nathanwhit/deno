@@ -17,6 +17,7 @@ import {
   op_http2_connect,
   op_http2_poll_client_connection,
   op_http_set_response_trailers,
+  op_node_http_take_tcp_conn,
 } from "ext:core/ops";
 
 import { notImplemented, warnNotImplemented } from "ext:deno_node/_utils.ts";
@@ -41,6 +42,7 @@ import { serveHttpOnConnection } from "ext:deno_http/00_serve.ts";
 import { nextTick } from "ext:deno_node/_next_tick.ts";
 import { TextEncoder } from "ext:deno_web/08_text_encoding.js";
 import { Duplex } from "node:stream";
+import { TcpConn } from "ext:deno_net/01_net.js";
 import {
   AbortError,
   ERR_HTTP2_CONNECT_AUTHORITY,
@@ -202,6 +204,34 @@ const sessionProxySocketHandler = {
   },
 };
 
+function ensureTcpConnFromHandle(handle: TCP): TcpConn {
+  const existing = handle[kStreamBaseField];
+  if (existing) {
+    return existing;
+  }
+
+  // Avoid parallel socket readers before ownership transfer.
+  handle.readStop?.();
+
+  const local = {};
+  handle.getsockname?.(local);
+  const remote = {};
+  handle.getpeername?.(remote);
+  const conn = new TcpConn(
+    op_node_http_take_tcp_conn(handle),
+    {
+      hostname: remote.address ?? "",
+      port: remote.port ?? 0,
+    },
+    {
+      hostname: local.address ?? "",
+      port: local.port ?? 0,
+    },
+  );
+  handle[kStreamBaseField] = conn;
+  return conn;
+}
+
 export class Http2Session extends EventEmitter {
   constructor(type, _options, socket) {
     super();
@@ -277,7 +307,10 @@ export class Http2Session extends EventEmitter {
     return false;
   }
 
-  get socket(): Socket {
+  get socket(): Socket | undefined {
+    if (this[kSocket] === undefined) {
+      return undefined;
+    }
     const proxySocket = this[kProxySocket];
     if (proxySocket === null) {
       return this[kProxySocket] = new Proxy(this, sessionProxySocketHandler);
@@ -318,6 +351,12 @@ export class Http2Session extends EventEmitter {
   ) {
     // TODO(satyarohith): create goaway op and pass the args
     debugHttp2(">>> goaway - ignored args", code, lastStreamID, opaqueData);
+    const state = this[kState];
+    if (state.pendingStreams.size > 0 || state.streams.size > 0) {
+      const cancel = new ERR_HTTP2_STREAM_CANCEL();
+      state.pendingStreams.forEach((stream) => stream.destroy(cancel));
+      state.streams.forEach((stream) => stream.close(constants.NGHTTP2_CANCEL));
+    }
     if (this[kDenoConnRid]) {
       core.tryClose(this[kDenoConnRid]);
     }
@@ -373,11 +412,11 @@ export class Http2Session extends EventEmitter {
   }
 
   ref() {
-    warnNotImplemented("Http2Session.ref");
+    this[kSocket]?.ref?.();
   }
 
   unref() {
-    warnNotImplemented("Http2Session.unref");
+    this[kSocket]?.unref?.();
   }
 
   _onTimeout() {
@@ -397,8 +436,7 @@ function emitClose(session: Http2Session, error?: Error) {
 }
 
 function finishSessionClose(session: Http2Session, error?: Error) {
-  // TODO(bartlomieju): handle sockets
-
+  session[kSocket] = undefined;
   nextTick(emitClose, session, error);
 }
 
@@ -430,13 +468,42 @@ function closeSession(session: Http2Session, code?: number, error?: Error) {
     core.tryClose(session[kDenoClientRid]);
   }
 
-  finishSessionClose(session, error);
+  let finished = false;
+  const finish = () => {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    finishSessionClose(session, error);
+  };
+
+  const socket = session[kSocket];
+  if (socket && !socket.destroyed) {
+    socket.once("close", () => {
+      finish();
+    });
+    if (session.closed) {
+      // Keep reading so graceful close can observe peer shutdown.
+      socket.resume?.();
+    }
+    socket.end?.(() => {
+      // Force teardown after ending to avoid detached-socket hangs.
+      if (!socket.destroyed) {
+        socket.destroy(error);
+      }
+    });
+    // Some server-side socket paths are not coupled to node:net close events.
+    if (session[kType] === constants.NGHTTP2_SESSION_SERVER) {
+      nextTick(finish);
+    }
+  } else {
+    finish();
+  }
 }
 
 export class ServerHttp2Session extends Http2Session {
-  constructor() {
-    // TODO(satyarohith): pass socket instead of undefined
-    super(constants.NGHTTP2_SESSION_SERVER, {}, undefined);
+  constructor(socket: Socket) {
+    super(constants.NGHTTP2_SESSION_SERVER, {}, socket);
   }
 
   altsvc(
@@ -487,7 +554,8 @@ export class ClientHttp2Session extends Http2Session {
     const connPromise = new Promise((resolve) => {
       const eventName = url.startsWith("https") ? "secureConnect" : "connect";
       socket.once(eventName, () => {
-        const rid = socket[kHandle][kStreamBaseField][internalRidSymbol];
+        const conn = ensureTcpConnFromHandle(socket[kHandle]);
+        const rid = conn[internalRidSymbol];
         nextTick(() => resolve(rid));
       });
     });
@@ -932,6 +1000,13 @@ export class ClientHttp2Stream extends Duplex {
           : constants.NGHTTP2_FLAG_NONE,
       );
       this[kDenoResponse] = response;
+      if (endStream) {
+        this[kState].serverEndedCall = true;
+        core.tryClose(response.bodyRid);
+        this.push(null);
+        this.read(0);
+        this[kMaybeDestroy]();
+      }
       this.emit("ready");
     })().catch((e) => {
       if (!(e instanceof ERR_HTTP2_STREAM_CANCEL)) {
@@ -1103,10 +1178,21 @@ export class ClientHttp2Stream extends Duplex {
     debugHttp2(">>> read");
 
     (async () => {
-      const [chunk, finished, cancelled] =
-        await op_http2_client_get_response_body_chunk(
-          this[kDenoResponse].bodyRid,
-        );
+      let chunk;
+      let finished;
+      let cancelled;
+      try {
+        [chunk, finished, cancelled] =
+          await op_http2_client_get_response_body_chunk(
+            this[kDenoResponse].bodyRid,
+          );
+      } catch {
+        this[kState].serverEndedCall = true;
+        this.push(null);
+        this.read(0);
+        this[kMaybeDestroy]();
+        return;
+      }
 
       if (cancelled) {
         return;
@@ -1129,6 +1215,7 @@ export class ClientHttp2Stream extends Duplex {
         this.push(null);
         debugHttp2(">>> read null chunk");
         this.read(0);
+        nextTick(() => this[kMaybeDestroy]());
         this[kMaybeDestroy]();
         return;
       }
@@ -1262,6 +1349,9 @@ export class ClientHttp2Stream extends Duplex {
     }
 
     if (this.writableFinished) {
+      if (!this.readable && !this.closed) {
+        closeStream(this, constants.NGHTTP2_NO_ERROR, kNoRstStream);
+      }
       if (!this.readable && this.closed) {
         debugHttp2("going into _destroy");
         this._destroy();
@@ -1419,8 +1509,26 @@ function finishCloseStream(stream, code) {
   }
 }
 
-function callTimeout() {
-  notImplemented("callTimeout");
+function callTimeout(self, session) {
+  // If the session/stream is already destroyed, ignore spurious timer firings.
+  if (self.destroyed) {
+    return;
+  }
+
+  if (self[kState]?.writeQueueSize > 0) {
+    const handle = session?.[kHandle];
+    const chunksSentSinceLastWrite = handle?.chunksSentSinceLastWrite;
+    if (
+      chunksSentSinceLastWrite !== null &&
+      chunksSentSinceLastWrite !== undefined &&
+      chunksSentSinceLastWrite !== handle.updateChunksSent?.()
+    ) {
+      self[kUpdateTimer]();
+      return;
+    }
+  }
+
+  self.emit("timeout");
 }
 
 export class ServerHttp2Stream extends Http2Stream {
@@ -1631,11 +1739,15 @@ export class Http2Server extends Server {
 
     this.on(
       "connection",
-      (conn: Deno.Conn) => {
+      (socket: Socket) => {
         try {
-          const session = new ServerHttp2Session();
+          const session = new ServerHttp2Session(socket);
+          socket.on("error", socketOnError);
+          socket.on("close", socketOnClose);
+          socket[kSession] = session;
           this.emit("session", session);
-          this.#server = serveHttpOnConnection(
+          const conn = ensureTcpConnFromHandle(socket[kHandle]);
+          const server = serveHttpOnConnection(
             conn,
             this.#abortController.signal,
             async (req: Request) => {
@@ -1676,6 +1788,11 @@ export class Http2Server extends Server {
             },
             () => {},
           );
+          this.#server = server;
+          server.finished.finally(() => {
+            session.close();
+            session[kMaybeDestroy]();
+          });
         } catch (e) {
           // deno-lint-ignore no-console
           console.log(">>> Error in Http2Server", e);
@@ -1686,11 +1803,6 @@ export class Http2Server extends Server {
     if (typeof requestListener === "function") {
       this.on("request", requestListener);
     }
-  }
-
-  // Prevent the TCP server from wrapping this in a socket, since we need it to serve HTTP
-  _createSocket(clientHandle: TCP) {
-    return clientHandle[kStreamBaseField];
   }
 
   setTimeout(msecs: number, callback?: () => unknown) {

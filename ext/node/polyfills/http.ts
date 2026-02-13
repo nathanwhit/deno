@@ -28,6 +28,7 @@ import {
 import { Buffer } from "node:buffer";
 import { ERR_SERVER_NOT_RUNNING } from "ext:deno_node/internal/errors.ts";
 import { EventEmitter } from "node:events";
+import { AsyncResource } from "node:async_hooks";
 import { nextTick } from "ext:deno_node/_next_tick.ts";
 import {
   validateAbortSignal,
@@ -206,6 +207,7 @@ class ClientRequest extends OutgoingMessage {
   _req: { requestRid: number; cancelHandleRid: number | null } | undefined;
   _encrypted = false;
   socket: Socket;
+  _asyncResource: AsyncResource;
 
   constructor(
     input: string | URL,
@@ -213,6 +215,7 @@ class ClientRequest extends OutgoingMessage {
     cb?: (res: IncomingMessageForClient) => void,
   ) {
     super();
+    this._asyncResource = new AsyncResource("HTTPCLIENTREQUEST");
 
     if (typeof input === "string") {
       const urlStr = input;
@@ -422,6 +425,18 @@ class ClientRequest extends OutgoingMessage {
 
     this[kUniqueHeaders] = parseUniqueHeadersOption(options!.uniqueHeaders);
 
+    // Honor explicit "Connection: close" request headers.
+    const connectionHeader = this.getHeader("connection");
+    if (connectionHeader !== undefined) {
+      const connectionValue = ArrayIsArray(connectionHeader)
+        ? connectionHeader.join(",")
+        : `${connectionHeader}`;
+      if (StringPrototypeToLowerCase(connectionValue).includes("close")) {
+        this._last = true;
+        this.shouldKeepAlive = false;
+      }
+    }
+
     let optsWithoutSignal = options as RequestOptions;
     if (optsWithoutSignal.signal) {
       optsWithoutSignal = Object.assign({}, options);
@@ -513,6 +528,9 @@ class ClientRequest extends OutgoingMessage {
           // This should be only happening in artificial test cases
           return;
         }
+        // The HTTP client ops own socket I/O. Stop net.Socket reads first to
+        // avoid competing reads on the same stream.
+        handle.readStop?.();
         if (span) {
           const context = ContextManager.active();
           for (const propagator of new SafeArrayIterator(PROPAGATORS)) {
@@ -655,6 +673,7 @@ class ClientRequest extends OutgoingMessage {
         incoming.statusMessage = res.statusText;
         incoming.upgrade = null;
 
+        let responseConnectionClose = false;
         for (const [key, value] of res.headers) {
           if (
             key.toLowerCase() === "upgrade" &&
@@ -663,12 +682,22 @@ class ClientRequest extends OutgoingMessage {
             incoming.upgrade = true;
             break;
           }
+          if (
+            key.toLowerCase() === "connection" &&
+            StringPrototypeToLowerCase(value).includes("close")
+          ) {
+            responseConnectionClose = true;
+          }
         }
 
         incoming._addHeaderLines(
           res.headers,
           Object.entries(res.headers).flat().length,
         );
+        if (responseConnectionClose) {
+          this._last = true;
+          this.shouldKeepAlive = false;
+        }
 
         if (incoming.upgrade) {
           if (this.listenerCount("upgrade") === 0) {
@@ -709,7 +738,20 @@ class ClientRequest extends OutgoingMessage {
           this.emit("close");
         } else {
           incoming._bodyRid = res.responseRid;
-          this.emit("response", incoming);
+          if (res.contentLength === 0) {
+            queueMicrotask(() => {
+              incoming._finalizeEmptyBody();
+            });
+          }
+          const hasResponseListeners = this._asyncResource.runInAsyncScope(
+            this.emit,
+            this,
+            "response",
+            incoming,
+          );
+          if (!hasResponseListeners) {
+            incoming._dump();
+          }
         }
       } catch (err) {
         if (span) {
@@ -1186,6 +1228,11 @@ export class IncomingMessageForClient extends NodeReadable {
   }
 
   _read(_n) {
+    if (this._bodyRid == null || this._bodyRid < 0) {
+      this.push(null);
+      return;
+    }
+
     if (!this._consuming) {
       this._readableState.readingMore = false;
       this._consuming = true;
@@ -1195,15 +1242,32 @@ export class IncomingMessageForClient extends NodeReadable {
 
     core.read(this._bodyRid, buf).then(async (bytesRead) => {
       if (bytesRead === 0) {
+        this.complete = true;
         // Return the socket to the agent pool BEFORE pushing null.
         // This must happen before the stream ends, otherwise the socket
         // may already be marked as destroyed.
         await this.#tryReturnSocket();
+        this.#closeBodyRid();
         this.push(null);
       } else {
         this.push(Buffer.from(buf.subarray(0, bytesRead)));
       }
     });
+  }
+
+  async _finalizeEmptyBody() {
+    this.complete = true;
+    await this.#tryReturnSocket();
+    this.#closeBodyRid();
+    this.push(null);
+  }
+
+  #closeBodyRid() {
+    if (this._bodyRid == null || this._bodyRid < 0) {
+      return;
+    }
+    core.tryClose(this._bodyRid);
+    this._bodyRid = -1;
   }
 
   // Try to return the socket to the agent pool for keepAlive reuse.
@@ -1216,6 +1280,10 @@ export class IncomingMessageForClient extends NodeReadable {
     const req = this.req;
     // Only pool the socket if keepAlive is enabled.
     if (!req?.shouldKeepAlive) {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      this.socket = null;
       return;
     }
 
@@ -1227,6 +1295,10 @@ export class IncomingMessageForClient extends NodeReadable {
     try {
       const newRid = await op_node_http_response_reclaim_conn(this._bodyRid);
       if (newRid == null) {
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
+        this.socket = null;
         return;
       }
 
@@ -1280,6 +1352,10 @@ export class IncomingMessageForClient extends NodeReadable {
       this.socket = null;
     } catch (_e) {
       // Socket reuse is best-effort.
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      this.socket = null;
     }
   }
 

@@ -131,6 +131,7 @@ const kLastWriteQueueSize = Symbol("lastWriteQueueSize");
 const kSetNoDelay = Symbol("kSetNoDelay");
 const kBytesRead = Symbol("kBytesRead");
 const kBytesWritten = Symbol("kBytesWritten");
+const kServerCloseWaitTimer = Symbol("kServerCloseWaitTimer");
 
 const DEFAULT_IPV4_ADDR = "0.0.0.0";
 const DEFAULT_IPV6_ADDR = "::";
@@ -362,7 +363,7 @@ function _afterConnect(
     return;
   }
 
-  debug("afterConnect");
+  debug("afterConnect", status);
 
   assert(socket.connecting);
 
@@ -383,12 +384,6 @@ function _afterConnect(
 
     socket.emit("connect");
     socket.emit("ready");
-
-    // Deno specific: run tls handshake if it's from a tls socket
-    // This swaps the handle[kStreamBaseField] from TcpConn to TlsConn
-    if (typeof handle.afterConnectTls === "function") {
-      handle.afterConnectTls();
-    }
 
     // Start the first read, or get an immediate EOF.
     // this doesn't actually consume any bytes, because len=0.
@@ -416,7 +411,8 @@ function _afterConnect(
       ex.localPort = req.localPort;
     }
 
-    socket.destroy(ex);
+    socket.emit("error", ex);
+    socket.destroy();
   }
 }
 
@@ -780,13 +776,24 @@ function _writeAfterFIN(
   cb?: (error: Error | null | undefined) => void,
 ): boolean {
   if (!this.writableEnded) {
-    return Duplex.prototype.write.call(
-      this,
-      chunk,
-      encoding as BufferEncoding | null,
-      // @ts-expect-error Using `call` seem to be interfering with the overload for write
-      cb,
+    if (typeof encoding === "function") {
+      cb = encoding;
+      encoding = null;
+    }
+
+    const err = genericNodeError(
+      "This socket has been ended by the other party",
+      { code: "EPIPE" },
     );
+    let hasCallback = false;
+    if (typeof cb === "function") {
+      hasCallback = true;
+      defaultTriggerAsyncIdScope(this[asyncIdSymbol], nextTick, cb, err);
+    }
+    if (!hasCallback) {
+      nextTick(() => this.destroy());
+    }
+    return false;
   }
 
   if (typeof encoding === "function") {
@@ -803,11 +810,7 @@ function _writeAfterFIN(
     defaultTriggerAsyncIdScope(this[asyncIdSymbol], nextTick, cb, err);
   }
 
-  if (this._server) {
-    nextTick(() => this.destroy(err));
-  } else {
-    this.destroy(err);
-  }
+  this.destroy(err);
 
   return false;
 }
@@ -998,63 +1001,68 @@ function _lookupAndConnect(
   }
 
   defaultTriggerAsyncIdScope(self[asyncIdSymbol], function () {
-    lookup(
-      host,
-      dnsOpts,
-      function emitLookup(
-        err: ErrnoException | null,
-        ip: string,
-        addressType: number,
-        netPermToken,
-      ) {
-        clearLookupKeepAlive();
-        self._handle?.setNetPermToken?.(netPermToken);
-        self.emit("lookup", err, ip, addressType, host);
+    try {
+      lookup(
+        host,
+        dnsOpts,
+        function emitLookup(
+          err: ErrnoException | null,
+          ip: string,
+          addressType: number,
+          netPermToken,
+        ) {
+          clearLookupKeepAlive();
+          self._handle?.setNetPermToken?.(netPermToken);
+          self.emit("lookup", err, ip, addressType, host);
 
-        // It's possible we were destroyed while looking this up.
-        // XXX it would be great if we could cancel the promise returned by
-        // the look up.
-        if (!self.connecting) {
-          return;
-        }
+          // It's possible we were destroyed while looking this up.
+          // XXX it would be great if we could cancel the promise returned by
+          // the look up.
+          if (!self.connecting) {
+            return;
+          }
 
-        if (err) {
-          // net.createConnection() creates a net.Socket object and immediately
-          // calls net.Socket.connect() on it (that's us). There are no event
-          // listeners registered yet so defer the error event to the next tick.
-          nextTick(_connectErrorNT, self, err);
-        } else if (!isIP(ip)) {
-          err = new ERR_INVALID_IP_ADDRESS(ip);
+          if (err) {
+            // net.createConnection() creates a net.Socket object and immediately
+            // calls net.Socket.connect() on it (that's us). There are no event
+            // listeners registered yet so defer the error event to the next tick.
+            nextTick(_connectErrorNT, self, err);
+          } else if (!isIP(ip)) {
+            err = new ERR_INVALID_IP_ADDRESS(ip);
 
-          nextTick(_connectErrorNT, self, err);
-        } else if (addressType !== 4 && addressType !== 6) {
-          err = new ERR_INVALID_ADDRESS_FAMILY(
-            `${addressType}`,
-            options.host!,
-            options.port,
-          );
+            nextTick(_connectErrorNT, self, err);
+          } else if (addressType !== 4 && addressType !== 6) {
+            err = new ERR_INVALID_ADDRESS_FAMILY(
+              `${addressType}`,
+              options.host!,
+              options.port,
+            );
 
-          nextTick(_connectErrorNT, self, err);
-        } else {
-          self._unrefTimer();
+            nextTick(_connectErrorNT, self, err);
+          } else {
+            self._unrefTimer();
 
-          defaultTriggerAsyncIdScope(self[asyncIdSymbol], nextTick, () => {
-            if (self.connecting) {
-              defaultTriggerAsyncIdScope(
-                self[asyncIdSymbol],
-                _internalConnect,
-                self,
-                ip,
-                port,
-                addressType,
-                localAddress,
-                localPort,
-              );
-            }
-          });
-        }
-      },
-    );
+            defaultTriggerAsyncIdScope(self[asyncIdSymbol], nextTick, () => {
+              if (self.connecting) {
+                defaultTriggerAsyncIdScope(
+                  self[asyncIdSymbol],
+                  _internalConnect,
+                  self,
+                  ip,
+                  port,
+                  addressType,
+                  localAddress,
+                  localPort,
+                );
+              }
+            });
+          }
+        },
+      );
+    } catch (err) {
+      clearLookupKeepAlive();
+      throw err;
+    }
   });
 }
 
@@ -1073,128 +1081,135 @@ function _lookupAndConnectMultiple(
   onLookupDone?: () => void,
 ) {
   defaultTriggerAsyncIdScope(self[asyncIdSymbol], function emitLookup() {
-    lookup(host, dnsopts, function emitLookup(err, addresses, _, netPermToken) {
-      onLookupDone?.();
-      self._handle?.setNetPermToken?.(netPermToken);
-      // It's possible we were destroyed while looking this up.
-      // XXX it would be great if we could cancel the promise returned by
-      // the look up.
-      if (!self.connecting) {
-        return;
-      } else if (err) {
-        self.emit("lookup", err, undefined, undefined, host);
-
-        // net.createConnection() creates a net.Socket object and immediately
-        // calls net.Socket.connect() on it (that's us). There are no event
-        // listeners registered yet so defer the error event to the next tick.
-        nextTick(_connectErrorNT, self, err);
-        return;
-      }
-
-      // Filter addresses by only keeping the one which are either IPv4 or IPV6.
-      // The first valid address determines which group has preference on the
-      // alternate family sorting which happens later.
-      const validAddresses = [[], []];
-      const validIps = [[], []];
-      let destinations;
-      for (let i = 0, l = addresses.length; i < l; i++) {
-        const address = addresses[i];
-        const { address: ip, family: addressType } = address;
-        self.emit("lookup", err, ip, addressType, host);
+    try {
+      lookup(host, dnsopts, function emitLookup(err, addresses, _, netPermToken) {
+        onLookupDone?.();
+        self._handle?.setNetPermToken?.(netPermToken);
         // It's possible we were destroyed while looking this up.
+        // XXX it would be great if we could cancel the promise returned by
+        // the look up.
         if (!self.connecting) {
           return;
+        } else if (err) {
+          self.emit("lookup", err, undefined, undefined, host);
+
+          // net.createConnection() creates a net.Socket object and immediately
+          // calls net.Socket.connect() on it (that's us). There are no event
+          // listeners registered yet so defer the error event to the next tick.
+          nextTick(_connectErrorNT, self, err);
+          return;
         }
-        if (isIP(ip) && (addressType === 4 || addressType === 6)) {
-          destinations ||= addressType === 6 ? { 6: 0, 4: 1 } : { 4: 0, 6: 1 };
 
-          const destination = destinations[addressType];
+        // Filter addresses by only keeping the one which are either IPv4 or IPV6.
+        // The first valid address determines which group has preference on the
+        // alternate family sorting which happens later.
+        const validAddresses = [[], []];
+        const validIps = [[], []];
+        let destinations;
+        for (let i = 0, l = addresses.length; i < l; i++) {
+          const address = addresses[i];
+          const { address: ip, family: addressType } = address;
+          self.emit("lookup", err, ip, addressType, host);
+          // It's possible we were destroyed while looking this up.
+          if (!self.connecting) {
+            return;
+          }
+          if (isIP(ip) && (addressType === 4 || addressType === 6)) {
+            destinations ||= addressType === 6
+              ? { 6: 0, 4: 1 }
+              : { 4: 0, 6: 1 };
 
-          // Only try an address once
-          if (!ArrayPrototypeIncludes(validIps[destination], ip)) {
-            ArrayPrototypePush(validAddresses[destination], address);
-            ArrayPrototypePush(validIps[destination], ip);
+            const destination = destinations[addressType];
+
+            // Only try an address once
+            if (!ArrayPrototypeIncludes(validIps[destination], ip)) {
+              ArrayPrototypePush(validAddresses[destination], address);
+              ArrayPrototypePush(validIps[destination], ip);
+            }
           }
         }
-      }
 
-      // When no AAAA or A records are available, fail on the first one
-      if (!validAddresses[0].length && !validAddresses[1].length) {
-        const { address: firstIp, family: firstAddressType } = addresses[0];
+        // When no AAAA or A records are available, fail on the first one
+        if (!validAddresses[0].length && !validAddresses[1].length) {
+          const { address: firstIp, family: firstAddressType } = addresses[0];
 
-        if (!isIP(firstIp)) {
-          err = new ERR_INVALID_IP_ADDRESS(firstIp);
-          nextTick(_connectErrorNT, self, err);
-        } else if (firstAddressType !== 4 && firstAddressType !== 6) {
-          err = new ERR_INVALID_ADDRESS_FAMILY(
-            firstAddressType,
-            options.host,
-            options.port,
+          if (!isIP(firstIp)) {
+            err = new ERR_INVALID_IP_ADDRESS(firstIp);
+            nextTick(_connectErrorNT, self, err);
+          } else if (firstAddressType !== 4 && firstAddressType !== 6) {
+            err = new ERR_INVALID_ADDRESS_FAMILY(
+              firstAddressType,
+              options.host,
+              options.port,
+            );
+            nextTick(_connectErrorNT, self, err);
+          }
+
+          return;
+        }
+
+        // Sort addresses alternating families
+        const toAttempt = [];
+        for (
+          let i = 0,
+            l = MathMax(validAddresses[0].length, validAddresses[1].length);
+          i < l;
+          i++
+        ) {
+          if (i in validAddresses[0]) {
+            ArrayPrototypePush(toAttempt, validAddresses[0][i]);
+          }
+          if (i in validAddresses[1]) {
+            ArrayPrototypePush(toAttempt, validAddresses[1][i]);
+          }
+        }
+
+        if (toAttempt.length === 1) {
+          debug(
+            "connect/multiple: only one address found, switching back to single connection",
           );
-          nextTick(_connectErrorNT, self, err);
+          const { address: ip, family: addressType } = toAttempt[0];
+
+          self._unrefTimer();
+          defaultTriggerAsyncIdScope(
+            self[asyncIdSymbol],
+            _internalConnect,
+            self,
+            ip,
+            port,
+            addressType,
+            localAddress,
+            localPort,
+          );
+
+          return;
         }
 
-        return;
-      }
+        self.autoSelectFamilyAttemptedAddresses = [];
+        debug("connect/multiple: will try the following addresses", toAttempt);
 
-      // Sort addresses alternating families
-      const toAttempt = [];
-      for (
-        let i = 0,
-          l = MathMax(validAddresses[0].length, validAddresses[1].length);
-        i < l;
-        i++
-      ) {
-        if (i in validAddresses[0]) {
-          ArrayPrototypePush(toAttempt, validAddresses[0][i]);
-        }
-        if (i in validAddresses[1]) {
-          ArrayPrototypePush(toAttempt, validAddresses[1][i]);
-        }
-      }
-
-      if (toAttempt.length === 1) {
-        debug(
-          "connect/multiple: only one address found, switching back to single connection",
-        );
-        const { address: ip, family: addressType } = toAttempt[0];
+        const context = {
+          socket: self,
+          addresses: toAttempt,
+          current: 0,
+          port,
+          localPort,
+          timeout,
+          [kTimeout]: null,
+          errors: [],
+        };
 
         self._unrefTimer();
         defaultTriggerAsyncIdScope(
           self[asyncIdSymbol],
-          _internalConnect,
-          self,
-          ip,
-          port,
-          addressType,
-          localAddress,
-          localPort,
+          _internalConnectMultiple,
+          context,
         );
-
-        return;
-      }
-
-      self.autoSelectFamilyAttemptedAddresses = [];
-      debug("connect/multiple: will try the following addresses", toAttempt);
-
-      const context = {
-        socket: self,
-        addresses: toAttempt,
-        current: 0,
-        port,
-        localPort,
-        timeout,
-        [kTimeout]: null,
-        errors: [],
-      };
-
-      self._unrefTimer();
-      defaultTriggerAsyncIdScope(
-        self[asyncIdSymbol],
-        _internalConnectMultiple,
-        context,
-      );
-    });
+      });
+    } catch (err) {
+      onLookupDone?.();
+      throw err;
+    }
   });
 }
 
@@ -2551,6 +2566,10 @@ Server.prototype.listen = function (...args: unknown[]) {
  * @param cb Called when the server is closed.
  */
 Server.prototype.close = function (cb?: (err?: Error) => void) {
+  const selfWithCloseTimer = this as Server & {
+    [kServerCloseWaitTimer]?: ReturnType<typeof setInterval>;
+  };
+
   if (typeof cb === "function") {
     if (!this._handle) {
       this.once("close", function close() {
@@ -2558,6 +2577,18 @@ Server.prototype.close = function (cb?: (err?: Error) => void) {
       });
     } else {
       this.once("close", cb);
+      if (selfWithCloseTimer[kServerCloseWaitTimer] === undefined) {
+        selfWithCloseTimer[kServerCloseWaitTimer] = setInterval(
+          () => {},
+          1 << 30,
+        );
+      }
+      this.once("close", () => {
+        if (selfWithCloseTimer[kServerCloseWaitTimer] !== undefined) {
+          clearInterval(selfWithCloseTimer[kServerCloseWaitTimer]);
+          selfWithCloseTimer[kServerCloseWaitTimer] = undefined;
+        }
+      });
     }
   }
 

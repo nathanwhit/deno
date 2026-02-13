@@ -3,6 +3,10 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::io::ErrorKind;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -14,12 +18,14 @@ use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
 use deno_permissions::PermissionsContainer;
+use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 
 use super::connection_wrap::ConnectionWrap;
 use super::handle_wrap::AsyncWrap;
 use super::handle_wrap::HandleWrap;
 use super::stream_wrap::LibuvStreamWrap;
+use super::stream_wrap::update_write_result;
 
 // `providerType.TCPCONNECTWRAP`
 const PROVIDER_TCPCONNECTWRAP: i32 = 32;
@@ -35,6 +41,7 @@ const SERVER: i32 = 1;
 const UV_EINVAL: i32 = -22;
 const UV_EADDRNOTAVAIL: i32 = -99;
 const UV_EACCES: i32 = -13;
+const UV_EBADF: i32 = -9;
 
 #[derive(CppgcBase, CppgcInherits)]
 #[cppgc_inherits_from(AsyncWrap)]
@@ -56,7 +63,7 @@ unsafe impl GarbageCollected for TCPConnectWrap {
 impl TCPConnectWrap {
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L118-L123
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L118-L123
   #[constructor]
   #[cppgc]
   fn new(state: &mut OpState) -> TCPConnectWrap {
@@ -73,9 +80,10 @@ pub struct TCP {
   base: ConnectionWrap,
   is_server: Cell<bool>,
   refed: Rc<Cell<bool>>,
+  active_ops: Rc<Cell<u32>>,
+  external_ops_tracker: deno_core::ExternalOpsTracker,
   connection_count: Rc<Cell<i32>>,
   parent_connection_count: Option<Rc<Cell<i32>>>,
-  reading: Rc<Cell<bool>>,
   fd: Cell<i32>,
   stream: Rc<RefCell<Option<TcpStream>>>,
   listener: Rc<RefCell<Option<std::net::TcpListener>>>,
@@ -102,14 +110,16 @@ impl TCP {
     connection_wrap: ConnectionWrap,
     is_server: bool,
     spawner: deno_core::V8TaskSpawner,
+    external_ops_tracker: deno_core::ExternalOpsTracker,
   ) -> Self {
     Self {
       base: connection_wrap,
       is_server: Cell::new(is_server),
       refed: Rc::new(Cell::new(true)),
+      active_ops: Rc::new(Cell::new(0)),
+      external_ops_tracker,
       connection_count: Rc::new(Cell::new(0)),
       parent_connection_count: None,
-      reading: Rc::new(Cell::new(false)),
       fd: Cell::new(-1),
       stream: Rc::new(RefCell::new(None)),
       listener: Rc::new(RefCell::new(None)),
@@ -123,6 +133,55 @@ impl TCP {
     }
   }
 
+  fn set_refed(&self, is_refed: bool) {
+    let was_refed = self.refed.replace(is_refed);
+    if was_refed == is_refed {
+      return;
+    }
+
+    let active = self.active_ops.get();
+    for _ in 0..active {
+      if is_refed {
+        self.external_ops_tracker.ref_op();
+      } else {
+        self.external_ops_tracker.unref_op();
+      }
+    }
+  }
+
+  fn begin_active_op(
+    &self,
+  ) -> (
+    Rc<Cell<u32>>,
+    Rc<Cell<bool>>,
+    deno_core::ExternalOpsTracker,
+  ) {
+    let active_ops = self.active_ops.clone();
+    let refed = self.refed.clone();
+    let external_ops_tracker = self.external_ops_tracker.clone();
+
+    active_ops.set(active_ops.get().saturating_add(1));
+    if refed.get() {
+      external_ops_tracker.ref_op();
+    }
+
+    (active_ops, refed, external_ops_tracker)
+  }
+
+  fn end_active_op(
+    active_ops: Rc<Cell<u32>>,
+    refed: Rc<Cell<bool>>,
+    external_ops_tracker: deno_core::ExternalOpsTracker,
+  ) {
+    let current = active_ops.get();
+    if current > 0 {
+      active_ops.set(current - 1);
+      if refed.get() {
+        external_ops_tracker.unref_op();
+      }
+    }
+  }
+
   fn connect_impl(
     &self,
     op_state: Rc<RefCell<OpState>>,
@@ -133,14 +192,24 @@ impl TCP {
   ) -> i32 {
     self.remote_address.replace(Some(address.clone()));
     self.remote_port.set(Some(port));
+    let requested_local_address = self.local_address.borrow().clone();
+    let requested_local_port = self.local_port.get();
 
     let stream_slot = self.stream.clone();
     let local_address = self.local_address.clone();
     let local_port = self.local_port.clone();
     let remote_address = self.remote_address.clone();
     let remote_port = self.remote_port.clone();
+    let (active_ops, refed, external_ops_tracker) = self.begin_active_op();
     deno_core::unsync::spawn(async move {
-      let status = match TcpStream::connect((address.as_str(), port)).await {
+      let status = match connect_tcp(
+        &address,
+        port,
+        requested_local_address.as_deref(),
+        requested_local_port,
+      )
+      .await
+      {
         Ok(stream) => {
           if let Ok(local_addr) = stream.local_addr() {
             local_address.replace(Some(local_addr.ip().to_string()));
@@ -160,20 +229,23 @@ impl TCP {
         .borrow()
         .borrow::<deno_core::V8TaskSpawner>()
         .spawn(move |scope| call_connect_oncomplete(scope, this, req, status));
+      TCP::end_active_op(active_ops, refed, external_ops_tracker);
     });
     0
   }
 
   fn start_read_loop(&self, this: v8::Global<v8::Object>) -> i32 {
-    if self.reading.get() {
+    let reading = self.base.stream_reading_cell();
+    if reading.get() {
       return 0;
     }
-    self.reading.set(true);
+    reading.set(true);
 
-    let reading = self.reading.clone();
+    let bytes_read = self.base.stream_bytes_read_cell();
     let stream = self.stream.clone();
     let this = Rc::new(this);
     let spawner = self.spawner.clone();
+    let (active_ops, refed, external_ops_tracker) = self.begin_active_op();
     deno_core::unsync::spawn(async move {
       let mut buf = vec![0u8; 64 * 1024];
       while reading.get() {
@@ -196,6 +268,7 @@ impl TCP {
             break;
           }
           Ok(nread) => {
+            bytes_read.set(bytes_read.get().saturating_add(nread as u64));
             let this = this.clone();
             let data = buf[..nread].to_vec();
             spawner.spawn(move |scope| {
@@ -218,14 +291,34 @@ impl TCP {
           }
         }
       }
+      TCP::end_active_op(active_ops, refed, external_ops_tracker);
     });
 
     0
   }
 
-  fn write_impl(&self, req: v8::Global<v8::Object>, data: Vec<u8>) -> i32 {
+  fn write_impl(
+    &self,
+    op_state: Rc<RefCell<OpState>>,
+    req: v8::Global<v8::Object>,
+    data: Vec<u8>,
+  ) -> i32 {
+    if self.closed.get() {
+      return UV_EBADF;
+    }
+
+    let written_len = data.len().min(u32::MAX as usize) as u32;
+    update_write_result(&op_state, written_len);
+    let bytes_written = self.base.stream_bytes_written_cell();
+    bytes_written.set(bytes_written.get().saturating_add(data.len() as u64));
+    let write_queue_size = self.base.stream_write_queue_size_cell();
+    write_queue_size.set(write_queue_size.get().saturating_add(written_len));
+
     let stream = self.stream.clone();
+    let closed = self.closed.clone();
+    let write_queue_size = write_queue_size.clone();
     let spawner = self.spawner.clone();
+    let (active_ops, refed, external_ops_tracker) = self.begin_active_op();
     deno_core::unsync::spawn(async move {
       let mut offset = 0usize;
       let status = loop {
@@ -236,7 +329,7 @@ impl TCP {
         let write_result = {
           let stream_ref = stream.borrow();
           let Some(stream) = stream_ref.as_ref() else {
-            break not_connected_status();
+            break if closed.get() { 0 } else { not_connected_status() };
           };
           stream.try_write(&data[offset..])
         };
@@ -252,10 +345,13 @@ impl TCP {
           Err(err) => break error_to_status(err),
         }
       };
+      let status = if status != 0 && closed.get() { 0 } else { status };
 
+      write_queue_size.set(write_queue_size.get().saturating_sub(written_len));
       spawner.spawn(move |scope| {
         call_req_oncomplete(scope, req, status);
       });
+      TCP::end_active_op(active_ops, refed, external_ops_tracker);
     });
 
     0
@@ -263,8 +359,15 @@ impl TCP {
 
   fn shutdown_impl(&self, req: v8::Global<v8::Object>) -> i32 {
     let stream = self.stream.clone();
+    let write_queue_size = self.base.stream_write_queue_size_cell();
+    let closed = self.closed.clone();
     let spawner = self.spawner.clone();
+    let (active_ops, refed, external_ops_tracker) = self.begin_active_op();
     deno_core::unsync::spawn(async move {
+      while write_queue_size.get() > 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+
       let status = {
         let stream_ref = stream.borrow();
         match stream_ref.as_ref() {
@@ -272,13 +375,20 @@ impl TCP {
             Ok(()) => 0,
             Err(err) => error_to_status(err),
           },
-          None => not_connected_status(),
+          None => {
+            if closed.get() {
+              0
+            } else {
+              not_connected_status()
+            }
+          }
         }
       };
 
       spawner.spawn(move |scope| {
         call_req_oncomplete(scope, req, status);
       });
+      TCP::end_active_op(active_ops, refed, external_ops_tracker);
     });
 
     0
@@ -288,11 +398,10 @@ impl TCP {
     if !self.closed.get()
       && let Some(parent_connection_count) = &self.parent_connection_count
     {
-      parent_connection_count.set(
-        parent_connection_count.get().saturating_sub(1),
-      );
+      parent_connection_count
+        .set(parent_connection_count.get().saturating_sub(1));
     }
-    self.reading.set(false);
+    self.base.stream_reading_cell().set(false);
     self.accepting.set(false);
     self.closed.set(true);
     self.listener.borrow_mut().take();
@@ -304,13 +413,53 @@ impl TCP {
   }
 }
 
+async fn connect_tcp(
+  address: &str,
+  port: u16,
+  requested_local_address: Option<&str>,
+  requested_local_port: Option<u16>,
+) -> Result<TcpStream, std::io::Error> {
+  if requested_local_address.is_none() && requested_local_port.is_none() {
+    return TcpStream::connect((address, port)).await;
+  }
+
+  let remote_addr = if let Ok(ip) = address.parse::<IpAddr>() {
+    SocketAddr::new(ip, port)
+  } else {
+    let mut addrs = tokio::net::lookup_host((address, port)).await?;
+    addrs.next().ok_or_else(|| {
+      std::io::Error::new(ErrorKind::AddrNotAvailable, "no address resolved")
+    })?
+  };
+
+  let local_ip = if let Some(local_address) = requested_local_address {
+    local_address.parse::<IpAddr>().map_err(|_| {
+      std::io::Error::new(ErrorKind::InvalidInput, "invalid local address")
+    })?
+  } else if remote_addr.is_ipv6() {
+    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+  } else {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+  };
+
+  let local_addr = SocketAddr::new(local_ip, requested_local_port.unwrap_or(0));
+  let socket = if remote_addr.is_ipv6() {
+    TcpSocket::new_v6()?
+  } else {
+    TcpSocket::new_v4()?
+  };
+  socket.bind(local_addr)?;
+  socket.connect(remote_addr).await
+}
+
 static ON_CLOSE_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("_onClose");
 static ON_COMPLETE_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("oncomplete");
 static ON_CONNECTION_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("onconnection");
-static ON_READ_STR: deno_core::FastStaticString = deno_core::ascii_str!("onread");
+static ON_READ_STR: deno_core::FastStaticString =
+  deno_core::ascii_str!("onread");
 static ADDRESS_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("address");
 static FAMILY_STR: deno_core::FastStaticString =
@@ -321,7 +470,7 @@ static PORT_STR: deno_core::FastStaticString = deno_core::ascii_str!("port");
 impl TCP {
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L154-L179
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L154-L179
   #[constructor]
   #[cppgc]
   fn new(#[smi] socket_type: i32, state: &mut OpState) -> TCP {
@@ -332,6 +481,7 @@ impl TCP {
     };
     let is_server = socket_type == SERVER;
     let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
+    let external_ops_tracker = state.external_ops_tracker.clone();
 
     TCP::create(
       ConnectionWrap::create(LibuvStreamWrap::create(HandleWrap::create(
@@ -340,12 +490,13 @@ impl TCP {
       ))),
       is_server,
       spawner,
+      external_ops_tracker,
     )
   }
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L224-L239
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L224-L239
   #[fast]
   fn open(&self, #[smi] fd: i32) -> i32 {
     if fd < 0 {
@@ -397,37 +548,62 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L275-L283
-  #[fast]
-  fn bind(&self, #[string] address: &str, #[smi] port: i32) -> i32 {
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L275-L283
+  fn bind(&self, #[string] address: &str, #[smi] port: Option<i32>) -> i32 {
+    let port = port.unwrap_or(0);
     if !(0..=u16::MAX as i32).contains(&port) {
       return UV_EINVAL;
     }
-    self.local_address.replace(Some(address.to_string()));
-    self.local_port.set(Some(port as u16));
+    let bound = match std::net::TcpListener::bind((address, port as u16)) {
+      Ok(listener) => listener,
+      Err(err) => return error_to_status(err),
+    };
+    if let Ok(local_addr) = bound.local_addr() {
+      self
+        .local_address
+        .replace(Some(local_addr.ip().to_string()));
+      self.local_port.set(Some(local_addr.port()));
+    } else {
+      self.local_address.replace(Some(address.to_string()));
+      self.local_port.set(Some(port as u16));
+    }
+    drop(bound);
     0
   }
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L280-L283
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L280-L283
   fn bind6(
     &self,
     #[string] address: &str,
-    #[smi] port: i32,
+    #[smi] port: Option<i32>,
     #[smi] _flags: Option<i32>,
   ) -> i32 {
+    let port = port.unwrap_or(0);
     if !(0..=u16::MAX as i32).contains(&port) {
       return UV_EINVAL;
     }
-    self.local_address.replace(Some(address.to_string()));
-    self.local_port.set(Some(port as u16));
+    let bound = match std::net::TcpListener::bind((address, port as u16)) {
+      Ok(listener) => listener,
+      Err(err) => return error_to_status(err),
+    };
+    if let Ok(local_addr) = bound.local_addr() {
+      self
+        .local_address
+        .replace(Some(local_addr.ip().to_string()));
+      self.local_port.set(Some(local_addr.port()));
+    } else {
+      self.local_address.replace(Some(address.to_string()));
+      self.local_port.set(Some(port as u16));
+    }
+    drop(bound);
     0
   }
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L285-L300
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L285-L300
   #[fast]
   fn listen(&self, #[smi] backlog: i32) -> i32 {
     if backlog < 0 || !self.is_server.get() {
@@ -470,7 +646,7 @@ impl TCP {
 
   #[fast]
   fn read_stop(&self) -> i32 {
-    self.reading.set(false);
+    self.base.stream_reading_cell().set(false);
     0
   }
 
@@ -482,40 +658,44 @@ impl TCP {
 
   #[fast]
   fn read_stop_native(&self) -> i32 {
-    self.reading.set(false);
+    self.base.stream_reading_cell().set(false);
     0
   }
 
   #[reentrant]
   fn write_buffer(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     #[scoped] req: v8::Global<v8::Object>,
     #[buffer] data: &[u8],
   ) -> i32 {
-    self.write_impl(req, data.to_vec())
+    self.write_impl(op_state, req, data.to_vec())
   }
 
   #[reentrant]
   fn write_ascii_string(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     #[scoped] req: v8::Global<v8::Object>,
     #[string] data: &str,
   ) -> i32 {
-    self.write_impl(req, data.as_bytes().to_vec())
+    self.write_impl(op_state, req, data.as_bytes().to_vec())
   }
 
   #[reentrant]
   fn write_utf8_string(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     #[scoped] req: v8::Global<v8::Object>,
     #[string] data: &str,
   ) -> i32 {
-    self.write_impl(req, data.as_bytes().to_vec())
+    self.write_impl(op_state, req, data.as_bytes().to_vec())
   }
 
   #[reentrant]
   fn write_ucs2_string(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     #[scoped] req: v8::Global<v8::Object>,
     #[string] data: &str,
   ) -> i32 {
@@ -524,17 +704,18 @@ impl TCP {
       out.push((unit & 0x00ff) as u8);
       out.push((unit >> 8) as u8);
     }
-    self.write_impl(req, out)
+    self.write_impl(op_state, req, out)
   }
 
   #[reentrant]
   fn write_latin1_string(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     #[scoped] req: v8::Global<v8::Object>,
     #[string] data: &str,
   ) -> i32 {
     let out = data.chars().map(|ch| (ch as u32 & 0xff) as u8).collect();
-    self.write_impl(req, out)
+    self.write_impl(op_state, req, out)
   }
 
   #[reentrant]
@@ -550,22 +731,27 @@ impl TCP {
   #[fast]
   #[rename("ref")]
   fn ref_method(&self) {
-    self.refed.set(true);
+    self.set_refed(true);
+  }
+
+  #[fast]
+  fn has_ref(&self) -> bool {
+    self.refed.get()
   }
 
   #[fast]
   fn unref(&self) {
-    self.refed.set(false);
+    self.set_refed(false);
   }
 
   #[fast]
   fn mark_unrefed(&self) {
-    self.refed.set(false);
+    self.set_refed(false);
   }
 
   #[fast]
   fn mark_refed(&self) {
-    self.refed.set(true);
+    self.set_refed(true);
   }
 
   #[fast]
@@ -602,12 +788,11 @@ impl TCP {
     self.accepting.set(true);
     let this = Rc::new(this);
     let accepting = self.accepting.clone();
-    let refed = self.refed.clone();
     let connection_count = self.connection_count.clone();
     let closed = self.closed.clone();
     let listener = self.listener.clone();
+    let (active_ops, refed, external_ops_tracker) = self.begin_active_op();
     deno_core::unsync::spawn(async move {
-      let mut unref_idle_polls = 0u32;
       while accepting.get() && !closed.get() {
         let result = {
           let listener_ref = listener.borrow();
@@ -619,7 +804,6 @@ impl TCP {
 
         match result {
           Ok((stream, _)) => {
-            unref_idle_polls = 0;
             if let Err(err) = stream.set_nonblocking(true) {
               let status = error_to_status(err);
               let this = this.clone();
@@ -629,7 +813,7 @@ impl TCP {
                 .spawn(move |scope| {
                   let this_local = v8::Local::new(scope, &*this);
                   call_onconnection(scope, this_local, status, None);
-              });
+                });
               tokio::time::sleep(Duration::from_millis(20)).await;
               continue;
             }
@@ -651,8 +835,7 @@ impl TCP {
             };
             let this = this.clone();
             let parent_connection_count = connection_count.clone();
-            connection_count
-              .set(connection_count.get().saturating_add(1));
+            connection_count.set(connection_count.get().saturating_add(1));
             op_state
               .borrow()
               .borrow::<deno_core::V8TaskSpawner>()
@@ -662,6 +845,8 @@ impl TCP {
                   let mut op_state = op_state.borrow_mut();
                   let spawner =
                     op_state.borrow::<deno_core::V8TaskSpawner>().clone();
+                  let external_ops_tracker =
+                    op_state.external_ops_tracker.clone();
 
                   let mut client = TCP::create(
                     ConnectionWrap::create(LibuvStreamWrap::create(
@@ -672,6 +857,7 @@ impl TCP {
                     )),
                     false,
                     spawner,
+                    external_ops_tracker,
                   );
                   client.parent_connection_count =
                     Some(parent_connection_count.clone());
@@ -696,15 +882,6 @@ impl TCP {
               });
           }
           Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            if refed.get() {
-              unref_idle_polls = 0;
-            } else {
-              unref_idle_polls = unref_idle_polls.saturating_add(1);
-              if unref_idle_polls >= 100 {
-                accepting.set(false);
-                break;
-              }
-            }
             tokio::time::sleep(Duration::from_millis(10)).await;
           }
           Err(err) => {
@@ -717,19 +894,11 @@ impl TCP {
                 let this_local = v8::Local::new(scope, &*this);
                 call_onconnection(scope, this_local, status, None);
               });
-            if refed.get() {
-              unref_idle_polls = 0;
-            } else {
-              unref_idle_polls = unref_idle_polls.saturating_add(1);
-              if unref_idle_polls >= 50 {
-                accepting.set(false);
-                break;
-              }
-            }
             tokio::time::sleep(Duration::from_millis(20)).await;
           }
         }
       }
+      TCP::end_active_op(active_ops, refed, external_ops_tracker);
     });
 
     0
@@ -737,7 +906,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L302-L373
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L302-L373
   #[reentrant]
   fn connect(
     &self,
@@ -764,7 +933,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L313-L373
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L313-L373
   #[reentrant]
   fn connect6(
     &self,
@@ -791,7 +960,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L102-L107
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L102-L107
   #[reentrant]
   fn getsockname(
     &self,
@@ -812,7 +981,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L106-L107
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L106-L107
   #[reentrant]
   fn getpeername(
     &self,
@@ -833,7 +1002,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L189-L197
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L189-L197
   #[fast]
   fn set_no_delay(&self, enable: bool) -> i32 {
     if let Some(stream) = self.stream.borrow().as_ref()
@@ -846,15 +1015,15 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L199-L211
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L199-L211
   #[fast]
-  fn set_keep_alive(&self, _enable: i32, _delay: u32) -> i32 {
+  fn set_keep_alive(&self, _enable: bool, _delay: u32) -> i32 {
     0
   }
 
   // Ported from Node.js (Windows-only in Node core).
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L213-L222
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L213-L222
   #[fast]
   fn set_simultaneous_accepts(&self, _enable: bool) -> i32 {
     0
@@ -862,7 +1031,7 @@ impl TCP {
 
   // Ported from Node.js
   //
-  // https://github.com/nodejs/node/blob/18f695298ecf8f284d2ff9997b0f4f6f9664b2fa/src/tcp_wrap.cc#L373-L400
+  // https://github.com/nodejs/node/blob/45eeb6f88cabdaafcf5e6075c9721c43847db99f/src/tcp_wrap.cc#L373-L400
   #[reentrant]
   fn reset(
     &self,
@@ -889,6 +1058,36 @@ impl TCP {
     0
   }
 
+  #[reentrant]
+  fn close(
+    &self,
+    op_state: Rc<RefCell<OpState>>,
+    scope: &mut v8::PinScope<'_, '_>,
+    #[this] this: v8::Global<v8::Object>,
+    #[scoped] cb: Option<v8::Global<v8::Function>>,
+  ) {
+    self.close_underlying();
+
+    let this_local = v8::Local::new(scope, this);
+    let on_close_key = ON_CLOSE_STR.v8_string(scope).unwrap();
+    if let Some(on_close) = this_local
+      .get(scope, on_close_key.into())
+      .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+    {
+      on_close.call(scope, this_local.into(), &[]);
+    }
+
+    if let Some(cb) = cb {
+      op_state
+        .borrow()
+        .borrow::<deno_core::V8TaskSpawner>()
+        .spawn(move |scope| {
+          let recv = v8::undefined(scope);
+          cb.open(scope).call(scope, recv.into(), &[]);
+        });
+    }
+  }
+
   #[getter]
   fn fd(&self) -> i32 {
     self.fd.get()
@@ -907,10 +1106,17 @@ fn error_to_status(err: std::io::Error) -> i32 {
 }
 
 fn not_connected_status() -> i32 {
-  std::io::Error::from(ErrorKind::NotConnected)
-    .raw_os_error()
-    .map(|code| -code)
-    .unwrap_or(UV_EINVAL)
+  #[cfg(unix)]
+  {
+    -libc::ENOTCONN
+  }
+  #[cfg(not(unix))]
+  {
+    std::io::Error::from(ErrorKind::NotConnected)
+      .raw_os_error()
+      .map(|code| -code)
+      .unwrap_or(UV_EINVAL)
+  }
 }
 
 #[cfg(unix)]
@@ -1029,8 +1235,7 @@ fn call_onread(
   let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(data);
   let array_buffer =
     v8::ArrayBuffer::with_backing_store(scope, &backing_store.make_shared());
-  let uint8 =
-    v8::Uint8Array::new(scope, array_buffer, 0, len).unwrap();
+  let uint8 = v8::Uint8Array::new(scope, array_buffer, 0, len).unwrap();
   let nread = v8::Integer::new(scope, nread);
   on_read.call(scope, this.into(), &[uint8.into(), nread.into()]);
 }
@@ -1061,10 +1266,12 @@ fn call_onconnection(
 #[cfg(test)]
 mod tests {
   use std::future::poll_fn;
+  use std::sync::Arc;
   use std::task::Poll;
 
   use deno_core::JsRuntime;
   use deno_core::RuntimeOptions;
+  use deno_permissions::RuntimePermissionDescriptorParser;
 
   async fn js_test(source_code: &'static str) {
     deno_core::extension!(
@@ -1083,6 +1290,11 @@ mod tests {
         );
         state.put::<super::super::stream_wrap::StreamBaseState>(
           super::super::stream_wrap::StreamBaseState::default(),
+        );
+        state.put::<deno_permissions::PermissionsContainer>(
+          deno_permissions::PermissionsContainer::allow_all(Arc::new(
+            RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys),
+          )),
         );
       }
     );
@@ -1138,6 +1350,25 @@ mod tests {
         const peer = {};
         if (tcp.getpeername(peer) !== 0 || peer.address !== "127.0.0.1") {
           throw new Error("getpeername should populate remote address");
+        }
+      "#,
+    )
+    .await;
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn test_tcp_wrap_bytes_written() {
+    js_test(
+      r#"
+        const { TCP, TCPConnectWrap, ConnectionWrap } = Deno.core.ops;
+        const connection = new ConnectionWrap(0);
+        if (connection.bytesWritten !== 0) {
+          throw new Error("bytesWritten should be 0");
+        }
+
+        const tcp = new TCP(0);
+        if (tcp.bytesWritten !== 0) {
+          throw new Error("bytesWritten should be 0");
         }
       "#,
     )

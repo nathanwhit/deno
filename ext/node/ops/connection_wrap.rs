@@ -1,5 +1,8 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use deno_core::CppgcBase;
 use deno_core::CppgcInherits;
 use deno_core::GarbageCollected;
@@ -33,6 +36,22 @@ impl ConnectionWrap {
     Self {
       base: libuv_stream_wrap,
     }
+  }
+
+  pub(crate) fn stream_reading_cell(&self) -> Rc<Cell<bool>> {
+    self.base.reading_cell()
+  }
+
+  pub(crate) fn stream_write_queue_size_cell(&self) -> Rc<Cell<u32>> {
+    self.base.write_queue_size_cell()
+  }
+
+  pub(crate) fn stream_bytes_read_cell(&self) -> Rc<Cell<u64>> {
+    self.base.bytes_read_cell()
+  }
+
+  pub(crate) fn stream_bytes_written_cell(&self) -> Rc<Cell<u64>> {
+    self.base.bytes_written_cell()
   }
 }
 

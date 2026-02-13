@@ -104,10 +104,10 @@ impl ShutdownWrap {
 #[repr(C)]
 pub struct LibuvStreamWrap {
   base: HandleWrap,
-  reading: Cell<bool>,
-  write_queue_size: Cell<u32>,
-  bytes_read: Cell<u64>,
-  bytes_written: Cell<u64>,
+  reading: Rc<Cell<bool>>,
+  write_queue_size: Rc<Cell<u32>>,
+  bytes_read: Rc<Cell<u64>>,
+  bytes_written: Rc<Cell<u64>>,
 }
 
 // SAFETY: we're sure this can be GCed
@@ -123,11 +123,27 @@ impl LibuvStreamWrap {
   pub(crate) fn create(handle_wrap: HandleWrap) -> Self {
     Self {
       base: handle_wrap,
-      reading: Cell::new(false),
-      write_queue_size: Cell::new(0),
-      bytes_read: Cell::new(0),
-      bytes_written: Cell::new(0),
+      reading: Rc::new(Cell::new(false)),
+      write_queue_size: Rc::new(Cell::new(0)),
+      bytes_read: Rc::new(Cell::new(0)),
+      bytes_written: Rc::new(Cell::new(0)),
     }
+  }
+
+  pub(crate) fn reading_cell(&self) -> Rc<Cell<bool>> {
+    self.reading.clone()
+  }
+
+  pub(crate) fn write_queue_size_cell(&self) -> Rc<Cell<u32>> {
+    self.write_queue_size.clone()
+  }
+
+  pub(crate) fn bytes_read_cell(&self) -> Rc<Cell<u64>> {
+    self.bytes_read.clone()
+  }
+
+  pub(crate) fn bytes_written_cell(&self) -> Rc<Cell<u64>> {
+    self.bytes_written.clone()
   }
 }
 
@@ -325,7 +341,10 @@ impl LibuvStreamWrap {
   }
 }
 
-fn update_write_result(op_state: &Rc<RefCell<OpState>>, bytes_written: u32) {
+pub(crate) fn update_write_result(
+  op_state: &Rc<RefCell<OpState>>,
+  bytes_written: u32,
+) {
   if op_state.borrow().try_borrow::<StreamBaseState>().is_none() {
     op_state.borrow_mut().put(StreamBaseState::default());
   }
