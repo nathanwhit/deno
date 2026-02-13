@@ -60,6 +60,8 @@ use hyper_util::rt::TokioIo;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use super::tcp_wrap::TCP;
+
 #[derive(Default, ToV8)]
 pub struct NodeHttpResponse {
   pub status: u16,
@@ -152,6 +154,21 @@ pub enum ConnError {
   #[class("Http")]
   #[error(transparent)]
   Hyper(#[from] hyper::Error),
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_node_http_take_tcp_conn(
+  state: &mut OpState,
+  #[cppgc] tcp: &TCP,
+) -> Result<ResourceId, ConnError> {
+  let Some(stream) = tcp.take_stream_for_http() else {
+    return Err(ConnError::TcpStreamBusy);
+  };
+  let rid = state
+    .resource_table
+    .add(TcpStreamResource::new(stream.into_split()));
+  Ok(rid)
 }
 
 #[op2(stack_trace)]

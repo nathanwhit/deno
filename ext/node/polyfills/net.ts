@@ -243,9 +243,16 @@ interface IpcSocketConnectOptions extends ConnectOptions {
 type SocketConnectOptions = TcpSocketConnectOptions | IpcSocketConnectOptions;
 
 function _getNewAsyncId(handle?: Handle): number {
-  return !handle || typeof handle.getAsyncId !== "function"
-    ? newAsyncId()
-    : handle.getAsyncId();
+  if (!handle || typeof handle.getAsyncId !== "function") {
+    return newAsyncId();
+  }
+  try {
+    return handle.getAsyncId();
+  } catch {
+    // Fallback for wrappers that are AsyncWrap-compatible in behavior but
+    // fail strict native brand checks.
+    return newAsyncId();
+  }
 }
 
 interface NormalizedArgs {
@@ -2496,7 +2503,13 @@ Server.prototype.close = function (cb?: (err?: Error) => void) {
   }
 
   if (this._handle) {
-    (this._handle as TCP).close();
+    try {
+      (this._handle as TCP).close();
+    } catch {
+      // Some native listener-backed wrappers fail strict HandleWrap receiver
+      // checks on close; TCP reset still provides immediate teardown.
+      (this._handle as { reset?: () => number }).reset?.();
+    }
     this._handle = null;
   }
 

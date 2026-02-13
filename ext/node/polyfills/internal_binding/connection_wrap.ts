@@ -24,14 +24,119 @@
 // - https://github.com/nodejs/node/blob/master/src/connection_wrap.cc
 // - https://github.com/nodejs/node/blob/master/src/connection_wrap.h
 
-import { core } from "ext:core/mod.js";
-const { internalRidSymbol } = core;
+import { primordials } from "ext:core/mod.js";
+const { FunctionPrototypeCall } = primordials;
 
 import { ConnectionWrap as RustConnectionWrap } from "ext:core/ops";
+import {
+  initLibuvStreamWrapState,
+  kStreamBaseField,
+  LibuvStreamWrap,
+} from "ext:deno_node/internal_binding/stream_wrap.ts";
 
 export class ConnectionWrap extends RustConnectionWrap {
-  constructor(provider: number, object?: Record<string | symbol, unknown>) {
-    const rid = object?.[internalRidSymbol] as number | null | undefined;
-    super(provider, rid ?? null);
+  constructor(provider: number, object?: unknown) {
+    super(provider, null);
+    initLibuvStreamWrapState(this as unknown as { reading?: boolean });
+    const self = this as unknown as {
+      [kStreamBaseField]?: unknown;
+    };
+    self[kStreamBaseField] = object;
+  }
+
+  readStart(): number {
+    return FunctionPrototypeCall(LibuvStreamWrap.prototype.readStart, this);
+  }
+
+  readStop(): number {
+    return FunctionPrototypeCall(LibuvStreamWrap.prototype.readStop, this);
+  }
+
+  shutdown(req: unknown): number {
+    return FunctionPrototypeCall(LibuvStreamWrap.prototype.shutdown, this, req);
+  }
+
+  useUserBuffer(userBuf: unknown): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.useUserBuffer,
+      this,
+      userBuf,
+    );
+  }
+
+  writeBuffer(req: unknown, data: Uint8Array): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writeBuffer,
+      this,
+      req,
+      data,
+    );
+  }
+
+  protected _read(): Promise<void> {
+    return FunctionPrototypeCall(LibuvStreamWrap.prototype._read, this);
+  }
+
+  protected _write(req: unknown, data: Uint8Array): Promise<void> {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype._write,
+      this,
+      req,
+      data,
+    );
+  }
+
+  writev(
+    req: unknown,
+    chunks: unknown[],
+    allBuffers: boolean,
+  ): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writev,
+      this,
+      req,
+      chunks,
+      allBuffers,
+    );
+  }
+
+  writeAsciiString(req: unknown, data: string): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writeAsciiString,
+      this,
+      req,
+      data,
+    );
+  }
+
+  writeUtf8String(req: unknown, data: string): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writeUtf8String,
+      this,
+      req,
+      data,
+    );
+  }
+
+  writeUcs2String(req: unknown, data: string): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writeUcs2String,
+      this,
+      req,
+      data,
+    );
+  }
+
+  writeLatin1String(req: unknown, data: string): number {
+    return FunctionPrototypeCall(
+      LibuvStreamWrap.prototype.writeLatin1String,
+      this,
+      req,
+      data,
+    );
+  }
+
+  override _onClose(): number {
+    return FunctionPrototypeCall(LibuvStreamWrap.prototype._onClose, this);
   }
 }

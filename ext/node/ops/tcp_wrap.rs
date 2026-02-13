@@ -156,6 +156,10 @@ impl TCP {
     self.listener.borrow_mut().take();
     self.stream.borrow_mut().take();
   }
+
+  pub(crate) fn take_stream_for_http(&self) -> Option<TcpStream> {
+    self.stream.borrow_mut().take()
+  }
 }
 
 static ON_CLOSE_STR: deno_core::FastStaticString =

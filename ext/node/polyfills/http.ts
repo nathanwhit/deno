@@ -10,6 +10,7 @@ import {
   op_node_http_fetch_response_upgrade,
   op_node_http_request_with_conn,
   op_node_http_response_reclaim_conn,
+  op_node_http_take_tcp_conn,
   op_tls_key_null,
   op_tls_key_static,
   op_tls_start,
@@ -530,7 +531,17 @@ class ClientRequest extends OutgoingMessage {
 
         let baseConnRid;
         try {
-          baseConnRid = handle[kStreamBaseField][internalRidSymbol];
+          const streamBase = (handle as {
+            [kStreamBaseField]?: Record<string | symbol, unknown>;
+          })[kStreamBaseField];
+          if (
+            streamBase &&
+            streamBase[internalRidSymbol] !== undefined
+          ) {
+            baseConnRid = streamBase[internalRidSymbol] as number;
+          } else {
+            baseConnRid = op_node_http_take_tcp_conn(handle);
+          }
         } catch (err) {
           throw (this.socket.errored || err);
         }

@@ -28,19 +28,16 @@
 // - https://github.com/nodejs/node/blob/master/src/stream_wrap.cc
 
 import { core, primordials } from "ext:core/mod.js";
-const { internalRidSymbol } = core;
 const {
   Array,
   MapPrototypeGet,
   ObjectPrototypeIsPrototypeOf,
   PromiseResolve,
-  PromisePrototypeThen,
   Symbol,
   TypedArrayPrototypeSlice,
   Uint8Array,
   Uint8ArrayPrototype,
 } = primordials;
-import { op_can_write_vectored, op_raw_write_vectored } from "ext:core/ops";
 
 import { TextEncoder } from "ext:deno_web/08_text_encoding.js";
 import { Buffer } from "node:buffer";
@@ -94,6 +91,19 @@ export const streamBaseState = new Uint8Array(5);
 // This is Deno, it always will be async.
 streamBaseState[kLastWriteWasAsync] = 1;
 
+function addIfWritable(
+  target: object,
+  key: "bytesRead" | "bytesWritten",
+  delta: number,
+) {
+  try {
+    const value = (target as { [k: string]: number })[key] ?? 0;
+    (target as { [k: string]: number })[key] = value + delta;
+  } catch {
+    // Native-backed wrappers may expose getter-only fields.
+  }
+}
+
 export class WriteWrap<H extends HandleWrap> extends AsyncWrap {
   handle!: H;
   oncomplete!: (status: number) => void;
@@ -119,19 +129,31 @@ export class ShutdownWrap<H extends HandleWrap> extends AsyncWrap {
 }
 
 export const kStreamBaseField = Symbol("kStreamBaseField");
+const kReadingField = Symbol("kReadingField");
+const kBufferField = Symbol("kBufferField");
 
 const SUGGESTED_SIZE = 64 * 1024;
 
+export function initLibuvStreamWrapState(target: {
+  [kReadingField]?: boolean;
+  [kBufferField]?: Uint8Array;
+  reading?: boolean;
+}) {
+  target[kReadingField] = false;
+  target[kBufferField] = new Uint8Array(SUGGESTED_SIZE);
+  target.reading = false;
+}
+
 export class LibuvStreamWrap extends HandleWrap {
   [kStreamBaseField]?: Reader & Writer & Closer & Ref;
+  [kReadingField] = false;
+  [kBufferField] = new Uint8Array(SUGGESTED_SIZE);
 
-  reading!: boolean;
-  #reading = false;
+  reading = false;
   destroyed = false;
   writeQueueSize = 0;
   bytesRead = 0;
   bytesWritten = 0;
-  #buf = new Uint8Array(SUGGESTED_SIZE);
 
   onread!: (_arrayBuffer: Uint8Array, _nread: number) => Uint8Array | undefined;
 
@@ -139,8 +161,9 @@ export class LibuvStreamWrap extends HandleWrap {
     provider: providerType,
     stream?: Reader & Writer & Closer & Ref,
   ) {
-    super(provider, stream?.[internalRidSymbol]);
-    this.#attachToObject(stream);
+    super(provider, null);
+    initLibuvStreamWrapState(this);
+    this.attachToObject(stream);
   }
 
   /**
@@ -148,9 +171,10 @@ export class LibuvStreamWrap extends HandleWrap {
    * @return An error status code.
    */
   readStart(): number {
-    if (!this.#reading) {
-      this.#reading = true;
-      this.#read();
+    if (!this[kReadingField]) {
+      this[kReadingField] = true;
+      this.reading = true;
+      this._read();
     }
 
     return 0;
@@ -161,7 +185,8 @@ export class LibuvStreamWrap extends HandleWrap {
    * @return An error status code.
    */
   readStop(): number {
-    this.#reading = false;
+    this[kReadingField] = false;
+    this.reading = false;
     if (this.cancelHandle) {
       core.close(this.cancelHandle);
       this.cancelHandle = undefined;
@@ -210,7 +235,7 @@ export class LibuvStreamWrap extends HandleWrap {
       );
     }
 
-    this.#write(req, data);
+    this._write(req, data);
 
     return 0;
   }
@@ -227,38 +252,6 @@ export class LibuvStreamWrap extends HandleWrap {
     chunks: Buffer[] | (string | Buffer)[],
     allBuffers: boolean,
   ): number {
-    const supportsWritev = this.provider === providerType.TCPSERVERWRAP;
-    const rid = this[kStreamBaseField]![internalRidSymbol];
-    // Fast case optimization: two chunks, and all buffers.
-    if (
-      chunks.length === 2 && allBuffers && supportsWritev &&
-      op_can_write_vectored(rid)
-    ) {
-      // String chunks.
-      if (typeof chunks[0] === "string") chunks[0] = Buffer.from(chunks[0]);
-      if (typeof chunks[1] === "string") chunks[1] = Buffer.from(chunks[1]);
-
-      PromisePrototypeThen(
-        op_raw_write_vectored(
-          rid,
-          chunks[0],
-          chunks[1],
-        ),
-        (nwritten) => {
-          try {
-            req.oncomplete(0);
-          } catch {
-            // swallow callback errors.
-          }
-
-          streamBaseState[kBytesWritten] = nwritten;
-          this.bytesWritten += nwritten;
-        },
-      );
-
-      return 0;
-    }
-
     const count = allBuffers ? chunks.length : chunks.length >> 1;
     const buffers: Buffer[] = new Array(count);
 
@@ -325,7 +318,8 @@ export class LibuvStreamWrap extends HandleWrap {
 
   override _onClose(): number {
     let status = 0;
-    this.#reading = false;
+    this[kReadingField] = false;
+    this.reading = false;
 
     try {
       this[kStreamBaseField]?.close();
@@ -340,19 +334,26 @@ export class LibuvStreamWrap extends HandleWrap {
    * Attaches the class to the underlying stream.
    * @param stream The stream to attach to.
    */
-  #attachToObject(stream?: Reader & Writer & Closer & Ref) {
+  protected attachToObject(stream?: Reader & Writer & Closer & Ref) {
     this[kStreamBaseField] = stream;
   }
 
   /** Internal method for reading from the attached stream. */
-  async #read() {
+  protected async _read() {
     // Queue the read operation and allow TLS upgrades to complete.
     //
     // This is done to ensure that the resource is not locked up by
     // op_read.
     await PromiseResolve();
 
-    let buf = this.#buf;
+    const stream = this[kStreamBaseField];
+    if (!stream) return;
+
+    let buf = this[kBufferField];
+    if (!buf) {
+      buf = new Uint8Array(SUGGESTED_SIZE);
+      this[kBufferField] = buf;
+    }
 
     let nread: number | null;
 
@@ -362,29 +363,31 @@ export class LibuvStreamWrap extends HandleWrap {
       return;
     }
 
-    const ridBefore = this[kStreamBaseField]![internalRidSymbol];
+    const streamBefore = stream;
     try {
-      if (this[kStreamBaseField]![_readWithCancelHandle]) {
-        const { cancelHandle, nread: p } = this[kStreamBaseField]!
-          [_readWithCancelHandle](buf);
+      const readWithCancelHandle = (stream as {
+        [_readWithCancelHandle]?: (
+          buffer: Uint8Array,
+        ) => { cancelHandle?: number; nread: Promise<number | null> };
+      })[_readWithCancelHandle];
+      if (readWithCancelHandle) {
+        const { cancelHandle, nread: p } = readWithCancelHandle(buf);
         if (cancelHandle) {
           this.cancelHandle = cancelHandle;
         }
 
         nread = await p;
       } else {
-        nread = await this[kStreamBaseField]!.read(buf);
+        nread = await stream.read(buf);
       }
     } catch (e) {
       // Try to read again if the underlying stream resource
       // changed. This can happen during TLS upgrades (eg. STARTTLS)
-      if (
-        ridBefore != this[kStreamBaseField]![internalRidSymbol]
-      ) {
-        return this.#read();
+      if (streamBefore !== this[kStreamBaseField]) {
+        return this._read();
       }
 
-      if (e.message === "cancelled") return null;
+      if ((e as { message?: string }).message === "cancelled") return null;
 
       if (
         ObjectPrototypeIsPrototypeOf(Deno.errors.Interrupted.prototype, e) ||
@@ -410,7 +413,7 @@ export class LibuvStreamWrap extends HandleWrap {
     streamBaseState[kReadBytesOrError] = nread;
 
     if (nread > 0) {
-      this.bytesRead += nread;
+      addIfWritable(this, "bytesRead", nread);
     }
 
     buf = TypedArrayPrototypeSlice(buf, 0, nread);
@@ -423,8 +426,8 @@ export class LibuvStreamWrap extends HandleWrap {
       // swallow callback errors.
     }
 
-    if (nread >= 0 && this.#reading) {
-      this.#read();
+    if (nread >= 0 && this[kReadingField]) {
+      this._read();
     }
   }
 
@@ -433,10 +436,19 @@ export class LibuvStreamWrap extends HandleWrap {
    * @param req A write request wrapper.
    * @param data The Uint8Array buffer to write to the stream.
    */
-  async #write(req: WriteWrap<LibuvStreamWrap>, data: Uint8Array) {
+  protected async _write(req: WriteWrap<LibuvStreamWrap>, data: Uint8Array) {
     const { byteLength } = data;
 
-    const ridBefore = this[kStreamBaseField]![internalRidSymbol];
+    const stream = this[kStreamBaseField];
+    if (!stream) {
+      try {
+        req.oncomplete(MapPrototypeGet(codeMap, "EBADF")!);
+      } catch {
+        // swallow callback errors.
+      }
+      return;
+    }
+    const streamBefore = stream;
 
     if (this.upgrading) {
       // There is an upgrade in progress, queue the write request.
@@ -447,17 +459,15 @@ export class LibuvStreamWrap extends HandleWrap {
     try {
       // TODO(crowlKats): duplicate from runtime/js/13_buffer.js
       while (nwritten < data.length) {
-        nwritten += await this[kStreamBaseField]!.write(
+        nwritten += await stream.write(
           data.subarray(nwritten),
         );
       }
     } catch (e) {
       // Try to read again if the underlying stream resource
       // changed. This can happen during TLS upgrades (eg. STARTTLS)
-      if (
-        ridBefore != this[kStreamBaseField]![internalRidSymbol]
-      ) {
-        return this.#write(req, data.subarray(nwritten));
+      if (streamBefore !== this[kStreamBaseField]) {
+        return this._write(req, data.subarray(nwritten));
       }
 
       let status: number;
@@ -481,7 +491,7 @@ export class LibuvStreamWrap extends HandleWrap {
     }
 
     streamBaseState[kBytesWritten] = byteLength;
-    this.bytesWritten += byteLength;
+    addIfWritable(this, "bytesWritten", byteLength);
 
     try {
       req.oncomplete(0);

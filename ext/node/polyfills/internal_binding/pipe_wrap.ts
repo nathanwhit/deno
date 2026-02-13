@@ -41,7 +41,6 @@ import {
   AsyncWrap,
   providerType,
 } from "ext:deno_node/internal_binding/async_wrap.ts";
-import { LibuvStreamWrap } from "ext:deno_node/internal_binding/stream_wrap.ts";
 import {
   codeMap,
   mapSysErrnoToUvErrno,
@@ -59,7 +58,6 @@ import { fs } from "ext:deno_node/internal_binding/constants.ts";
 const {
   Error,
   ErrorPrototype,
-  FunctionPrototypeCall,
   MapPrototypeGet,
   ObjectDefineProperty,
   ObjectPrototypeIsPrototypeOf,
@@ -616,7 +614,7 @@ export class Pipe extends ConnectionWrap {
       }
     }
 
-    return FunctionPrototypeCall(LibuvStreamWrap.prototype._onClose, this);
+    return super._onClose();
   }
 }
 

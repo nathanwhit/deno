@@ -51,6 +51,8 @@ export class TCPConnectWrap extends RustTCPConnectWrap {
 }
 
 export class TCP extends RustTCP {
+  #listenKeepAlive?: ReturnType<typeof setInterval>;
+
   constructor(type: number, _conn?: Deno.Conn) {
     super(type);
   }
@@ -58,8 +60,28 @@ export class TCP extends RustTCP {
   override listen(backlog: number): number {
     const err = super.listen(backlog);
     if (err === 0) {
+      if (this.#listenKeepAlive === undefined) {
+        // Keep the event loop alive while a native listener is active.
+        this.#listenKeepAlive = setInterval(() => {}, 1 << 30);
+      }
       (this as TCP & { startListen?: () => number }).startListen?.();
     }
     return err;
+  }
+
+  override reset(closeCallback?: () => void): number {
+    if (this.#listenKeepAlive !== undefined) {
+      clearInterval(this.#listenKeepAlive);
+      this.#listenKeepAlive = undefined;
+    }
+    return super.reset(closeCallback);
+  }
+
+  override _onClose(): number {
+    if (this.#listenKeepAlive !== undefined) {
+      clearInterval(this.#listenKeepAlive);
+      this.#listenKeepAlive = undefined;
+    }
+    return super._onClose();
   }
 }
