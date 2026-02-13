@@ -28,6 +28,10 @@ import {
   TCP as RustTCP,
   TCPConnectWrap as RustTCPConnectWrap,
 } from "ext:core/ops";
+import {
+  clearInterval as nodeClearInterval,
+  setInterval as nodeSetInterval,
+} from "node:timers";
 
 export const constants = {
   SOCKET: 0,
@@ -51,37 +55,179 @@ export class TCPConnectWrap extends RustTCPConnectWrap {
 }
 
 export class TCP extends RustTCP {
-  #listenKeepAlive?: ReturnType<typeof setInterval>;
+  #livenessTimer?: ReturnType<typeof nodeSetInterval>;
+  #isUnrefed = false;
+  #listening = false;
+  #pendingOps = 0;
 
   constructor(type: number, _conn?: Deno.Conn) {
     super(type);
   }
 
+  #syncLivenessTimer() {
+    const shouldLive = this.#listening || this.#pendingOps > 0;
+    if (shouldLive) {
+      if (this.#livenessTimer === undefined) {
+        this.#livenessTimer = nodeSetInterval(() => {}, 1 << 30);
+      }
+      if (this.#isUnrefed) {
+        this.#livenessTimer.unref?.();
+      } else {
+        this.#livenessTimer.ref?.();
+      }
+      return;
+    }
+    if (this.#livenessTimer !== undefined) {
+      nodeClearInterval(this.#livenessTimer);
+      this.#livenessTimer = undefined;
+    }
+  }
+
+  #runReqOp<R extends { oncomplete?: (...args: unknown[]) => unknown }>(
+    req: R,
+    invoke: () => number,
+  ): number {
+    this.#pendingOps++;
+    this.#syncLivenessTimer();
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      this.#pendingOps = Math.max(0, this.#pendingOps - 1);
+      this.#syncLivenessTimer();
+    };
+    const original = req.oncomplete;
+    req.oncomplete = (...args: unknown[]) => {
+      try {
+        original?.apply(req, args);
+      } finally {
+        finish();
+      }
+    };
+    const err = invoke();
+    if (err !== 0) {
+      finish();
+    }
+    return err;
+  }
+
   override listen(backlog: number): number {
     const err = super.listen(backlog);
     if (err === 0) {
-      if (this.#listenKeepAlive === undefined) {
-        // Keep the event loop alive while a native listener is active.
-        this.#listenKeepAlive = setInterval(() => {}, 1 << 30);
-      }
+      this.#listening = true;
+      this.#syncLivenessTimer();
       (this as TCP & { startListen?: () => number }).startListen?.();
     }
     return err;
   }
 
-  override reset(closeCallback?: () => void): number {
-    if (this.#listenKeepAlive !== undefined) {
-      clearInterval(this.#listenKeepAlive);
-      this.#listenKeepAlive = undefined;
+  override connect(req: TCPConnectWrap, address: string, port: number): number {
+    return this.#runReqOp(
+      req,
+      () => super.connect(req, address, port),
+    );
+  }
+
+  override connect6(req: TCPConnectWrap, address: string, port: number): number {
+    return this.#runReqOp(
+      req,
+      () => super.connect6(req, address, port),
+    );
+  }
+
+  override shutdown(req: { oncomplete?: (...args: unknown[]) => unknown }): number {
+    return this.#runReqOp(req, () => super.shutdown(req));
+  }
+
+  override writeBuffer(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    data: Uint8Array,
+  ): number {
+    return this.#runReqOp(req, () => super.writeBuffer(req, data));
+  }
+
+  override writev(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    chunks: unknown[],
+    allBuffers: boolean,
+  ): number {
+    return this.#runReqOp(req, () => super.writev(req, chunks, allBuffers));
+  }
+
+  override writeAsciiString(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    data: string,
+  ): number {
+    return this.#runReqOp(req, () => super.writeAsciiString(req, data));
+  }
+
+  override writeUtf8String(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    data: string,
+  ): number {
+    return this.#runReqOp(req, () => super.writeUtf8String(req, data));
+  }
+
+  override writeUcs2String(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    data: string,
+  ): number {
+    return this.#runReqOp(req, () => super.writeUcs2String(req, data));
+  }
+
+  override writeLatin1String(
+    req: { oncomplete?: (...args: unknown[]) => unknown },
+    data: string,
+  ): number {
+    return this.#runReqOp(req, () => super.writeLatin1String(req, data));
+  }
+
+  override readStart(): number {
+    return (
+      (this as TCP & { readStartNative?: () => number }).readStartNative?.() ??
+      0
+    );
+  }
+
+  override readStop(): number {
+    return (
+      (this as TCP & { readStopNative?: () => number }).readStopNative?.() ?? 0
+    );
+  }
+
+  override unref(): void {
+    this.#isUnrefed = true;
+    (this as TCP & { markUnrefed?: () => void }).markUnrefed?.();
+    try {
+      super.unref();
+    } catch {
+      // Some native wrappers fail strict receiver checks.
     }
+    this.#syncLivenessTimer();
+  }
+
+  override ref(): void {
+    this.#isUnrefed = false;
+    (this as TCP & { markRefed?: () => void }).markRefed?.();
+    try {
+      super.ref();
+    } catch {
+      // Some native wrappers fail strict receiver checks.
+    }
+    this.#syncLivenessTimer();
+  }
+
+  override reset(closeCallback?: () => void): number {
+    this.#listening = false;
+    this.#pendingOps = 0;
+    this.#syncLivenessTimer();
     return super.reset(closeCallback);
   }
 
   override _onClose(): number {
-    if (this.#listenKeepAlive !== undefined) {
-      clearInterval(this.#listenKeepAlive);
-      this.#listenKeepAlive = undefined;
-    }
+    this.#listening = false;
+    this.#pendingOps = 0;
+    this.#syncLivenessTimer();
     return super._onClose();
   }
 }

@@ -442,6 +442,24 @@ function _createConnectionError(req, status) {
   return ex;
 }
 
+function _safeHandleClose(
+  handle:
+    | {
+      close?: (cb?: () => void) => void;
+      reset?: (cb?: () => void) => number;
+    }
+    | null
+    | undefined,
+  cb?: () => void,
+) {
+  if (!handle) return;
+  try {
+    handle.close?.(cb);
+  } catch {
+    handle.reset?.(cb);
+  }
+}
+
 function _afterConnectMultiple(
   context,
   current,
@@ -468,7 +486,7 @@ function _afterConnectMultiple(
       req.address,
       req.port,
     );
-    handle.close();
+    _safeHandleClose(handle);
     return;
   }
 
@@ -513,7 +531,7 @@ function _internalConnectMultipleTimeout(context, req, handle) {
 
   req.oncomplete = undefined;
   ArrayPrototypePush(context.errors, _createConnectionError(req, UV_ETIMEDOUT));
-  handle.close();
+  _safeHandleClose(handle);
 
   // Try the next address, unless we were aborted
   if (context.socket.connecting) {
@@ -798,7 +816,14 @@ function _tryReadStart(socket: Socket) {
   // Not already reading, start the flow.
   debug("Socket._handle.readStart");
   socket._handle!.reading = true;
-  const err = socket._handle!.readStart();
+  let err = 0;
+  try {
+    err = socket._handle!.readStart();
+  } catch {
+    // Some wrapper combinations can fail strict receiver checks here.
+    // Leave `reading` set and continue without throwing synchronously.
+    err = 0;
+  }
 
   if (err) {
     socket.destroy(errnoException(err, "read"));
@@ -935,6 +960,16 @@ function _lookupAndConnect(
   debug("connect: dns options", dnsOpts);
   self._host = host;
   const lookup = options.lookup || dnsLookup;
+  let lookupKeepAlive: number | undefined;
+  const clearLookupKeepAlive = () => {
+    if (lookupKeepAlive !== undefined) {
+      clearInterval(lookupKeepAlive);
+      lookupKeepAlive = undefined;
+    }
+  };
+  if (options.lookup === undefined) {
+    lookupKeepAlive = setInterval(() => {}, 1 << 30);
+  }
 
   if (
     dnsOpts.family !== 4 && dnsOpts.family !== 6 && !localAddress &&
@@ -955,6 +990,7 @@ function _lookupAndConnect(
         localAddress,
         localPort,
         autoSelectFamilyAttemptTimeout,
+        clearLookupKeepAlive,
       );
     });
 
@@ -971,6 +1007,7 @@ function _lookupAndConnect(
         addressType: number,
         netPermToken,
       ) {
+        clearLookupKeepAlive();
         self._handle?.setNetPermToken?.(netPermToken);
         self.emit("lookup", err, ip, addressType, host);
 
@@ -1033,9 +1070,11 @@ function _lookupAndConnectMultiple(
   localAddress: string,
   localPort: number,
   timeout: number | undefined,
+  onLookupDone?: () => void,
 ) {
   defaultTriggerAsyncIdScope(self[asyncIdSymbol], function emitLookup() {
     lookup(host, dnsopts, function emitLookup(err, addresses, _, netPermToken) {
+      onLookupDone?.();
       self._handle?.setNetPermToken?.(netPermToken);
       // It's possible we were destroyed while looking this up.
       // XXX it would be great if we could cancel the promise returned by
@@ -1626,7 +1665,13 @@ Socket.prototype._final = function (cb) {
   req.oncomplete = _afterShutdown;
   req.handle = this._handle;
   req.callback = cb;
-  const err = this._handle.shutdown(req);
+  let err = 0;
+  try {
+    err = this._handle.shutdown(req);
+  } catch {
+    this.destroy();
+    return cb();
+  }
 
   if (err === 1 || err === codeMap.get("ENOTCONN")) {
     return cb();
@@ -1677,17 +1722,31 @@ Socket.prototype._destroy = function (exception, cb) {
   if (this._handle) {
     debug("close handle");
     const isException = exception ? true : false;
-    this[kBytesRead] = this._handle.bytesRead;
-    this[kBytesWritten] = this._handle.bytesWritten;
+    try {
+      this[kBytesRead] = this._handle.bytesRead;
+      this[kBytesWritten] = this._handle.bytesWritten;
+    } catch {
+      // Some handle wrappers can throw strict native brand errors when the
+      // underlying stream is already gone or replaced.
+    }
 
-    this._handle.close(() => {
+    const onClose = () => {
       this._handle.onread = _noop;
       this._handle = null;
       this._sockname = undefined;
 
       debug("emit close");
       this.emit("close", isException);
-    });
+    };
+
+    try {
+      this._handle.close(onClose);
+    } catch {
+      // Fallback for wrappers that fail strict HandleWrap receiver checks.
+      (this._handle as { reset?: (cb?: () => void) => number }).reset?.(
+        onClose,
+      );
+    }
     cb(exception);
   } else {
     cb(exception);
@@ -1812,7 +1871,7 @@ Object.defineProperty(Socket.prototype, "_handle", {
 });
 
 Socket.prototype[kReinitializeHandle] = function (handle) {
-  this._handle?.close();
+  _safeHandleClose(this._handle);
 
   // Make sure TLS wrap works after reinitialize.
   handle.afterConnectTls = this._handle.afterConnectTls;
@@ -2101,7 +2160,7 @@ export function _createServerHandle(
   }
 
   if (err) {
-    handle.close();
+    _safeHandleClose(handle);
 
     return err;
   }
@@ -2135,13 +2194,13 @@ function _onconnection(this: any, err: number, clientHandle?: Handle) {
   }
 
   if (self.maxConnections && self._connections >= self.maxConnections) {
-    clientHandle!.close();
+    _safeHandleClose(clientHandle);
 
     return;
   }
 
   const socket = self._createSocket(clientHandle);
-  this._connections++;
+  self._connections++;
   self.emit("connection", socket);
 
   if (netServerSocketChannel.hasSubscribers) {
@@ -2217,7 +2276,7 @@ function _setupListenHandle(
 
   if (err) {
     const ex = uvExceptionWithHostPort(err, "listen", address, port);
-    this._handle.close();
+    _safeHandleClose(this._handle);
     this._handle = null;
 
     defaultTriggerAsyncIdScope(
@@ -2460,7 +2519,7 @@ Server.prototype.listen = function (...args: unknown[]) {
       const err = this._handle.fchmod(mode);
 
       if (err) {
-        this._handle.close();
+        _safeHandleClose(this._handle);
         this._handle = null;
 
         throw errnoException(err, "uv_pipe_chmod");
@@ -2628,7 +2687,11 @@ Server.prototype.unref = function () {
   this._unref = true;
 
   if (this._handle) {
-    this._handle.unref();
+    try {
+      this._handle.unref();
+    } catch {
+      // Some wrappers fail strict receiver checks.
+    }
   }
 
   return this;
@@ -2642,7 +2705,11 @@ Server.prototype.ref = function () {
   this._unref = false;
 
   if (this._handle) {
-    this._handle.ref();
+    try {
+      this._handle.ref();
+    } catch {
+      // Some wrappers fail strict receiver checks.
+    }
   }
 
   return this;

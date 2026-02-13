@@ -72,11 +72,16 @@ impl TCPConnectWrap {
 pub struct TCP {
   base: ConnectionWrap,
   is_server: Cell<bool>,
+  refed: Rc<Cell<bool>>,
+  connection_count: Rc<Cell<i32>>,
+  parent_connection_count: Option<Rc<Cell<i32>>>,
+  reading: Rc<Cell<bool>>,
   fd: Cell<i32>,
   stream: Rc<RefCell<Option<TcpStream>>>,
   listener: Rc<RefCell<Option<std::net::TcpListener>>>,
   accepting: Rc<Cell<bool>>,
   closed: Rc<Cell<bool>>,
+  spawner: deno_core::V8TaskSpawner,
   local_address: Rc<RefCell<Option<String>>>,
   local_port: Rc<Cell<Option<u16>>>,
   remote_address: Rc<RefCell<Option<String>>>,
@@ -93,15 +98,24 @@ unsafe impl GarbageCollected for TCP {
 }
 
 impl TCP {
-  fn create(connection_wrap: ConnectionWrap, is_server: bool) -> Self {
+  fn create(
+    connection_wrap: ConnectionWrap,
+    is_server: bool,
+    spawner: deno_core::V8TaskSpawner,
+  ) -> Self {
     Self {
       base: connection_wrap,
       is_server: Cell::new(is_server),
+      refed: Rc::new(Cell::new(true)),
+      connection_count: Rc::new(Cell::new(0)),
+      parent_connection_count: None,
+      reading: Rc::new(Cell::new(false)),
       fd: Cell::new(-1),
       stream: Rc::new(RefCell::new(None)),
       listener: Rc::new(RefCell::new(None)),
       accepting: Rc::new(Cell::new(false)),
       closed: Rc::new(Cell::new(false)),
+      spawner,
       local_address: Rc::new(RefCell::new(None)),
       local_port: Rc::new(Cell::new(None)),
       remote_address: Rc::new(RefCell::new(None)),
@@ -150,7 +164,135 @@ impl TCP {
     0
   }
 
+  fn start_read_loop(&self, this: v8::Global<v8::Object>) -> i32 {
+    if self.reading.get() {
+      return 0;
+    }
+    self.reading.set(true);
+
+    let reading = self.reading.clone();
+    let stream = self.stream.clone();
+    let this = Rc::new(this);
+    let spawner = self.spawner.clone();
+    deno_core::unsync::spawn(async move {
+      let mut buf = vec![0u8; 64 * 1024];
+      while reading.get() {
+        let read_result = {
+          let stream_ref = stream.borrow();
+          let Some(stream) = stream_ref.as_ref() else {
+            break;
+          };
+          stream.try_read(&mut buf)
+        };
+
+        match read_result {
+          Ok(0) => {
+            reading.set(false);
+            let this = this.clone();
+            spawner.spawn(move |scope| {
+              let this_local = v8::Local::new(scope, &*this);
+              call_onread(scope, this_local, -4095, Vec::new());
+            });
+            break;
+          }
+          Ok(nread) => {
+            let this = this.clone();
+            let data = buf[..nread].to_vec();
+            spawner.spawn(move |scope| {
+              let this_local = v8::Local::new(scope, &*this);
+              call_onread(scope, this_local, nread as i32, data);
+            });
+          }
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+          }
+          Err(err) => {
+            reading.set(false);
+            let this = this.clone();
+            let status = error_to_status(err);
+            spawner.spawn(move |scope| {
+              let this_local = v8::Local::new(scope, &*this);
+              call_onread(scope, this_local, status, Vec::new());
+            });
+            break;
+          }
+        }
+      }
+    });
+
+    0
+  }
+
+  fn write_impl(&self, req: v8::Global<v8::Object>, data: Vec<u8>) -> i32 {
+    let stream = self.stream.clone();
+    let spawner = self.spawner.clone();
+    deno_core::unsync::spawn(async move {
+      let mut offset = 0usize;
+      let status = loop {
+        if offset >= data.len() {
+          break 0;
+        }
+
+        let write_result = {
+          let stream_ref = stream.borrow();
+          let Some(stream) = stream_ref.as_ref() else {
+            break not_connected_status();
+          };
+          stream.try_write(&data[offset..])
+        };
+
+        match write_result {
+          Ok(0) => break not_connected_status(),
+          Ok(nwritten) => {
+            offset += nwritten;
+          }
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+          }
+          Err(err) => break error_to_status(err),
+        }
+      };
+
+      spawner.spawn(move |scope| {
+        call_req_oncomplete(scope, req, status);
+      });
+    });
+
+    0
+  }
+
+  fn shutdown_impl(&self, req: v8::Global<v8::Object>) -> i32 {
+    let stream = self.stream.clone();
+    let spawner = self.spawner.clone();
+    deno_core::unsync::spawn(async move {
+      let status = {
+        let stream_ref = stream.borrow();
+        match stream_ref.as_ref() {
+          Some(stream) => match shutdown_stream_write(stream) {
+            Ok(()) => 0,
+            Err(err) => error_to_status(err),
+          },
+          None => not_connected_status(),
+        }
+      };
+
+      spawner.spawn(move |scope| {
+        call_req_oncomplete(scope, req, status);
+      });
+    });
+
+    0
+  }
+
   fn close_underlying(&self) {
+    if !self.closed.get()
+      && let Some(parent_connection_count) = &self.parent_connection_count
+    {
+      parent_connection_count.set(
+        parent_connection_count.get().saturating_sub(1),
+      );
+    }
+    self.reading.set(false);
     self.accepting.set(false);
     self.closed.set(true);
     self.listener.borrow_mut().take();
@@ -168,6 +310,7 @@ static ON_COMPLETE_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("oncomplete");
 static ON_CONNECTION_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("onconnection");
+static ON_READ_STR: deno_core::FastStaticString = deno_core::ascii_str!("onread");
 static ADDRESS_STR: deno_core::FastStaticString =
   deno_core::ascii_str!("address");
 static FAMILY_STR: deno_core::FastStaticString =
@@ -188,6 +331,7 @@ impl TCP {
       _ => PROVIDER_TCPWRAP,
     };
     let is_server = socket_type == SERVER;
+    let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
 
     TCP::create(
       ConnectionWrap::create(LibuvStreamWrap::create(HandleWrap::create(
@@ -195,6 +339,7 @@ impl TCP {
         None,
       ))),
       is_server,
+      spawner,
     )
   }
 
@@ -319,6 +464,112 @@ impl TCP {
 
   #[fast]
   #[reentrant]
+  fn read_start(&self, #[this] this: v8::Global<v8::Object>) -> i32 {
+    self.start_read_loop(this)
+  }
+
+  #[fast]
+  fn read_stop(&self) -> i32 {
+    self.reading.set(false);
+    0
+  }
+
+  #[fast]
+  #[reentrant]
+  fn read_start_native(&self, #[this] this: v8::Global<v8::Object>) -> i32 {
+    self.start_read_loop(this)
+  }
+
+  #[fast]
+  fn read_stop_native(&self) -> i32 {
+    self.reading.set(false);
+    0
+  }
+
+  #[reentrant]
+  fn write_buffer(
+    &self,
+    #[scoped] req: v8::Global<v8::Object>,
+    #[buffer] data: &[u8],
+  ) -> i32 {
+    self.write_impl(req, data.to_vec())
+  }
+
+  #[reentrant]
+  fn write_ascii_string(
+    &self,
+    #[scoped] req: v8::Global<v8::Object>,
+    #[string] data: &str,
+  ) -> i32 {
+    self.write_impl(req, data.as_bytes().to_vec())
+  }
+
+  #[reentrant]
+  fn write_utf8_string(
+    &self,
+    #[scoped] req: v8::Global<v8::Object>,
+    #[string] data: &str,
+  ) -> i32 {
+    self.write_impl(req, data.as_bytes().to_vec())
+  }
+
+  #[reentrant]
+  fn write_ucs2_string(
+    &self,
+    #[scoped] req: v8::Global<v8::Object>,
+    #[string] data: &str,
+  ) -> i32 {
+    let mut out = Vec::with_capacity(data.len().saturating_mul(2));
+    for unit in data.encode_utf16() {
+      out.push((unit & 0x00ff) as u8);
+      out.push((unit >> 8) as u8);
+    }
+    self.write_impl(req, out)
+  }
+
+  #[reentrant]
+  fn write_latin1_string(
+    &self,
+    #[scoped] req: v8::Global<v8::Object>,
+    #[string] data: &str,
+  ) -> i32 {
+    let out = data.chars().map(|ch| (ch as u32 & 0xff) as u8).collect();
+    self.write_impl(req, out)
+  }
+
+  #[reentrant]
+  fn shutdown(&self, #[scoped] req: v8::Global<v8::Object>) -> i32 {
+    self.shutdown_impl(req)
+  }
+
+  #[reentrant]
+  fn shutdown_native(&self, #[scoped] req: v8::Global<v8::Object>) -> i32 {
+    self.shutdown_impl(req)
+  }
+
+  #[fast]
+  #[rename("ref")]
+  fn ref_method(&self) {
+    self.refed.set(true);
+  }
+
+  #[fast]
+  fn unref(&self) {
+    self.refed.set(false);
+  }
+
+  #[fast]
+  fn mark_unrefed(&self) {
+    self.refed.set(false);
+  }
+
+  #[fast]
+  fn mark_refed(&self) {
+    self.refed.set(true);
+  }
+
+  #[fast]
+  #[reentrant]
   fn start_listen(
     &self,
     op_state: Rc<RefCell<OpState>>,
@@ -351,9 +602,12 @@ impl TCP {
     self.accepting.set(true);
     let this = Rc::new(this);
     let accepting = self.accepting.clone();
+    let refed = self.refed.clone();
+    let connection_count = self.connection_count.clone();
     let closed = self.closed.clone();
     let listener = self.listener.clone();
     deno_core::unsync::spawn(async move {
+      let mut unref_idle_polls = 0u32;
       while accepting.get() && !closed.get() {
         let result = {
           let listener_ref = listener.borrow();
@@ -365,6 +619,7 @@ impl TCP {
 
         match result {
           Ok((stream, _)) => {
+            unref_idle_polls = 0;
             if let Err(err) = stream.set_nonblocking(true) {
               let status = error_to_status(err);
               let this = this.clone();
@@ -374,7 +629,7 @@ impl TCP {
                 .spawn(move |scope| {
                   let this_local = v8::Local::new(scope, &*this);
                   call_onconnection(scope, this_local, status, None);
-                });
+              });
               tokio::time::sleep(Duration::from_millis(20)).await;
               continue;
             }
@@ -395,43 +650,61 @@ impl TCP {
               }
             };
             let this = this.clone();
+            let parent_connection_count = connection_count.clone();
+            connection_count
+              .set(connection_count.get().saturating_add(1));
             op_state
               .borrow()
               .borrow::<deno_core::V8TaskSpawner>()
               .spawn(move |scope| {
-                let op_state = JsRuntime::op_state_from(scope);
-                let mut op_state = op_state.borrow_mut();
+                let client_obj = {
+                  let op_state = JsRuntime::op_state_from(scope);
+                  let mut op_state = op_state.borrow_mut();
+                  let spawner =
+                    op_state.borrow::<deno_core::V8TaskSpawner>().clone();
 
-                let client = TCP::create(
-                  ConnectionWrap::create(LibuvStreamWrap::create(
-                    HandleWrap::create(
-                      AsyncWrap::create(&mut op_state, PROVIDER_TCPWRAP),
-                      None,
-                    ),
-                  )),
-                  false,
-                );
-                if let Ok(local_addr) = stream.local_addr() {
-                  client
-                    .local_address
-                    .replace(Some(local_addr.ip().to_string()));
-                  client.local_port.set(Some(local_addr.port()));
-                }
-                if let Ok(peer_addr) = stream.peer_addr() {
-                  client
-                    .remote_address
-                    .replace(Some(peer_addr.ip().to_string()));
-                  client.remote_port.set(Some(peer_addr.port()));
-                }
-                client.stream.borrow_mut().replace(stream);
+                  let mut client = TCP::create(
+                    ConnectionWrap::create(LibuvStreamWrap::create(
+                      HandleWrap::create(
+                        AsyncWrap::create(&mut op_state, PROVIDER_TCPWRAP),
+                        None,
+                      ),
+                    )),
+                    false,
+                    spawner,
+                  );
+                  client.parent_connection_count =
+                    Some(parent_connection_count.clone());
+                  if let Ok(local_addr) = stream.local_addr() {
+                    client
+                      .local_address
+                      .replace(Some(local_addr.ip().to_string()));
+                    client.local_port.set(Some(local_addr.port()));
+                  }
+                  if let Ok(peer_addr) = stream.peer_addr() {
+                    client
+                      .remote_address
+                      .replace(Some(peer_addr.ip().to_string()));
+                    client.remote_port.set(Some(peer_addr.port()));
+                  }
+                  client.stream.borrow_mut().replace(stream);
 
-                let client_obj =
-                  deno_core::cppgc::make_cppgc_object(scope, client);
+                  deno_core::cppgc::make_cppgc_object(scope, client)
+                };
                 let this_local = v8::Local::new(scope, &*this);
                 call_onconnection(scope, this_local, 0, Some(client_obj));
               });
           }
           Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if refed.get() {
+              unref_idle_polls = 0;
+            } else {
+              unref_idle_polls = unref_idle_polls.saturating_add(1);
+              if unref_idle_polls >= 100 {
+                accepting.set(false);
+                break;
+              }
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
           }
           Err(err) => {
@@ -444,6 +717,15 @@ impl TCP {
                 let this_local = v8::Local::new(scope, &*this);
                 call_onconnection(scope, this_local, status, None);
               });
+            if refed.get() {
+              unref_idle_polls = 0;
+            } else {
+              unref_idle_polls = unref_idle_polls.saturating_add(1);
+              if unref_idle_polls >= 50 {
+                accepting.set(false);
+                break;
+              }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
           }
         }
@@ -624,6 +906,31 @@ fn error_to_status(err: std::io::Error) -> i32 {
   err.raw_os_error().map(|code| -code).unwrap_or(-1)
 }
 
+fn not_connected_status() -> i32 {
+  std::io::Error::from(ErrorKind::NotConnected)
+    .raw_os_error()
+    .map(|code| -code)
+    .unwrap_or(UV_EINVAL)
+}
+
+#[cfg(unix)]
+fn shutdown_stream_write(stream: &TcpStream) -> std::io::Result<()> {
+  use std::os::fd::AsRawFd;
+  let fd = stream.as_raw_fd();
+  // SAFETY: `fd` is a valid socket descriptor owned by `stream`.
+  let rc = unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+  if rc == 0 {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error())
+  }
+}
+
+#[cfg(not(unix))]
+fn shutdown_stream_write(_stream: &TcpStream) -> std::io::Result<()> {
+  Ok(())
+}
+
 fn write_address_info(
   scope: &mut v8::PinScope<'_, '_>,
   out: v8::Local<v8::Object>,
@@ -682,6 +989,50 @@ fn call_connect_oncomplete(
       writable.into(),
     ],
   );
+}
+
+fn call_req_oncomplete(
+  scope: &mut v8::PinScope<'_, '_>,
+  req: v8::Global<v8::Object>,
+  status: i32,
+) {
+  let req = v8::Local::new(scope, req);
+  let on_complete_key = ON_COMPLETE_STR.v8_string(scope).unwrap();
+  let on_complete = req.get(scope, on_complete_key.into());
+  let Some(on_complete) = on_complete else {
+    return;
+  };
+  let Ok(on_complete) = v8::Local::<v8::Function>::try_from(on_complete) else {
+    return;
+  };
+
+  let status = v8::Integer::new(scope, status);
+  on_complete.call(scope, req.into(), &[status.into()]);
+}
+
+fn call_onread(
+  scope: &mut v8::PinScope<'_, '_>,
+  this: v8::Local<v8::Object>,
+  nread: i32,
+  data: Vec<u8>,
+) {
+  let on_read_key = ON_READ_STR.v8_string(scope).unwrap();
+  let on_read = this.get(scope, on_read_key.into());
+  let Some(on_read) = on_read else {
+    return;
+  };
+  let Ok(on_read) = v8::Local::<v8::Function>::try_from(on_read) else {
+    return;
+  };
+
+  let len = data.len();
+  let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(data);
+  let array_buffer =
+    v8::ArrayBuffer::with_backing_store(scope, &backing_store.make_shared());
+  let uint8 =
+    v8::Uint8Array::new(scope, array_buffer, 0, len).unwrap();
+  let nread = v8::Integer::new(scope, nread);
+  on_read.call(scope, this.into(), &[uint8.into(), nread.into()]);
 }
 
 fn call_onconnection(
