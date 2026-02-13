@@ -2,6 +2,7 @@
 
 pub mod blocklist;
 pub mod buffer;
+pub mod connection_wrap;
 pub mod constant;
 pub mod dns;
 pub mod fs;
@@ -17,6 +18,7 @@ pub mod perf_hooks;
 pub mod process;
 pub mod require;
 pub mod stream_wrap;
+pub mod tcp_wrap;
 pub mod tls;
 pub mod util;
 pub mod v8;

@@ -24,71 +24,14 @@
 // - https://github.com/nodejs/node/blob/master/src/connection_wrap.cc
 // - https://github.com/nodejs/node/blob/master/src/connection_wrap.h
 
-import { LibuvStreamWrap } from "ext:deno_node/internal_binding/stream_wrap.ts";
-import {
-  AsyncWrap,
-  providerType,
-} from "ext:deno_node/internal_binding/async_wrap.ts";
+import { core } from "ext:core/mod.js";
+const { internalRidSymbol } = core;
 
-interface Reader {
-  read(p: Uint8Array): Promise<number | null>;
-}
+import { ConnectionWrap as RustConnectionWrap } from "ext:core/ops";
 
-interface Writer {
-  write(p: Uint8Array): Promise<number>;
-}
-
-export interface Closer {
-  close(): void;
-}
-
-type Ref = { ref(): void; unref(): void };
-
-export class ConnectionWrap extends LibuvStreamWrap {
-  /** Optional connection callback. */
-  onconnection: ((status: number, handle?: ConnectionWrap) => void) | null =
-    null;
-
-  /**
-   * Creates a new ConnectionWrap class instance.
-   * @param provider Provider type.
-   * @param object Optional stream object.
-   */
-  constructor(
-    provider: providerType,
-    object?: Reader & Writer & Closer & Ref,
-  ) {
-    super(provider, object);
-  }
-
-  /**
-   * @param req A connect request.
-   * @param status An error status code.
-   */
-  afterConnect<
-    T extends AsyncWrap & {
-      oncomplete(
-        status: number,
-        handle: ConnectionWrap,
-        req: T,
-        readable: boolean,
-        writeable: boolean,
-      ): void;
-    },
-  >(
-    req: T,
-    status: number,
-  ) {
-    const isSuccessStatus = !status;
-    const readable = isSuccessStatus;
-    const writable = isSuccessStatus;
-
-    try {
-      req.oncomplete(status, this, req, readable, writable);
-    } catch {
-      // swallow callback errors.
-    }
-
-    return;
+export class ConnectionWrap extends RustConnectionWrap {
+  constructor(provider: number, object?: Record<string | symbol, unknown>) {
+    const rid = object?.[internalRidSymbol] as number | null | undefined;
+    super(provider, rid ?? null);
   }
 }

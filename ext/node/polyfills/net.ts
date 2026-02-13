@@ -964,7 +964,7 @@ function _lookupAndConnect(
         addressType: number,
         netPermToken,
       ) {
-        self._handle?.setNetPermToken(netPermToken);
+        self._handle?.setNetPermToken?.(netPermToken);
         self.emit("lookup", err, ip, addressType, host);
 
         // It's possible we were destroyed while looking this up.
@@ -1029,7 +1029,7 @@ function _lookupAndConnectMultiple(
 ) {
   defaultTriggerAsyncIdScope(self[asyncIdSymbol], function emitLookup() {
     lookup(host, dnsopts, function emitLookup(err, addresses, _, netPermToken) {
-      self._handle?.setNetPermToken(netPermToken);
+      self._handle?.setNetPermToken?.(netPermToken);
       // It's possible we were destroyed while looking this up.
       // XXX it would be great if we could cancel the promise returned by
       // the look up.
