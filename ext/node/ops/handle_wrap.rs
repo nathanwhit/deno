@@ -120,7 +120,7 @@ impl HandleWrap {
     }
   }
 
-  fn is_alive(&self) -> bool {
+  pub(crate) fn is_alive(&self) -> bool {
     self.state.get() != State::Closed
   }
 }

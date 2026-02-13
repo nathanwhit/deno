@@ -16,6 +16,7 @@ pub mod os;
 pub mod perf_hooks;
 pub mod process;
 pub mod require;
+pub mod stream_wrap;
 pub mod tls;
 pub mod util;
 pub mod v8;

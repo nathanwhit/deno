@@ -35,6 +35,7 @@ pub use node_resolver::DENO_SUPPORTED_BUILTIN_NODE_MODULES as SUPPORTED_BUILTIN_
 pub use node_resolver::PathClean;
 use ops::handle_wrap::AsyncId;
 pub use ops::ipc::ChildPipeFd;
+use ops::stream_wrap::StreamBaseState;
 use ops::vm;
 pub use ops::vm::ContextInitMode;
 pub use ops::vm::VM_CONTEXT_INDEX;
@@ -306,6 +307,9 @@ deno_core::extension!(deno_node,
     ops::perf_hooks::EldHistogram,
     ops::handle_wrap::AsyncWrap,
     ops::handle_wrap::HandleWrap,
+    ops::stream_wrap::WriteWrap,
+    ops::stream_wrap::ShutdownWrap,
+    ops::stream_wrap::LibuvStreamWrap,
     ops::zlib::BrotliDecoder,
     ops::zlib::BrotliEncoder,
     ops::zlib::Zlib,
@@ -586,6 +590,7 @@ deno_core::extension!(deno_node,
     }
 
     state.put(AsyncId::default());
+    state.put(StreamBaseState::default());
   },
   global_template_middleware = global_template_middleware,
   global_object_middleware = global_object_middleware,
