@@ -1960,6 +1960,7 @@ dependencies = [
 [[package]]
 name = "deno_core"
 version = "0.385.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=inheritance-plus-fixes#5a65b93a3fa2fe0705640f28bc2c643607330116"
 dependencies = [
  "anyhow",
  "az",
@@ -2756,6 +2757,7 @@ dependencies = [
 [[package]]
 name = "deno_ops"
 version = "0.261.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=inheritance-plus-fixes#5a65b93a3fa2fe0705640f28bc2c643607330116"
 dependencies = [
  "indexmap 2.9.0",
  "proc-macro2",
@@ -8605,6 +8607,7 @@ dependencies = [
 [[package]]
 name = "serde_v8"
 version = "0.294.0"
+source = "git+https://github.com/nathanwhit/deno_core?branch=inheritance-plus-fixes#5a65b93a3fa2fe0705640f28bc2c643607330116"
 dependencies = [
  "deno_error",
  "num-bigint",
