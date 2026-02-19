@@ -1238,6 +1238,11 @@ impl DenoPluginHandler {
     if path.starts_with("data:") {
       return Ok(None);
     }
+    // CSS url() tokens reference assets (images, fonts, SVG fragments, etc.),
+    // not modules. Let esbuild handle them with its built-in resolver.
+    if kind == protocol::ImportKind::UrlToken {
+      return Ok(None);
+    }
     let mut resolve_dir = resolve_dir.unwrap_or("").to_string();
     let resolver = self.resolver.clone();
     if !resolve_dir.ends_with(std::path::MAIN_SEPARATOR) {

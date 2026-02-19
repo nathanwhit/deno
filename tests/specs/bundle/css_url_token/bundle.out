@@ -1,0 +1,5 @@
+[WILDCARD]
+/* test.css */
+.vml {
+  behavior: url(#default#VML);
+}
