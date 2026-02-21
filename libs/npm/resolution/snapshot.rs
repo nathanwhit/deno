@@ -23,9 +23,12 @@ use thiserror::Error;
 use super::NpmPackageVersionNotFound;
 use super::UnmetPeerDepDiagnostic;
 use super::common::NpmVersionResolver;
+use super::dep_tree::DepTree;
+use super::dep_tree::DepTreeBuilder;
 use super::graph::Graph;
 use super::graph::GraphDependencyResolver;
 use super::graph::NpmResolutionError;
+use super::peer_resolution;
 use crate::NpmPackageCacheFolderId;
 use crate::NpmPackageExtraInfo;
 use crate::NpmPackageId;
@@ -380,6 +383,101 @@ impl NpmResolutionSnapshot {
           graph
             .into_snapshot(api, &options.version_resolver.link_packages)
             .await
+        }
+        Err(err) => Err(err),
+      },
+    };
+
+    AddPkgReqsResult {
+      results,
+      dep_graph_result,
+      unmet_peer_diagnostics,
+    }
+  }
+
+  /// Two-phase resolution: Phase 1 resolves versions without peers,
+  /// Phase 2 resolves peers on the frozen tree.
+  ///
+  /// This is the new implementation that will eventually replace `add_pkg_reqs`.
+  pub async fn add_pkg_reqs_v2(
+    self,
+    api: &impl NpmRegistryApi,
+    options: AddPkgReqsOptions<'_>,
+    reporter: Option<&dyn Reporter>,
+  ) -> AddPkgReqsResult {
+    // Phase 1: Build the dependency tree (version resolution only)
+    let mut dep_tree = DepTree::new();
+
+    // Reconstruct tree from existing snapshot if non-empty
+    if !self.is_empty() {
+      // Collect cached package infos from snapshot packages
+      let mut cached_infos = HashMap::new();
+      for pkg_id in self.packages.keys() {
+        if !cached_infos.contains_key(&pkg_id.nv.name) {
+          if let Ok(info) = api.package_info(&pkg_id.nv.name).await {
+            cached_infos.insert(pkg_id.nv.name.clone(), info);
+          }
+        }
+      }
+      dep_tree =
+        DepTree::from_snapshot(self, options.version_resolver, &cached_infos);
+    }
+
+    let mut builder = DepTreeBuilder::new(
+      dep_tree,
+      api,
+      options.version_resolver,
+      reporter,
+      options.should_dedup,
+    );
+
+    // Add new package requirements
+    let mut results = Vec::with_capacity(options.package_reqs.len());
+    let mut first_resolution_error = None;
+
+    // Prefetch package infos in parallel
+    let mut top_level_infos = FuturesOrdered::from_iter(
+      options
+        .package_reqs
+        .iter()
+        .map(|req| async move { (req, api.package_info(&req.name).await) }),
+    );
+
+    while let Some((req, info_result)) = top_level_infos.next().await {
+      match info_result
+        .map_err(NpmResolutionError::from)
+        .and_then(|info| builder.add_package_req(req, &info))
+      {
+        Ok(nv) => {
+          results.push(Ok(nv.as_ref().clone()));
+        }
+        Err(err) => {
+          if first_resolution_error.is_none() {
+            first_resolution_error = Some(err.clone());
+          }
+          results.push(Err(err));
+        }
+      }
+    }
+    drop(top_level_infos);
+
+    let mut unmet_peer_diagnostics = Vec::new();
+    let dep_graph_result = match first_resolution_error {
+      Some(err) => Err(err),
+      None => match builder.resolve_pending().await {
+        Ok(()) => {
+          let tree = builder.into_dep_tree();
+
+          // Phase 2: Resolve peers on the frozen tree
+          let peer_result = peer_resolution::resolve_peers(&tree);
+
+          // Build the final snapshot
+          let snapshot =
+            peer_resolution::build_snapshot(&tree, &peer_result);
+
+          unmet_peer_diagnostics = peer_result.unmet_peer_diagnostics;
+
+          Ok(snapshot)
         }
         Err(err) => Err(err),
       },

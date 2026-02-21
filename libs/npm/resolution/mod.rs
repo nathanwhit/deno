@@ -2,8 +2,10 @@
 
 mod collections;
 mod common;
+pub(crate) mod dep_tree;
 mod graph;
 mod overrides;
+pub(crate) mod peer_resolution;
 mod snapshot;
 #[cfg(feature = "tracing")]
 mod tracing;
