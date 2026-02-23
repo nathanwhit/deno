@@ -423,7 +423,7 @@ impl NpmResolutionSnapshot {
         DepTree::from_snapshot(self, options.version_resolver, &cached_infos);
     }
 
-    let mut builder = DepTreeBuilder::new(
+    let builder = DepTreeBuilder::new(
       dep_tree,
       api,
       options.version_resolver,

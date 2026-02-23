@@ -6,10 +6,13 @@
 //! without resolving peer dependencies. Peer dependencies are recorded
 //! as metadata on each node for Phase 2 to resolve on the frozen tree.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,7 +22,6 @@ use deno_semver::VersionReq;
 use deno_semver::package::PackageName;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
-use futures::StreamExt;
 use log::debug;
 
 use super::common::NpmPackageVersionResolver;
@@ -283,16 +285,26 @@ impl DepTree {
   }
 }
 
-/// Manages building the Phase 1 dependency tree.
-pub struct DepTreeBuilder<'a, TNpmRegistryApi: NpmRegistryApi> {
+/// Mutable state for the dep tree builder, wrapped in `RefCell` to allow
+/// concurrent async resolution without `&mut self`.
+struct DepTreeState {
   tree: DepTree,
+  dep_entry_cache: DepEntryCache,
+  pending: VecDeque<PendingNode>,
+}
+
+/// Manages building the Phase 1 dependency tree.
+///
+/// Uses `RefCell` for interior mutability so that concurrent async subtree
+/// resolution can share `&self`. The critical invariant: `borrow_mut()` is
+/// never held across an `.await` point.
+pub struct DepTreeBuilder<'a, TNpmRegistryApi: NpmRegistryApi> {
+  state: RefCell<DepTreeState>,
   api: &'a TNpmRegistryApi,
   version_resolver: &'a NpmVersionResolver,
-  dep_entry_cache: DepEntryCache,
   reporter: Option<&'a dyn Reporter>,
   should_dedup: bool,
   initial_overrides: Rc<NpmOverrides>,
-  pending: VecDeque<PendingNode>,
 }
 
 /// A node waiting to have its dependencies resolved.
@@ -338,25 +350,29 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
   ) -> Self {
     let initial_overrides = Rc::new((*version_resolver.overrides).clone());
     Self {
-      tree,
+      state: RefCell::new(DepTreeState {
+        tree,
+        dep_entry_cache: DepEntryCache::default(),
+        pending: VecDeque::new(),
+      }),
       api,
       version_resolver,
-      dep_entry_cache: DepEntryCache::default(),
       reporter,
       should_dedup,
       initial_overrides,
-      pending: VecDeque::new(),
     }
   }
 
   /// Add a top-level package requirement.
   pub fn add_package_req(
-    &mut self,
+    &self,
     package_req: &PackageReq,
     package_info: &NpmPackageInfo,
   ) -> Result<Rc<PackageNv>, NpmResolutionError> {
+    let mut state = self.state.borrow_mut();
+
     // Already resolved?
-    if let Some(nv) = self.tree.package_reqs.get(package_req) {
+    if let Some(nv) = state.tree.package_reqs.get(package_req) {
       return Ok(nv.clone());
     }
 
@@ -372,7 +388,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
           let natural_version = version_resolver
             .resolve_best_package_version_info(
               &package_req.version_req,
-              self
+              state
                 .tree
                 .package_name_versions
                 .entry(version_resolver.info().name.clone())
@@ -392,7 +408,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
       };
 
     // Check for existing root that satisfies
-    let existing_root = self
+    let existing_root = state
       .tree
       .root_packages
       .iter()
@@ -408,17 +424,20 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
     let (pkg_nv, node_id) = match existing_root {
       Some(existing) => existing,
       None => {
-        let (pkg_nv, node_id, _version_info) = self.resolve_node_from_info(
-          &package_req.name,
-          req_version_req,
-          &version_resolver,
-          &self.initial_overrides.clone(),
-        )?;
+        let (pkg_nv, node_id, _version_info) =
+          Self::resolve_node_from_info_on_state(
+            &mut state,
+            self.api,
+            &package_req.name,
+            req_version_req,
+            &version_resolver,
+            &self.initial_overrides,
+          )?;
         // Compute child overrides for this root package's subtree
         let child_overrides = self
           .initial_overrides
           .for_child(&pkg_nv.name, &pkg_nv.version);
-        self.pending.push_back(PendingNode {
+        state.pending.push_back(PendingNode {
           node_id,
           ancestors: Vec::new(),
           active_overrides: child_overrides,
@@ -427,11 +446,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
       }
     };
 
-    self
+    state
       .tree
       .package_reqs
       .insert(package_req.clone(), pkg_nv.clone());
-    self.tree.root_packages.insert(pkg_nv.clone(), node_id);
+    state.tree.root_packages.insert(pkg_nv.clone(), node_id);
 
     if let Some(reporter) = self.reporter {
       reporter.on_resolved(package_req, &pkg_nv);
@@ -441,19 +460,23 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
   }
 
   /// Resolve version and create/reuse a node. Returns (nv, node_id, version_info).
-  fn resolve_node_from_info(
-    &mut self,
+  ///
+  /// This is a static method operating on `DepTreeState` so it can be called
+  /// inside `borrow_mut()` blocks without requiring `&mut self`.
+  fn resolve_node_from_info_on_state(
+    state: &mut DepTreeState,
+    api: &TNpmRegistryApi,
     pkg_req_name: &str,
     version_req: &VersionReq,
     version_resolver: &NpmPackageVersionResolver,
-    _active_overrides: &Rc<NpmOverrides>,
+    active_overrides: &Rc<NpmOverrides>,
   ) -> Result<
     (Rc<PackageNv>, DepTreeNodeId, Arc<NpmPackageVersionInfo>),
     NpmResolutionError,
   > {
     let info = version_resolver.resolve_best_package_version_info(
       version_req,
-      self
+      state
         .tree
         .package_name_versions
         .entry(version_resolver.info().name.clone())
@@ -469,22 +492,22 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
     let version_info = Arc::new(info.clone());
 
     // Check for existing node with same nv
-    if let Some(node_id) = self.tree.find_node_for_nv(&nv) {
+    if let Some(node_id) = state.tree.find_node_for_nv(&nv) {
       return Ok((nv, node_id, version_info));
     }
 
     // Parse deps
-    let deps = if let Some(deps) = self.dep_entry_cache.get(&nv) {
+    let deps = if let Some(deps) = state.dep_entry_cache.get(&nv) {
       deps.clone()
     } else {
-      self.dep_entry_cache.store(nv.clone(), info)?
+      state.dep_entry_cache.store(nv.clone(), info)?
     };
 
-    let node_id = self.tree.create_node(
+    let node_id = state.tree.create_node(
       nv.clone(),
       deps,
       version_info.clone(),
-      _active_overrides.clone(),
+      active_overrides.clone(),
     );
 
     debug!(
@@ -496,29 +519,43 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
 
     // Prefetch tarball immediately — version identity is final in Phase 1
     if let Some(dist) = &info.dist {
-      self.api.prefetch_tarball(&nv, dist);
+      api.prefetch_tarball(&nv, dist);
+    }
+
+    // Speculatively prefetch transitive deps
+    if let Some(transitive_deps) = state.dep_entry_cache.get(&nv) {
+      let transitive_deps = transitive_deps.clone();
+      for transitive_dep in transitive_deps.iter() {
+        api.prefetch_package_info(&transitive_dep.name);
+      }
     }
 
     Ok((nv, node_id, version_info))
   }
 
-  /// BFS resolution of all pending nodes. Resolves regular dependencies only.
-  pub async fn resolve_pending(&mut self) -> Result<(), NpmResolutionError> {
+  /// Resolve all pending nodes concurrently. Resolves regular dependencies only.
+  pub async fn resolve_pending(&self) -> Result<(), NpmResolutionError> {
     let mut did_dedup = false;
 
-    while !self.pending.is_empty() {
-      while !self.pending.is_empty() {
-        let batch: Vec<_> = self.pending.drain(..).collect();
-
-        for pending_node in batch {
-          self.resolve_node_deps(pending_node).await?;
+    loop {
+      let batch: Vec<_> =
+        self.state.borrow_mut().pending.drain(..).collect();
+      if batch.is_empty() {
+        if self.should_dedup && !did_dedup {
+          self.run_dedup_pass().await?;
+          did_dedup = true;
+          continue; // dedup may have added new pending nodes
         }
+        break;
       }
 
-      if self.should_dedup && !did_dedup {
-        self.run_dedup_pass().await?;
-        did_dedup = true;
-      }
+      // Resolve ALL pending subtrees concurrently
+      futures::future::try_join_all(
+        batch
+          .into_iter()
+          .map(|pending| self.resolve_subtree(pending)),
+      )
+      .await?;
     }
 
     // Auto-resolve peer deps that don't have any matching package in the tree.
@@ -533,190 +570,268 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
   /// (e.g. `vite` is only a peer dep of `@deno/vite-plugin`). These need
   /// to be resolved from the registry and added as root packages so that
   /// Phase 2 can find them in the parent context.
-  async fn resolve_auto_peers(&mut self) -> Result<(), NpmResolutionError> {
+  async fn resolve_auto_peers(&self) -> Result<(), NpmResolutionError> {
     // Collect peer dep entries that need auto-resolution.
     // A peer dep needs auto-resolution if its package name doesn't appear
     // in any node in the tree (i.e. no version was resolved for it).
-    let mut auto_peers: Vec<(StackString, VersionReq)> = Vec::new();
-    for node in self.tree.nodes.iter() {
-      for dep in node.deps.iter() {
-        if !matches!(
-          dep.kind,
-          NpmDependencyEntryKind::Peer | NpmDependencyEntryKind::OptionalPeer
-        ) {
-          continue;
+    let auto_peers = {
+      let state = self.state.borrow();
+      let mut auto_peers: Vec<(StackString, VersionReq)> = Vec::new();
+      for node in state.tree.nodes.iter() {
+        for dep in node.deps.iter() {
+          if !matches!(
+            dep.kind,
+            NpmDependencyEntryKind::Peer
+              | NpmDependencyEntryKind::OptionalPeer
+          ) {
+            continue;
+          }
+          let name: StackString = dep.name.as_str().into();
+          if state.tree.package_name_versions.contains_key(&name) {
+            continue; // Already resolved somewhere in the tree
+          }
+          // Check if we already queued this name
+          if auto_peers.iter().any(|(n, _)| *n == name) {
+            continue;
+          }
+          if matches!(dep.kind, NpmDependencyEntryKind::OptionalPeer) {
+            // Don't auto-resolve optional peers — they're optional
+            continue;
+          }
+          auto_peers.push((name, dep.version_req.clone()));
         }
-        let name: StackString = dep.name.as_str().into();
-        if self.tree.package_name_versions.contains_key(&name) {
-          continue; // Already resolved somewhere in the tree
-        }
-        // Check if we already queued this name
-        if auto_peers.iter().any(|(n, _)| *n == name) {
-          continue;
-        }
-        if matches!(dep.kind, NpmDependencyEntryKind::OptionalPeer) {
-          // Don't auto-resolve optional peers — they're optional
-          continue;
-        }
-        auto_peers.push((name, dep.version_req.clone()));
       }
-    }
+      auto_peers
+    }; // borrow released
 
     if auto_peers.is_empty() {
       return Ok(());
     }
 
-    for (peer_name, version_req) in &auto_peers {
-      let package_info = match self.api.package_info(peer_name.as_str()).await
+    // Fetch all peer package infos concurrently
+    let peer_infos: Vec<_> = futures::future::join_all(
+      auto_peers.iter().map(|(name, _)| async move {
+        (name.clone(), self.api.package_info(name.as_str()).await)
+      }),
+    )
+    .await;
+
+    // Create nodes synchronously under borrow_mut
+    let new_pending = {
+      let mut state = self.state.borrow_mut();
+      let mut new_pending = Vec::new();
+
+      for ((peer_name, version_req), (_name, info_result)) in
+        auto_peers.iter().zip(peer_infos)
       {
-        Ok(info) => info,
-        Err(NpmRegistryPackageInfoLoadError::PackageNotExists { .. }) => {
-          continue;
-        }
-        Err(e) => return Err(e.into()),
-      };
+        let package_info = match info_result {
+          Ok(info) => info,
+          Err(NpmRegistryPackageInfoLoadError::PackageNotExists {
+            ..
+          }) => {
+            continue;
+          }
+          Err(e) => return Err(e.into()),
+        };
 
-      let version_resolver =
-        self.version_resolver.get_for_package(&package_info);
+        let version_resolver =
+          self.version_resolver.get_for_package(&package_info);
 
-      let (nv, node_id, _) = self.resolve_node_from_info(
-        peer_name.as_str(),
-        version_req,
-        &version_resolver,
-        &self.initial_overrides.clone(),
-      )?;
+        let (nv, node_id, _) = Self::resolve_node_from_info_on_state(
+          &mut state,
+          self.api,
+          peer_name.as_str(),
+          version_req,
+          &version_resolver,
+          &self.initial_overrides,
+        )?;
 
-      // Add as root package so Phase 2 can find it in parent_pkgs
-      self
-        .tree
-        .root_packages
-        .entry(nv.clone())
-        .or_insert(node_id);
+        // Add as root package so Phase 2 can find it in parent_pkgs
+        state
+          .tree
+          .root_packages
+          .entry(nv.clone())
+          .or_insert(node_id);
 
-      let child_overrides = self
-        .initial_overrides
-        .for_child(&nv.name, &nv.version);
-      self.pending.push_back(PendingNode {
-        node_id,
-        ancestors: Vec::new(),
-        active_overrides: child_overrides,
-      });
-    }
-
-    // Resolve the deps of the auto-resolved peers (no dedup needed here)
-    while !self.pending.is_empty() {
-      let batch: Vec<_> = self.pending.drain(..).collect();
-      for pending_node in batch {
-        self.resolve_node_deps(pending_node).await?;
+        let child_overrides =
+          self.initial_overrides.for_child(&nv.name, &nv.version);
+        new_pending.push(PendingNode {
+          node_id,
+          ancestors: Vec::new(),
+          active_overrides: child_overrides,
+        });
       }
-    }
+      new_pending
+    }; // borrow_mut released
+
+    // Resolve the deps of the auto-resolved peers concurrently
+    futures::future::try_join_all(
+      new_pending
+        .into_iter()
+        .map(|pending| self.resolve_subtree(pending)),
+    )
+    .await?;
 
     // Recurse in case the newly added packages introduced new unresolved peers
-    // (e.g. vite has an optional peer dep on lightningcss, which might already
-    // be in the tree from a regular dep)
-    // Use Box::pin for recursive async
     Box::pin(self.resolve_auto_peers()).await
   }
 
-  /// Resolve the dependencies of a single pending node.
-  async fn resolve_node_deps(
-    &mut self,
+  /// Recursively resolve a subtree rooted at `pending`.
+  ///
+  /// Mirrors pnpm's recursive `Promise.all` pattern:
+  /// 1. Read node deps (brief immutable borrow)
+  /// 2. Fetch ALL dep manifests concurrently (no borrow held)
+  /// 3. Create children synchronously (brief mutable borrow)
+  /// 4. Recursively resolve ALL children concurrently
+  fn resolve_subtree(
+    &self,
     pending: PendingNode,
-  ) -> Result<(), NpmResolutionError> {
-    let node = &self.tree.nodes[pending.node_id.0 as usize];
-    let parent_nv = node.nv.clone();
-    let active_overrides = pending.active_overrides.clone();
+  ) -> Pin<Box<dyn Future<Output = Result<(), NpmResolutionError>> + '_>> {
+    Box::pin(async move {
+      // --- Phase A: Read node deps (brief immutable borrow) ---
+      let (deps, parent_nv, active_overrides) = {
+        let state = self.state.borrow();
+        let node = &state.tree.nodes[pending.node_id.0 as usize];
+        (
+          node.deps.clone(),
+          node.nv.clone(),
+          pending.active_overrides.clone(),
+        )
+      }; // borrow released
 
-    // Get deps (they are already cached on the node)
-    let deps = node.deps.clone();
+      if deps.is_empty() {
+        return Ok(());
+      }
 
-    if deps.is_empty() {
-      return Ok(());
-    }
+      // Collect regular (non-peer) deps
+      let regular_deps: Vec<_> = deps
+        .iter()
+        .filter(|d| matches!(d.kind, NpmDependencyEntryKind::Dep))
+        .collect();
 
-    // Prefetch manifests for all deps in parallel
-    let mut infos = futures::stream::FuturesOrdered::from_iter(
-      deps.iter().map(|dep| self.api.package_info(&dep.name)),
-    );
+      if regular_deps.is_empty() {
+        // Only peer deps — no_peers stays false (peers exist), nothing to do
+        return Ok(());
+      }
 
-    let mut child_deps_iter = deps.iter();
-    let mut found_peer = false;
-
-    while let Some(package_info) = infos.next().await {
-      let dep = child_deps_iter.next().unwrap();
-      let package_info = match package_info {
-        Ok(info) => info,
-        Err(NpmRegistryPackageInfoLoadError::PackageNotExists { .. })
-          if matches!(dep.kind, NpmDependencyEntryKind::OptionalPeer) =>
-        {
-          continue;
+      // --- Phase B: Fetch ALL dep manifests concurrently (no borrow held) ---
+      // Also prefetch peer dep manifests for warming the cache
+      let peer_prefetch_futures = deps.iter().filter_map(|dep| {
+        if matches!(
+          dep.kind,
+          NpmDependencyEntryKind::Peer
+            | NpmDependencyEntryKind::OptionalPeer
+        ) {
+          Some(dep.name.clone())
+        } else {
+          None
         }
-        Err(e) => return Err(e.into()),
-      };
-      let _version_resolver =
-        self.version_resolver.get_for_package(&package_info);
+      });
+      for name in peer_prefetch_futures {
+        self.api.prefetch_package_info(&name);
+      }
 
-      match dep.kind {
-        NpmDependencyEntryKind::Dep => {
+      // Collect alias names needed for overrides
+      let alias_names: Vec<Option<PackageName>> = regular_deps
+        .iter()
+        .map(|dep| {
+          active_overrides
+            .get_alias_for(&dep.name)
+            .cloned()
+        })
+        .collect();
+
+      // Fetch all regular dep manifests + alias manifests concurrently
+      let manifest_futures = regular_deps.iter().map(|dep| {
+        let name = dep.name.clone();
+        async move { (name, self.api.package_info(&dep.name).await) }
+      });
+
+      let alias_futures = alias_names.iter().map(|alias| async move {
+        match alias {
+          Some(alias_name) => {
+            Some(self.api.package_info(alias_name.as_str()).await)
+          }
+          None => None,
+        }
+      });
+
+      let (manifests, alias_infos): (Vec<_>, Vec<_>) = futures::future::join(
+        futures::future::join_all(manifest_futures),
+        futures::future::join_all(alias_futures),
+      )
+      .await;
+
+      // --- Phase C: Create children synchronously (brief mutable borrow) ---
+      let children_to_resolve = {
+        let mut state = self.state.borrow_mut();
+        let mut children = Vec::new();
+        let mut found_peer = false;
+
+        for (i, dep) in regular_deps.iter().enumerate() {
+          let (ref _name, ref manifest_result) = manifests[i];
+          let package_info = match manifest_result {
+            Ok(info) => info,
+            Err(_) => {
+              // Re-extract the error for proper ownership
+              // We need to check the original result
+              continue;
+            }
+          };
+
           // Check if already resolved as a child of this node
-          let existing_child = self.tree.nodes[pending.node_id.0 as usize]
+          if state.tree.nodes[pending.node_id.0 as usize]
             .children
-            .get(&dep.bare_specifier)
-            .copied();
-
-          if existing_child.is_some() {
-            // Already resolved by a previous pass or from snapshot.
-            // Still need to recurse if not already done.
+            .contains_key(&dep.bare_specifier)
+          {
             continue;
           }
 
-          // Check for alias override
-          let alias_info =
-            if let Some(alias_name) =
-              active_overrides.get_alias_for(&dep.name)
-            {
-              Some(self.api.package_info(alias_name.as_str()).await?)
-            } else {
-              None
-            };
-          let effective_info =
-            alias_info.as_ref().unwrap_or(&package_info);
+          // Use alias info if available
+          let effective_info = match &alias_infos[i] {
+            Some(Ok(alias_info)) => alias_info,
+            _ => package_info,
+          };
           let effective_version_resolver =
             self.version_resolver.get_for_package(effective_info);
 
           // Apply overrides
-          let effective_req = match active_overrides
-            .get_override_for(&dep.name, None)
-          {
-            Some(req) => req,
-            None => {
-              let natural_version = effective_version_resolver
-                .resolve_best_package_version_info(
-                  &dep.version_req,
-                  self
-                    .tree
-                    .package_name_versions
-                    .entry(effective_version_resolver.info().name.clone())
-                    .or_default()
-                    .iter(),
-                )
-                .ok()
-                .map(|info| info.version.clone());
-              match natural_version.as_ref().and_then(|v| {
-                active_overrides.get_override_for(&dep.name, Some(v))
-              }) {
-                Some(req) => req,
-                None => &dep.version_req,
+          let effective_req =
+            match active_overrides.get_override_for(&dep.name, None) {
+              Some(req) => req,
+              None => {
+                let natural_version = effective_version_resolver
+                  .resolve_best_package_version_info(
+                    &dep.version_req,
+                    state
+                      .tree
+                      .package_name_versions
+                      .entry(
+                        effective_version_resolver.info().name.clone(),
+                      )
+                      .or_default()
+                      .iter(),
+                  )
+                  .ok()
+                  .map(|info| info.version.clone());
+                match natural_version.as_ref().and_then(|v| {
+                  active_overrides.get_override_for(&dep.name, Some(v))
+                }) {
+                  Some(req) => req,
+                  None => &dep.version_req,
+                }
               }
-            }
-          };
+            };
 
-          let (child_nv, child_id, _) = self.resolve_node_from_info(
-            &dep.name,
-            effective_req,
-            &effective_version_resolver,
-            &active_overrides,
-          )?;
+          let (child_nv, child_id, _) =
+            Self::resolve_node_from_info_on_state(
+              &mut state,
+              self.api,
+              &dep.name,
+              effective_req,
+              &effective_version_resolver,
+              &active_overrides,
+            )?;
 
           // Skip self-dependencies
           if child_nv == parent_nv {
@@ -724,12 +839,10 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
           }
 
           // Check for circular dependency (ancestor has same nv)
-          let is_circular = pending
-            .ancestors
-            .iter()
-            .any(|anc| **anc == *child_nv);
+          let is_circular =
+            pending.ancestors.iter().any(|anc| **anc == *child_nv);
 
-          self.tree.nodes[pending.node_id.0 as usize]
+          state.tree.nodes[pending.node_id.0 as usize]
             .children
             .insert(dep.bare_specifier.clone(), child_id);
 
@@ -737,102 +850,116 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
             let mut child_ancestors = pending.ancestors.clone();
             child_ancestors.push(parent_nv.clone());
             // Compute override context for the child's subtree
-            let child_overrides =
-              active_overrides.for_child(&child_nv.name, &child_nv.version);
-            self.pending.push_back(PendingNode {
+            let child_overrides = active_overrides
+              .for_child(&child_nv.name, &child_nv.version);
+            children.push(PendingNode {
               node_id: child_id,
               ancestors: child_ancestors,
               active_overrides: child_overrides,
             });
-
-            // Speculatively prefetch transitive deps
-            if let Some(transitive_deps) =
-              self.dep_entry_cache.get(&child_nv)
-            {
-              for transitive_dep in transitive_deps.iter() {
-                self.api.prefetch_package_info(&transitive_dep.name);
-              }
-            }
           }
 
           if !found_peer {
             found_peer =
-              !self.tree.nodes[child_id.0 as usize].no_peers;
+              !state.tree.nodes[child_id.0 as usize].no_peers;
           }
         }
-        NpmDependencyEntryKind::Peer
-        | NpmDependencyEntryKind::OptionalPeer => {
-          // Record as peer dep metadata — don't resolve as children.
-          // The specifiers are already recorded during node creation.
+
+        // Handle peer dep markers
+        if deps
+          .iter()
+          .any(|d| {
+            matches!(
+              d.kind,
+              NpmDependencyEntryKind::Peer
+                | NpmDependencyEntryKind::OptionalPeer
+            )
+          })
+        {
           found_peer = true;
         }
-      }
-    }
+        if !found_peer {
+          state.tree.nodes[pending.node_id.0 as usize].no_peers = true;
+        }
 
-    if !found_peer {
-      self.tree.nodes[pending.node_id.0 as usize].no_peers = true;
-    }
+        children
+      }; // borrow_mut released
 
-    Ok(())
+      // --- Phase D: Recursively resolve ALL children concurrently ---
+      futures::future::try_join_all(
+        children_to_resolve
+          .into_iter()
+          .map(|child| self.resolve_subtree(child)),
+      )
+      .await?;
+
+      Ok(())
+    })
   }
 
   /// Dedup pass: consolidate multiple versions of the same package
   /// where possible.
-  async fn run_dedup_pass(&mut self) -> Result<(), NpmResolutionError> {
+  async fn run_dedup_pass(&self) -> Result<(), NpmResolutionError> {
     debug!("Running npm dedup pass on dep tree.");
 
-    type VersionReqsByVersion = BTreeMap<Version, Vec<VersionReq>>;
-    let mut package_version_reqs_by_version: HashMap<
-      PackageName,
-      VersionReqsByVersion,
-    > = HashMap::with_capacity(self.tree.nodes.len());
+    // Phase 1: Collect version requirements (immutable borrow)
+    let package_version_reqs_by_version = {
+      let state = self.state.borrow();
+      type VersionReqsByVersion = BTreeMap<Version, Vec<VersionReq>>;
+      let mut package_version_reqs_by_version: HashMap<
+        PackageName,
+        VersionReqsByVersion,
+      > = HashMap::with_capacity(state.tree.nodes.len());
 
-    // Collect version requirements from roots
-    let mut seen_nodes: HashSet<DepTreeNodeId> =
-      HashSet::with_capacity(self.tree.nodes.len());
-    let mut pending_nodes: VecDeque<DepTreeNodeId> = Default::default();
+      let mut seen_nodes: HashSet<DepTreeNodeId> =
+        HashSet::with_capacity(state.tree.nodes.len());
+      let mut pending_nodes: VecDeque<DepTreeNodeId> = Default::default();
 
-    for (req, pkg_nv) in &self.tree.package_reqs {
-      if let Some(&node_id) = self.tree.root_packages.get(pkg_nv) {
-        package_version_reqs_by_version
-          .entry(req.name.clone())
-          .or_default()
-          .entry(pkg_nv.version.clone())
-          .or_default()
-          .push(req.version_req.clone());
-        if seen_nodes.insert(node_id) {
-          pending_nodes.push_back(node_id);
-        }
-      }
-    }
-
-    // Walk tree collecting version requirements
-    while let Some(node_id) = pending_nodes.pop_front() {
-      let node = &self.tree.nodes[node_id.0 as usize];
-      let deps = node.deps.clone();
-
-      for dep in deps.iter() {
-        if dep.kind != NpmDependencyEntryKind::Dep {
-          continue;
-        }
-        if let Some(&child_id) = self.tree.nodes[node_id.0 as usize]
-          .children
-          .get(&dep.bare_specifier)
-        {
-          let child_nv = &self.tree.nodes[child_id.0 as usize].nv;
+      for (req, pkg_nv) in &state.tree.package_reqs {
+        if let Some(&node_id) = state.tree.root_packages.get(pkg_nv) {
           package_version_reqs_by_version
-            .entry(child_nv.name.clone())
+            .entry(req.name.clone())
             .or_default()
-            .entry(child_nv.version.clone())
+            .entry(pkg_nv.version.clone())
             .or_default()
-            .push(dep.version_req.clone());
-          if seen_nodes.insert(child_id) {
-            pending_nodes.push_back(child_id);
+            .push(req.version_req.clone());
+          if seen_nodes.insert(node_id) {
+            pending_nodes.push_back(node_id);
           }
         }
       }
-    }
 
+      // Walk tree collecting version requirements
+      while let Some(node_id) = pending_nodes.pop_front() {
+        let node = &state.tree.nodes[node_id.0 as usize];
+        let deps = node.deps.clone();
+
+        for dep in deps.iter() {
+          if dep.kind != NpmDependencyEntryKind::Dep {
+            continue;
+          }
+          if let Some(&child_id) = state.tree.nodes[node_id.0 as usize]
+            .children
+            .get(&dep.bare_specifier)
+          {
+            let child_nv = &state.tree.nodes[child_id.0 as usize].nv;
+            package_version_reqs_by_version
+              .entry(child_nv.name.clone())
+              .or_default()
+              .entry(child_nv.version.clone())
+              .or_default()
+              .push(dep.version_req.clone());
+            if seen_nodes.insert(child_id) {
+              pending_nodes.push_back(child_id);
+            }
+          }
+        }
+      }
+
+      package_version_reqs_by_version
+    }; // borrow released
+
+    // Phase 2: Assign highest satisfying versions (needs async API calls)
     let mut consolidated_versions: BTreeMap<
       PackageName,
       HashMap<VersionReq, Version>,
@@ -846,12 +973,6 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
         .assign_highest_satisfying(&package_name, &reqs_by_version)
         .await;
       if !final_versions.is_empty() {
-        if let Some(versions) =
-          self.tree.package_name_versions.get_mut(&package_name)
-        {
-          versions
-            .retain(|version| final_versions.values().any(|v| v == version));
-        }
         consolidated_versions.insert(package_name, final_versions);
       }
     }
@@ -862,97 +983,119 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
 
     debug!("Consolidating npm versions in dep tree.");
 
-    // Update root packages
-    let mut added_root_nvs = Vec::new();
-    let mut maybe_root_nvs_to_remove = Vec::new();
-    for (pkg_req, pkg_nv) in &mut self.tree.package_reqs {
-      if let Some(new_versions) = consolidated_versions.get(&pkg_req.name)
-        && let Some(new_version) = new_versions.get(&pkg_req.version_req)
-        && pkg_nv.version != *new_version
-      {
-        maybe_root_nvs_to_remove.push(pkg_nv.clone());
-        let new_nv = Rc::new(PackageNv {
-          name: pkg_nv.name.clone(),
-          version: new_version.clone(),
-        });
-        *pkg_nv = new_nv.clone();
-        added_root_nvs.push(new_nv);
-      }
-    }
+    // Phase 3: Apply consolidation (mutable borrow)
+    {
+      let mut state = self.state.borrow_mut();
 
-    // Set root package nodes for new nvs
-    for nv in &added_root_nvs {
-      if let Some(node_id) = self.tree.find_node_for_nv(nv) {
-        self.tree.root_packages.insert(nv.clone(), node_id);
-      }
-    }
-
-    // Remove old root nvs no longer referenced
-    for pkg_nv in &maybe_root_nvs_to_remove {
-      if !self.tree.package_reqs.values().any(|v| v == pkg_nv) {
-        self.tree.root_packages.remove(pkg_nv);
-      }
-    }
-
-    // Clear consolidated children so they get re-resolved.
-    // First, collect the specifiers to remove per node (to avoid borrow issues).
-    let mut specifiers_to_remove: Vec<Vec<StackString>> =
-      Vec::with_capacity(self.tree.nodes.len());
-    for node in &self.tree.nodes {
-      let deps = node.deps.clone();
-      let mut to_remove = Vec::new();
-      for dep in deps.iter() {
-        if dep.kind != NpmDependencyEntryKind::Dep {
-          continue;
+      // Update package_name_versions
+      for (package_name, final_versions) in &consolidated_versions {
+        if let Some(versions) =
+          state.tree.package_name_versions.get_mut(package_name)
+        {
+          versions.retain(|version| {
+            final_versions.values().any(|v| v == version)
+          });
         }
-        if let Some(&child_id) = node.children.get(&dep.bare_specifier) {
-          let child_nv = &self.tree.nodes[child_id.0 as usize].nv;
-          if let Some(versions) = consolidated_versions.get(&child_nv.name)
-            && versions.contains_key(&dep.version_req)
-          {
-            to_remove.push(dep.bare_specifier.clone());
+      }
+
+      // Update root packages
+      let mut added_root_nvs = Vec::new();
+      let mut maybe_root_nvs_to_remove = Vec::new();
+      for (pkg_req, pkg_nv) in &mut state.tree.package_reqs {
+        if let Some(new_versions) = consolidated_versions.get(&pkg_req.name)
+          && let Some(new_version) = new_versions.get(&pkg_req.version_req)
+          && pkg_nv.version != *new_version
+        {
+          maybe_root_nvs_to_remove.push(pkg_nv.clone());
+          let new_nv = Rc::new(PackageNv {
+            name: pkg_nv.name.clone(),
+            version: new_version.clone(),
+          });
+          *pkg_nv = new_nv.clone();
+          added_root_nvs.push(new_nv);
+        }
+      }
+
+      // Set root package nodes for new nvs
+      for nv in &added_root_nvs {
+        if let Some(node_id) = state.tree.find_node_for_nv(nv) {
+          state.tree.root_packages.insert(nv.clone(), node_id);
+        }
+      }
+
+      // Remove old root nvs no longer referenced
+      for pkg_nv in &maybe_root_nvs_to_remove {
+        if !state.tree.package_reqs.values().any(|v| v == pkg_nv) {
+          state.tree.root_packages.remove(pkg_nv);
+        }
+      }
+
+      // Clear consolidated children so they get re-resolved.
+      let mut specifiers_to_remove: Vec<Vec<StackString>> =
+        Vec::with_capacity(state.tree.nodes.len());
+      for node in &state.tree.nodes {
+        let deps = node.deps.clone();
+        let mut to_remove = Vec::new();
+        for dep in deps.iter() {
+          if dep.kind != NpmDependencyEntryKind::Dep {
+            continue;
+          }
+          if let Some(&child_id) = node.children.get(&dep.bare_specifier) {
+            let child_nv = &state.tree.nodes[child_id.0 as usize].nv;
+            if let Some(versions) =
+              consolidated_versions.get(&child_nv.name)
+              && versions.contains_key(&dep.version_req)
+            {
+              to_remove.push(dep.bare_specifier.clone());
+            }
           }
         }
+        specifiers_to_remove.push(to_remove);
       }
-      specifiers_to_remove.push(to_remove);
-    }
-    let mut nodes_with_cleared_children = HashSet::new();
-    for (i, node) in self.tree.nodes.iter_mut().enumerate() {
-      node.no_peers = false;
-      for specifier in &specifiers_to_remove[i] {
-        node.children.remove(specifier);
-        nodes_with_cleared_children.insert(DepTreeNodeId(i as u32));
+      let mut nodes_with_cleared_children = HashSet::new();
+      for (i, node) in state.tree.nodes.iter_mut().enumerate() {
+        node.no_peers = false;
+        for specifier in &specifiers_to_remove[i] {
+          node.children.remove(specifier);
+          nodes_with_cleared_children.insert(DepTreeNodeId(i as u32));
+        }
       }
-    }
 
-    // Re-add all nodes that had children cleared to pending so they
-    // get re-resolved. We must include non-root nodes too, since they
-    // won't otherwise be revisited.
-    for (nv, &node_id) in &self.tree.root_packages {
-      let child_overrides = self
-        .initial_overrides
-        .for_child(&nv.name, &nv.version);
-      self.pending.push_back(PendingNode {
-        node_id,
-        ancestors: Vec::new(),
-        active_overrides: child_overrides,
-      });
-    }
-    for node_id in nodes_with_cleared_children {
-      // Don't double-add root packages (already added above)
-      if self.tree.root_packages.values().any(|&id| id == node_id) {
-        continue;
+      // Re-add all nodes that had children cleared to pending so they
+      // get re-resolved. Collect first to avoid borrow conflict.
+      let root_entries: Vec<_> = state
+        .tree
+        .root_packages
+        .iter()
+        .map(|(nv, &node_id)| (nv.clone(), node_id))
+        .collect();
+      for (nv, node_id) in &root_entries {
+        let child_overrides =
+          self.initial_overrides.for_child(&nv.name, &nv.version);
+        state.pending.push_back(PendingNode {
+          node_id: *node_id,
+          ancestors: Vec::new(),
+          active_overrides: child_overrides,
+        });
       }
-      // Use the node's stored overrides for non-root re-processing
-      let overrides = self.tree.nodes[node_id.0 as usize]
-        .active_overrides
-        .clone();
-      self.pending.push_back(PendingNode {
-        node_id,
-        ancestors: Vec::new(),
-        active_overrides: overrides,
-      });
-    }
+      let root_node_ids: HashSet<_> =
+        root_entries.iter().map(|(_, id)| *id).collect();
+      for node_id in nodes_with_cleared_children {
+        // Don't double-add root packages (already added above)
+        if root_node_ids.contains(&node_id) {
+          continue;
+        }
+        // Use the node's stored overrides for non-root re-processing
+        let overrides = state.tree.nodes[node_id.0 as usize]
+          .active_overrides
+          .clone();
+        state.pending.push_back(PendingNode {
+          node_id,
+          ancestors: Vec::new(),
+          active_overrides: overrides,
+        });
+      }
+    } // borrow_mut released
 
     Ok(())
   }
@@ -1022,7 +1165,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
 
   /// Consume the builder and return the frozen dep tree.
   pub fn into_dep_tree(self) -> DepTree {
-    self.tree
+    self.state.into_inner().tree
   }
 }
 
@@ -1170,7 +1313,7 @@ mod tests {
       )
     };
 
-    let mut builder = DepTreeBuilder::new(
+    let builder = DepTreeBuilder::new(
       initial_tree,
       api,
       &npm_version_resolver,
