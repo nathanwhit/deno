@@ -533,7 +533,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
     Ok((nv, node_id, version_info))
   }
 
-  /// Resolve all pending nodes concurrently. Resolves regular dependencies only.
+  /// Resolve all pending nodes. Resolves regular dependencies only.
   pub async fn resolve_pending(&self) -> Result<(), NpmResolutionError> {
     let mut did_dedup = false;
 
@@ -551,9 +551,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
 
       // Resolve ALL pending subtrees concurrently
       futures::future::try_join_all(
-        batch
-          .into_iter()
-          .map(|pending| self.resolve_subtree(pending)),
+        batch.into_iter().map(|pending| self.resolve_subtree(pending)),
       )
       .await?;
     }
@@ -767,14 +765,13 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
         let mut state = self.state.borrow_mut();
         let mut children = Vec::new();
         let mut found_peer = false;
+        let mut created_any_child = false;
 
         for (i, dep) in regular_deps.iter().enumerate() {
           let (ref _name, ref manifest_result) = manifests[i];
           let package_info = match manifest_result {
             Ok(info) => info,
             Err(_) => {
-              // Re-extract the error for proper ownership
-              // We need to check the original result
               continue;
             }
           };
@@ -845,6 +842,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
           state.tree.nodes[pending.node_id.0 as usize]
             .children
             .insert(dep.bare_specifier.clone(), child_id);
+          created_any_child = true;
 
           if !is_circular {
             let mut child_ancestors = pending.ancestors.clone();
@@ -865,21 +863,23 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
           }
         }
 
-        // Handle peer dep markers
-        if deps
-          .iter()
-          .any(|d| {
+        // Only update no_peers if we actually created children for this node.
+        // If another concurrent subtree already resolved this node, all
+        // children would already exist and no_peers was already set correctly.
+        if created_any_child {
+          // Handle peer dep markers
+          if deps.iter().any(|d| {
             matches!(
               d.kind,
               NpmDependencyEntryKind::Peer
                 | NpmDependencyEntryKind::OptionalPeer
             )
-          })
-        {
-          found_peer = true;
-        }
-        if !found_peer {
-          state.tree.nodes[pending.node_id.0 as usize].no_peers = true;
+          }) {
+            found_peer = true;
+          }
+          if !found_peer {
+            state.tree.nodes[pending.node_id.0 as usize].no_peers = true;
+          }
         }
 
         children

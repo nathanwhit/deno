@@ -145,6 +145,9 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
     );
   }
 
+  // Fix up cycle back-edges: when a cycle was detected during DFS,
+  // the dependency got a bare NpmPackageId (no peers). Now that resolution
+  // is complete, replace these bare IDs with the actual resolved IDs.
   // For each root package, find the best resolution from all_results.
   // A root package that also appears as a peer dep in a deeper context
   // may have a better resolution (with more peer deps) than the root-level one.

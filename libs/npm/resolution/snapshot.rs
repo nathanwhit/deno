@@ -596,7 +596,10 @@ impl NpmResolutionSnapshot {
           has_scripts: pkg.has_scripts,
         };
         for (key, dep_id) in &pkg.dependencies {
-          let dep = self.packages.get(dep_id).unwrap();
+          let Some(dep) = self.packages.get(dep_id) else {
+            // Cycle back-edge with bare ID — skip (see all_system_packages)
+            continue;
+          };
 
           let matches_system = !pkg.optional_dependencies.contains(key)
             || dep.system.matches_system(system_info);
@@ -819,7 +822,13 @@ impl NpmResolutionSnapshot {
         packages.push(pkg.clone());
 
         for (key, dep_id) in &pkg.dependencies {
-          let dep = self.packages.get(dep_id).unwrap();
+          let Some(dep) = self.packages.get(dep_id) else {
+            // Cycle back-edge: peer resolution returns a bare NpmPackageId
+            // (no peers) when it detects a cycle. The real package exists
+            // in the snapshot under a peer-resolved ID and is reachable
+            // via the non-cycle path, so we can safely skip this edge.
+            continue;
+          };
 
           let matches_system = !pkg.optional_dependencies.contains(key)
             || dep.system.matches_system(system_info);

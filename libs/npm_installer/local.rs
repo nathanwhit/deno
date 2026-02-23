@@ -592,7 +592,10 @@ impl<
         .join("node_modules");
       let mut dep_setup_cache = setup_cache.with_dep(&package_folder_name);
       for (name, dep_id) in &package.dependencies {
-        let dep = snapshot.package_from_id(dep_id).unwrap();
+        let Some(dep) = snapshot.package_from_id(dep_id) else {
+          // Cycle back-edge with bare ID — skip
+          continue;
+        };
         if package.optional_dependencies.contains(name)
           && !dep.system.matches_system(&self.system_info)
         {
