@@ -115,15 +115,35 @@ struct PeerResolutionCtx<'a> {
   peers_cache: HashMap<(Rc<PackageNv>, Vec<StackString>), ResolvedNodePeers>,
   /// Diagnostics
   unmet_peer_diagnostics: IndexSet<UnmetPeerDepDiagnostic>,
+  /// NVs of auto-resolved peer deps (in root_packages but not in package_reqs).
+  /// These are placed at the root for visibility during Phase 2, but should not
+  /// bubble up through the tree to affect ancestor identities — matching the v1
+  /// behavior where auto-resolved peers are placed as local children of the
+  /// requesting node rather than at the root.
+  auto_resolved_nvs: HashSet<PackageNv>,
 }
 
 /// Run Phase 2 peer resolution on the frozen dep tree.
 pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
+  // Compute auto-resolved NVs: packages in root_packages but not in package_reqs.
+  let package_req_nvs: HashSet<&PackageNv> = tree
+    .package_reqs
+    .values()
+    .map(|nv| nv.as_ref())
+    .collect();
+  let auto_resolved_nvs: HashSet<PackageNv> = tree
+    .root_packages
+    .keys()
+    .filter(|nv| !package_req_nvs.contains(nv.as_ref()))
+    .map(|nv| (**nv).clone())
+    .collect();
+
   let mut ctx = PeerResolutionCtx {
     tree,
     all_results: Vec::with_capacity(tree.nodes.len()),
     peers_cache: HashMap::new(),
     unmet_peer_diagnostics: IndexSet::new(),
+    auto_resolved_nvs,
   };
 
   let root_parent_pkgs = {
@@ -135,8 +155,8 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
     pkgs
   };
 
-  for (_nv, &node_id) in &tree.root_packages {
-    let _ = resolve_peers_of_node(
+  for (_, &node_id) in &tree.root_packages {
+    resolve_peers_of_node(
       node_id,
       &root_parent_pkgs,
       &mut ctx,
@@ -154,7 +174,7 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
   // Use the root-level resolution (first entry) by default, and only
   // replace it if a deeper resolution has strictly MORE peer deps.
   let mut root_resolved = HashMap::with_capacity(tree.root_packages.len());
-  for (_nv, &node_id) in &tree.root_packages {
+  for (_, &node_id) in &tree.root_packages {
     let mut best: Option<&ResolvedNodePeers> = None;
     for (id, resolved) in ctx.all_results.iter() {
       if *id != node_id {
@@ -217,7 +237,13 @@ fn resolve_peers_of_node(
   let cache_key = make_cache_key(node_id, parent_pkgs, ctx.tree);
   if let Some(cached) = ctx.peers_cache.get(&cache_key) {
     let result = cached.clone();
-    let bubbling = result.all_resolved_peers.clone();
+    // Filter auto-resolved peers from bubbling, same as the non-cached path.
+    let bubbling = result
+      .all_resolved_peers
+      .iter()
+      .filter(|(_, peer_id)| !ctx.auto_resolved_nvs.contains(&peer_id.nv))
+      .map(|(k, v)| (k.clone(), v.clone()))
+      .collect();
     ctx.all_results.push((node_id, result));
     return NodePeerResult {
       pkg_id: ctx.all_results.last().unwrap().1.pkg_id.clone(),
@@ -338,7 +364,9 @@ fn resolve_peers_of_node(
       // Add this peer to our resolved peers set
       all_resolved_peers
         .insert(dep.name.clone(), peer_result.pkg_id);
-      // Also collect the peer's own bubbling peers (transitive peer deps)
+      // Also collect the peer's own bubbling peers (transitive peer deps).
+      // These appear as separate entries in this node's identity when
+      // they are real (non-auto-resolved) packages.
       for (peer_name, peer_id) in peer_result.bubbling_peers {
         all_resolved_peers.entry(peer_name).or_insert(peer_id);
       }
@@ -390,12 +418,15 @@ fn resolve_peers_of_node(
     peer_dependencies,
   };
 
-  // Compute bubbling peers: all_resolved_peers minus those whose name
-  // matches a direct child of this node. Peers that match a direct child
-  // are "consumed" here and don't propagate further up.
+  // Compute bubbling peers: all_resolved_peers minus:
+  // 1. Those whose name matches a direct child ("consumed" here)
+  // 2. Auto-resolved peers (in root_packages but not package_reqs) — these
+  //    should not propagate to ancestor identities, matching v1 behavior
+  //    where auto-resolved peers are local to the requesting node.
   let bubbling_peers: HashMap<StackString, NpmPackageId> = all_resolved_peers
     .iter()
     .filter(|(name, _)| !child_pkg_names.contains(name.as_str()))
+    .filter(|(_, peer_id)| !ctx.auto_resolved_nvs.contains(&peer_id.nv))
     .map(|(k, v)| (k.clone(), v.clone()))
     .collect();
 
