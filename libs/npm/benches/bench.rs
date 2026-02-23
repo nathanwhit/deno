@@ -92,6 +92,44 @@ mod resolution {
     });
   }
 
+  #[divan::bench]
+  fn test2(bencher: divan::Bencher) {
+    let api = TestNpmRegistryApi::default();
+    let mut initial_pkgs = Vec::new();
+    const VERSION_COUNT: usize = 100;
+    for pkg_index in 0..26 {
+      let pkg_name = format!("a{}", pkg_index);
+      let next_pkg = format!("a{}", pkg_index + 1);
+      for version_index in 0..VERSION_COUNT {
+        let version = format!("{}.0.0", version_index);
+        if pkg_index == 0 {
+          initial_pkgs.push(format!(
+            "{}@{}",
+            pkg_name.clone(),
+            version.clone()
+          ));
+        }
+        api.ensure_package_version(&pkg_name, &version);
+        if pkg_index < 25 {
+          api.add_dependency(
+            (pkg_name.as_str(), version.as_str()),
+            (next_pkg.as_str(), version.as_str()),
+          );
+        }
+      }
+    }
+
+    let rt = build_rt();
+
+    bencher.bench_local(|| {
+      let snapshot = rt.block_on(async {
+        run_resolver_and_get_snapshot2(&api, &initial_pkgs).await
+      });
+
+      assert_eq!(snapshot.top_level_packages().count(), VERSION_COUNT);
+    });
+  }
+
   #[divan::bench(sample_count = 1000)]
   fn nextjs_resolve(bencher: divan::Bencher) {
     let api = TargetFolderCachedRegistryApi::default();
@@ -105,6 +143,25 @@ mod resolution {
     bencher.bench_local(|| {
       let snapshot = rt.block_on(async {
         run_resolver_and_get_snapshot(&api, &["next@15.1.2".to_string()]).await
+      });
+
+      assert_eq!(snapshot.top_level_packages().count(), 1);
+    });
+  }
+
+  #[divan::bench(sample_count = 1000)]
+  fn nextjs_resolve2(bencher: divan::Bencher) {
+    let api = TargetFolderCachedRegistryApi::default();
+    let rt = build_rt();
+
+    // run once to fill the caches
+    rt.block_on(async {
+      run_resolver_and_get_snapshot2(&api, &["next@15.1.2".to_string()]).await
+    });
+
+    bencher.bench_local(|| {
+      let snapshot = rt.block_on(async {
+        run_resolver_and_get_snapshot2(&api, &["next@15.1.2".to_string()]).await
       });
 
       assert_eq!(snapshot.top_level_packages().count(), 1);
@@ -199,6 +256,34 @@ async fn run_resolver_and_get_snapshot(
   };
   let result = snapshot
     .add_pkg_reqs(
+      api,
+      AddPkgReqsOptions {
+        package_reqs: &reqs,
+        version_resolver: &version_resolver,
+        should_dedup: true,
+      },
+      None,
+    )
+    .await;
+  result.dep_graph_result.unwrap()
+}
+
+async fn run_resolver_and_get_snapshot2(
+  api: &impl NpmRegistryApi,
+  reqs: &[String],
+) -> NpmResolutionSnapshot {
+  let snapshot = NpmResolutionSnapshot::new(Default::default());
+  let reqs = reqs
+    .iter()
+    .map(|req| PackageReq::from_str(req).unwrap())
+    .collect::<Vec<_>>();
+  let version_resolver = NpmVersionResolver {
+    link_packages: Default::default(),
+    newest_dependency_date_options: Default::default(),
+    overrides: Default::default(),
+  };
+  let result = snapshot
+    .add_pkg_reqs_v2(
       api,
       AddPkgReqsOptions {
         package_reqs: &reqs,

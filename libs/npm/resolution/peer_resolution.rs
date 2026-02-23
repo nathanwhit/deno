@@ -680,11 +680,19 @@ pub fn build_snapshot(
   }
 
 
-  // Set up root packages mapping first
+  // Set up root packages mapping.
+  // Only include packages that have a corresponding package_req — auto-resolved
+  // peer deps are in tree.root_packages for Phase 2 visibility but should not
+  // appear as top-level packages in the snapshot.
+  let package_req_nvs: HashSet<&PackageNv> =
+    tree.package_reqs.values().map(|nv| nv.as_ref()).collect();
   for (req, nv) in &tree.package_reqs {
     package_reqs.insert(req.clone(), (**nv).clone());
   }
   for (nv, &node_id) in &tree.root_packages {
+    if !package_req_nvs.contains(nv.as_ref()) {
+      continue; // Skip auto-resolved peer deps
+    }
     if let Some(resolved) = peer_result.root_resolved.get(&node_id) {
       root_packages.insert((**nv).clone(), resolved.pkg_id.clone());
     }
