@@ -1935,22 +1935,19 @@ async fn resolve_peer_dep_other_specifier_slot() {
 
   let (packages, package_reqs) =
     run_v2_resolver_and_get_output(&api, vec!["package-a@1"]).await;
-  // Note: the old resolver recognized that the aliased dep "package-peer2"
-  // (pointing to package-peer@2.0.0) satisfies the peer dep "package-peer@2".
-  // The new two-phase resolver doesn't check aliases for peer satisfaction,
-  // and since package-a is a root package, the unresolved peer is skipped
-  // (it may be resolved in a deeper context). This is a known edge case
-  // difference that is acceptable.
   assert_eq!(
     packages,
     vec![
       TestNpmResolutionPackage {
-        pkg_id: "package-a@1.0.0".to_string(),
+        pkg_id: "package-a@1.0.0_package-peer@2.0.0".to_string(),
         copy_index: 0,
-        dependencies: BTreeMap::from([(
-          "package-peer2".to_string(),
-          "package-peer@2.0.0".to_string(),
-        )]),
+        dependencies: BTreeMap::from([
+          ("package-peer".to_string(), "package-peer@2.0.0".to_string(),),
+          (
+            "package-peer2".to_string(),
+            "package-peer@2.0.0".to_string(),
+          ),
+        ]),
       },
       TestNpmResolutionPackage {
         pkg_id: "package-peer@2.0.0".to_string(),
@@ -1963,7 +1960,7 @@ async fn resolve_peer_dep_other_specifier_slot() {
     package_reqs,
     vec![(
       "package-a@1".to_string(),
-      "package-a@1.0.0".to_string()
+      "package-a@1.0.0_package-peer@2.0.0".to_string()
     ),]
   );
 }
@@ -2135,26 +2132,22 @@ async fn nested_deps_same_peer_dep_ancestor() {
 
   let (packages, package_reqs) =
     run_v2_resolver_and_get_output(&api, vec!["package-0@1.0"]).await;
-  // Note: differs from the old resolver in nested peer dep encoding.
-  // In the DFS two-phase resolver, package-a's own peer dep (package-0)
-  // doesn't propagate as a nested peer `__package-0@1.0.0` into the
-  // identities of b/c/d. Also, when b/c/d resolve their peer dep
-  // package-a, they get the bare package-a@1.0.0 (without the _package-0
-  // suffix) because in their DFS context, package-a was already resolved
-  // as a child before peer resolution happened.
   assert_eq!(
     packages,
     vec![
       TestNpmResolutionPackage {
         pkg_id: "package-0@1.0.0".to_string(),
         copy_index: 0,
-        dependencies: BTreeMap::from([(
-          "package-a".to_string(),
-          "package-a@1.0.0_package-0@1.0.0".to_string(),
-        ), (
-          "package-1".to_string(),
-          "package-1@1.0.0_package-0@1.0.0".to_string(),
-        )]),
+        dependencies: BTreeMap::from([
+          (
+            "package-1".to_string(),
+            "package-1@1.0.0_package-0@1.0.0".to_string(),
+          ),
+          (
+            "package-a".to_string(),
+            "package-a@1.0.0_package-0@1.0.0".to_string(),
+          ),
+        ]),
       },
       TestNpmResolutionPackage {
         pkg_id: "package-1@1.0.0_package-0@1.0.0".to_string(),
@@ -2169,11 +2162,11 @@ async fn nested_deps_same_peer_dep_ancestor() {
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-b".to_string(),
-          "package-b@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+          "package-b@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
         )]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-b@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+        pkg_id: "package-b@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
@@ -2182,16 +2175,16 @@ async fn nested_deps_same_peer_dep_ancestor() {
           ),
           (
             "package-a".to_string(),
-            "package-a@1.0.0".to_string(),
+            "package-a@1.0.0_package-0@1.0.0".to_string(),
           ),
           (
             "package-c".to_string(),
-            "package-c@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+            "package-c@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
           )
         ]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-c@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+        pkg_id: "package-c@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
@@ -2200,16 +2193,16 @@ async fn nested_deps_same_peer_dep_ancestor() {
           ),
           (
             "package-a".to_string(),
-            "package-a@1.0.0".to_string(),
+            "package-a@1.0.0_package-0@1.0.0".to_string(),
           ),
           (
             "package-d".to_string(),
-            "package-d@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+            "package-d@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
           )
         ]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-d@1.0.0_package-0@1.0.0_package-a@1.0.0".to_string(),
+        pkg_id: "package-d@1.0.0_package-0@1.0.0_package-a@1.0.0__package-0@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
@@ -2218,7 +2211,7 @@ async fn nested_deps_same_peer_dep_ancestor() {
           ),
           (
             "package-a".to_string(),
-            "package-a@1.0.0".to_string(),
+            "package-a@1.0.0_package-0@1.0.0".to_string(),
           )
         ]),
       }
@@ -2315,9 +2308,6 @@ async fn peer_dep_resolved_then_resolved_deeper() {
 #[tokio::test]
 async fn resolve_dep_with_peer_deps_circular_1() {
   // a -> b -> c -> d -> c where c has a peer dependency on b
-  // Note: In the two-phase resolver, package-d is resolved before
-  // package-c's peer dep (package-b) is known, so package-d doesn't
-  // inherit the peer. The old resolver propagates retroactively.
   let api = TestNpmRegistryApi::default();
   api.ensure_package_version("package-a", "1.0.0");
   api.ensure_package_version("package-b", "1.0.0");
@@ -2357,19 +2347,16 @@ async fn resolve_dep_with_peer_deps_circular_1() {
           ("package-b".to_string(), "package-b@1.0.0".to_string(),),
           (
             "package-d".to_string(),
-            // In two-phase: package-d doesn't get the peer because it was
-            // resolved before package-c's peer dep was computed.
-            "package-d@1.0.0".to_string(),
+            "package-d@1.0.0_package-b@1.0.0".to_string(),
           )
         ]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-d@1.0.0".to_string(),
+        pkg_id: "package-d@1.0.0_package-b@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-c".to_string(),
-          // Cycle: package-c is bare here
-          "package-c@1.0.0".to_string(),
+          "package-c@1.0.0_package-b@1.0.0".to_string(),
         )]),
       },
     ]
@@ -2399,12 +2386,6 @@ async fn resolve_dep_with_peer_deps_circular_3() {
 
   let (packages, package_reqs) =
     run_v2_resolver_and_get_output(&api, vec!["package-a@1.0.0"]).await;
-  // Note: differs from the old resolver in circular peer dep encoding.
-  // In the DFS, children are resolved before the parent's peers, so:
-  // - d's peer dep c resolves to bare package-c@1.0.0 (without nested peer
-  //   encoding for package-a) because c's children were resolved first
-  // - d's identity uses flat peer deps (package-a, package-c) rather than
-  //   nested (package-c__package-a)
   assert_eq!(
     packages,
     vec![
@@ -2429,19 +2410,19 @@ async fn resolve_dep_with_peer_deps_circular_3() {
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-d".to_string(),
-          "package-d@1.0.0_package-a@1.0.0_package-c@1.0.0"
+          "package-d@1.0.0_package-c@1.0.0__package-a@1.0.0_package-a@1.0.0"
             .to_string(),
         )]),
       },
       TestNpmResolutionPackage {
         pkg_id:
-          "package-d@1.0.0_package-a@1.0.0_package-c@1.0.0"
+          "package-d@1.0.0_package-c@1.0.0__package-a@1.0.0_package-a@1.0.0"
             .to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
             "package-c".to_string(),
-            "package-c@1.0.0".to_string(),
+            "package-c@1.0.0_package-a@1.0.0".to_string(),
           ),
           (
             "package-e".to_string(),
@@ -2861,15 +2842,11 @@ async fn resolve_sibling_peer_deps() {
 
   let (packages, package_reqs) =
     run_v2_resolver_and_get_output(&api, vec!["package-a@1.0.0"]).await;
-  // In the two-phase DFS resolver, mutual peer deps between siblings
-  // produce different encodings than the old resolver. The DFS resolves
-  // children bottom-up, so circular peer refs use truncated identities
-  // at cycle boundaries (e.g. c's dep on b is bare b@1.0.0).
   assert_eq!(
     packages,
     vec![
       TestNpmResolutionPackage {
-        pkg_id: "package-a@1.0.0_package-b@1.0.0_package-c@1.0.0__package-b@1.0.0".to_string(),
+        pkg_id: "package-a@1.0.0_package-c@1.0.0__package-b@1.0.0___package-c@1.0.0_package-b@1.0.0__package-c@1.0.0___package-b@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
@@ -2878,7 +2855,7 @@ async fn resolve_sibling_peer_deps() {
           ),
           (
             "package-c".to_string(),
-            "package-c@1.0.0_package-b@1.0.0".to_string(),
+            "package-c@1.0.0_package-b@1.0.0__package-c@1.0.0".to_string(),
           )
         ])
       },
@@ -2887,15 +2864,15 @@ async fn resolve_sibling_peer_deps() {
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-c".to_string(),
-          "package-c@1.0.0_package-b@1.0.0".to_string(),
+          "package-c@1.0.0_package-b@1.0.0__package-c@1.0.0".to_string(),
         )]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-c@1.0.0_package-b@1.0.0".to_string(),
+        pkg_id: "package-c@1.0.0_package-b@1.0.0__package-c@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-b".to_string(),
-          "package-b@1.0.0".to_string(),
+          "package-b@1.0.0_package-c@1.0.0__package-b@1.0.0".to_string(),
         )]),
       },
     ]
@@ -2904,7 +2881,7 @@ async fn resolve_sibling_peer_deps() {
     package_reqs,
     vec![(
       "package-a@1.0.0".to_string(),
-      "package-a@1.0.0_package-b@1.0.0_package-c@1.0.0__package-b@1.0.0".to_string()
+      "package-a@1.0.0_package-c@1.0.0__package-b@1.0.0___package-c@1.0.0_package-b@1.0.0__package-c@1.0.0___package-b@1.0.0".to_string()
     )]
   );
 }
@@ -2932,11 +2909,6 @@ async fn resolve_dep_with_peer_deps_circular_2() {
 
   let (packages, package_reqs) =
     run_v2_resolver_and_get_output(&api, vec!["package-a@1.0.0"]).await;
-  // Note: differs from old resolver in circular peer dep encoding.
-  // The DFS resolves children before peers. In circular scenarios,
-  // package-c picks up both package-a and package-b as peers (bubbled
-  // from its subtree), but its children (d, e, f) use simpler identities
-  // because peer context doesn't propagate as deeply through cycles.
   assert_eq!(
     packages,
     vec![
@@ -2953,52 +2925,52 @@ async fn resolve_dep_with_peer_deps_circular_2() {
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-c".to_string(),
-          "package-c@1.0.0_package-a@1.0.0_package-b@1.0.0".to_string(),
+          "package-c@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
         )]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-c@1.0.0_package-a@1.0.0_package-b@1.0.0".to_string(),
+        pkg_id: "package-c@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([
           (
             "package-b".to_string(),
-            "package-b@1.0.0".to_string(),
+            "package-b@1.0.0_package-a@1.0.0".to_string(),
           ),
           (
             "package-d".to_string(),
-            "package-d@1.0.0".to_string(),
+            "package-d@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
           ),
           (
             "package-e".to_string(),
-            "package-e@1.0.0_package-a@1.0.0".to_string()
+            "package-e@1.0.0_package-a@1.0.0_package-b@1.0.0__package-a@1.0.0".to_string()
           )
         ]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-d@1.0.0".to_string(),
+        pkg_id: "package-d@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-c".to_string(),
-          "package-c@1.0.0".to_string(),
+          "package-c@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
         )]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-e@1.0.0_package-a@1.0.0".to_string(),
+        pkg_id: "package-e@1.0.0_package-a@1.0.0_package-b@1.0.0__package-a@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-f".to_string(),
-          "package-f@1.0.0_package-a@1.0.0".to_string(),
+          "package-f@1.0.0_package-a@1.0.0_package-b@1.0.0__package-a@1.0.0".to_string(),
         )]),
       },
       TestNpmResolutionPackage {
-        pkg_id: "package-f@1.0.0_package-a@1.0.0".to_string(),
+        pkg_id: "package-f@1.0.0_package-a@1.0.0_package-b@1.0.0__package-a@1.0.0".to_string(),
         copy_index: 0,
         dependencies: BTreeMap::from([(
           "package-a".to_string(),
           "package-a@1.0.0".to_string(),
         ), (
           "package-d".to_string(),
-          "package-d@1.0.0".to_string(),
+          "package-d@1.0.0_package-b@1.0.0__package-a@1.0.0_package-a@1.0.0".to_string(),
         )]),
       },
     ]
@@ -3063,20 +3035,16 @@ async fn vite_tailwind_optional_peer_duplicates() {
         )])
       },
       TestNpmResolutionPackage {
-        pkg_id:
-          "@tailwindcss/vite@4.0.17_lightningcss@1.29.2_vite@6.2.4__lightningcss@1.29.2"
-            .to_string(),
+        pkg_id: "@tailwindcss/vite@4.0.17_vite@6.2.4__lightningcss@1.29.2_lightningcss@1.29.2"
+          .to_string(),
         copy_index: 0,
-        dependencies: BTreeMap::from([
-          (
-            "lightningcss".to_string(),
-            "lightningcss@1.29.2".to_string(),
-          ),
-          (
-            "vite".to_string(),
-            "vite@6.2.4_lightningcss@1.29.2".to_string(),
-          )
-        ])
+        dependencies: BTreeMap::from([(
+          "lightningcss".to_string(),
+          "lightningcss@1.29.2".to_string(),
+        ), (
+          "vite".to_string(),
+          "vite@6.2.4_lightningcss@1.29.2".to_string(),
+        )])
       },
       TestNpmResolutionPackage {
         pkg_id: "lightningcss@1.29.2".to_string(),
@@ -3103,7 +3071,7 @@ async fn vite_tailwind_optional_peer_duplicates() {
       ),
       (
         "@tailwindcss/vite@~4.0.17".to_string(),
-        "@tailwindcss/vite@4.0.17_lightningcss@1.29.2_vite@6.2.4__lightningcss@1.29.2"
+        "@tailwindcss/vite@4.0.17_vite@6.2.4__lightningcss@1.29.2_lightningcss@1.29.2"
           .to_string()
       ),
     ]
@@ -4573,4 +4541,57 @@ async fn dep_tree_from_snapshot_dep_on_self() {
   // assert this doesn't panic
   let _tree =
     DepTree::from_snapshot(snapshot, &version_resolver, &HashMap::new());
+}
+
+/// Reproduction of the vitefu/picomatch issue:
+/// fdir has an optional peer dep on picomatch. vite depends on both fdir
+/// and picomatch. vitefu (under kit) has peer dep vite. picomatch should
+/// appear nested inside vite but NOT as a direct peer of vitefu.
+#[tokio::test]
+async fn peer_dep_no_extra_propagation_through_child_peer() {
+  let api = TestNpmRegistryApi::default();
+  api.ensure_package_version("kit", "1.0.0");
+  api.ensure_package_version("vitefu", "1.1.2");
+  api.ensure_package_version("vite", "6.4.1");
+  api.ensure_package_version("fdir", "6.4.4");
+  api.ensure_package_version("picomatch", "4.0.3");
+
+  // kit depends on vitefu
+  api.add_dependency(("kit", "1.0.0"), ("vitefu", "1"));
+  // vitefu has peer dep vite
+  api.add_peer_dependency(("vitefu", "1.1.2"), ("vite", ">=5"));
+  // vite depends on fdir and picomatch (regular deps)
+  api.add_dependency(("vite", "6.4.1"), ("fdir", "6"));
+  api.add_dependency(("vite", "6.4.1"), ("picomatch", "4"));
+  // fdir has optional peer dep picomatch
+  api.add_optional_peer_dependency(("fdir", "6.4.4"), ("picomatch", "^3 || ^4"));
+
+  let (packages, package_reqs) =
+    run_v2_resolver_and_get_output(&api, vec!["kit@1.0", "vite@6.4"])
+      .await;
+
+  // Print the actual output for debugging
+  for pkg in &packages {
+    eprintln!("  pkg_id: {:?}", pkg.pkg_id);
+    eprintln!("    deps: {:?}", pkg.dependencies);
+  }
+  eprintln!("  reqs: {:?}", package_reqs);
+
+  // vitefu should have vite as a peer, with picomatch nested inside vite.
+  // picomatch should NOT be a direct peer of vitefu.
+  let vitefu_pkg = packages
+    .iter()
+    .find(|p| p.pkg_id.starts_with("vitefu@"))
+    .unwrap();
+  // Expected: vitefu@1.1.2_vite@6.4.1__picomatch@4.0.3
+  // NOT: vitefu@1.1.2_vite@6.4.1__picomatch@4.0.3_picomatch@4.0.3
+  assert!(
+    !vitefu_pkg.pkg_id.ends_with("_picomatch@4.0.3_picomatch@4.0.3"),
+    "picomatch should not be a direct peer of vitefu, got: {}",
+    vitefu_pkg.pkg_id
+  );
+  assert_eq!(
+    vitefu_pkg.pkg_id,
+    "vitefu@1.1.2_vite@6.4.1__picomatch@4.0.3"
+  );
 }

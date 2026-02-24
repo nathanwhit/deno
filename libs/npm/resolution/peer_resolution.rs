@@ -36,6 +36,8 @@ pub(crate) struct ResolvedNodePeers {
   pkg_id: NpmPackageId,
   /// Full dependency map including resolved peers: specifier → NpmPackageId
   dependencies: HashMap<StackString, NpmPackageId>,
+  /// Dependency specifier → DepTreeNodeId (for post-DFS NpmPackageId reconstruction)
+  dep_node_ids: HashMap<StackString, DepTreeNodeId>,
   /// Which specifiers are optional dependencies
   optional_dependencies: HashSet<StackString>,
   /// Which specifiers are optional peer dependencies
@@ -43,6 +45,9 @@ pub(crate) struct ResolvedNodePeers {
   /// All resolved peers (own + bubbled from children) — keyed by package name.
   /// Used by the parent to propagate peers upward through the tree.
   all_resolved_peers: HashMap<StackString, NpmPackageId>,
+  /// Ordered resolved peer node IDs for post-DFS NpmPackageId reconstruction.
+  /// Preserves insertion order: own peers first, then bubbled from children.
+  all_resolved_peer_node_ids: Vec<(StackString, DepTreeNodeId)>,
 }
 
 /// Result of Phase 2.
@@ -121,6 +126,10 @@ struct PeerResolutionCtx<'a> {
   /// behavior where auto-resolved peers are placed as local children of the
   /// requesting node rather than at the root.
   auto_resolved_nvs: HashSet<PackageNv>,
+  /// Partially resolved peer node IDs (own peers only, before children).
+  /// Used for cycle back-edge bubbling so that ancestors' own peers
+  /// propagate correctly even during cycles.
+  partial_peer_node_ids: HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
 }
 
 /// Run Phase 2 peer resolution on the frozen dep tree.
@@ -144,6 +153,7 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
     peers_cache: HashMap::new(),
     unmet_peer_diagnostics: IndexSet::new(),
     auto_resolved_nvs,
+    partial_peer_node_ids: HashMap::new(),
   };
 
   let root_parent_pkgs = {
@@ -165,9 +175,11 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
     );
   }
 
-  // Fix up cycle back-edges: when a cycle was detected during DFS,
-  // the dependency got a bare NpmPackageId (no peers). Now that resolution
-  // is complete, replace these bare IDs with the actual resolved IDs.
+  // Reconstruct all NpmPackageIds using v1-style cycle-aware recursion.
+  // During the DFS, cycle back-edges produce placeholder NpmPackageIds.
+  // This pass rebuilds all IDs with correct nested peer encoding.
+  rebuild_npm_package_ids(&mut ctx.all_results, tree);
+
   // For each root package, find the best resolution from all_results.
   // A root package that also appears as a peer dep in a deeper context
   // may have a better resolution (with more peer deps) than the root-level one.
@@ -214,12 +226,19 @@ struct NodePeerResult {
   /// Peers that should continue bubbling to the parent.
   /// Keyed by package name for dedup and filtering.
   bubbling_peers: HashMap<StackString, NpmPackageId>,
+  /// Ordered peer node IDs that should bubble to the parent
+  /// (for post-DFS NpmPackageId reconstruction).
+  bubbling_peer_node_ids: Vec<(StackString, DepTreeNodeId)>,
 }
 
 /// Recursively resolve peers for a node and its subtree.
 ///
 /// Returns the resolved NpmPackageId plus any peer deps that should
 /// propagate upward through ancestor identities.
+///
+/// Key ordering: resolves own peer deps FIRST, then recurses into children.
+/// This ensures ancestors' peers are known before children are resolved,
+/// matching v1's lazy reference behavior.
 fn resolve_peers_of_node(
   node_id: DepTreeNodeId,
   parent_pkgs: &ParentPackages,
@@ -232,34 +251,60 @@ fn resolve_peers_of_node(
   let nv = node.nv.clone();
 
   // Check cache: same nv + same visible peer package set → same result.
-  // This correctly handles shared nodes that appear in different peer
-  // contexts (they'll have different cache keys).
   let cache_key = make_cache_key(node_id, parent_pkgs, ctx.tree);
   if let Some(cached) = ctx.peers_cache.get(&cache_key) {
     let result = cached.clone();
-    // Filter auto-resolved peers from bubbling, same as the non-cached path.
+    // Filter bubbling by child_pkg_names: peers that are regular dep
+    // children of this node should not bubble to the caller. This matches
+    // the filtering done in the non-cache path (lines ~589-599).
+    let node_child_pkg_names: HashSet<StackString> = ctx
+      .tree
+      .get_node(node_id)
+      .children
+      .values()
+      .map(|&cid| ctx.tree.get_node(cid).nv.name.clone())
+      .collect();
     let bubbling = result
       .all_resolved_peers
       .iter()
+      .filter(|(name, _)| !node_child_pkg_names.contains(name.as_str()))
       .filter(|(_, peer_id)| !ctx.auto_resolved_nvs.contains(&peer_id.nv))
       .map(|(k, v)| (k.clone(), v.clone()))
+      .collect();
+    let bubbling_node_ids = result
+      .all_resolved_peer_node_ids
+      .iter()
+      .filter(|(name, _)| !node_child_pkg_names.contains(name.as_str()))
+      .filter(|(_, nid)| {
+        !ctx
+          .auto_resolved_nvs
+          .contains(&ctx.tree.get_node(*nid).nv)
+      })
+      .cloned()
       .collect();
     ctx.all_results.push((node_id, result));
     return NodePeerResult {
       pkg_id: ctx.all_results.last().unwrap().1.pkg_id.clone(),
       bubbling_peers: bubbling,
+      bubbling_peer_node_ids: bubbling_node_ids,
     };
   }
 
   // Detect cycles: if this node is already in the ancestor path,
-  // return a truncated ID to break the cycle
+  // return a placeholder ID and bubble the ancestor's own peers.
   if ancestor_path.contains(&node_id) {
+    let partial = ctx
+      .partial_peer_node_ids
+      .get(&node_id)
+      .cloned()
+      .unwrap_or_default();
     return NodePeerResult {
       pkg_id: NpmPackageId {
         nv: (*nv).clone(),
         peer_dependencies: Default::default(),
       },
       bubbling_peers: HashMap::new(),
+      bubbling_peer_node_ids: partial,
     };
   }
 
@@ -279,38 +324,24 @@ fn resolve_peers_of_node(
     .map(|(_, child_id)| ctx.tree.get_node(*child_id).nv.name.clone())
     .collect();
 
-  // All resolved peers for this node (own + bubbled from children).
-  // This will be included in the NpmPackageId and stored for parent use.
   let mut all_resolved_peers: HashMap<StackString, NpmPackageId> =
     HashMap::new();
-
-  // First, recurse into regular children
+  let mut all_resolved_peer_node_ids: Vec<(StackString, DepTreeNodeId)> =
+    Vec::new();
+  let mut dep_node_ids: HashMap<StackString, DepTreeNodeId> = HashMap::new();
   let mut dependencies = HashMap::with_capacity(
     node.children.len() + node.peer_dep_specifiers.len(),
   );
 
-  for (specifier, child_id) in &children {
-    let mut child_ancestor_nvs = ancestor_nvs.to_vec();
-    child_ancestor_nvs.push(nv.clone());
-    let child_result = resolve_peers_of_node(
-      *child_id,
-      &child_parent_pkgs,
-      ctx,
-      ancestor_path,
-      &child_ancestor_nvs,
-    );
-    dependencies.insert(specifier.clone(), child_result.pkg_id);
-
-    // Collect bubbling peers from this child
-    for (peer_name, peer_id) in child_result.bubbling_peers {
-      all_resolved_peers.entry(peer_name).or_insert(peer_id);
-    }
-  }
-
-  // Now resolve peer deps by searching parent_pkgs
   let optional_peer_dep_specifiers = node.optional_peer_dep_specifiers.clone();
   let deps = node.deps.clone();
 
+  // ── Phase 1: resolve OWN peer deps first ──
+  // Collect bubbling peer node IDs separately so that own direct peers
+  // are added to all_resolved_peer_node_ids first (matching v1's BFS
+  // ordering where own peers come before bubbled peers from children).
+  let mut deferred_bubbling_node_ids: Vec<(StackString, DepTreeNodeId)> =
+    Vec::new();
   for dep in deps.iter() {
     if !matches!(
       dep.kind,
@@ -321,21 +352,51 @@ fn resolve_peers_of_node(
 
     let specifier = &dep.bare_specifier;
 
-    // Try to find in parent packages
-    if let Some((peer_nv, peer_node_id)) =
+    // Issue C fix: check if any of this node's own children (regular deps)
+    // already resolve to a package matching the peer dep name.
+    // This handles aliased deps like "package-peer2" → package-peer@2.0.0
+    // satisfying a peer dep on "package-peer".
+    let already_resolved_by_child = children
+      .iter()
+      .find(|(_, child_id)| ctx.tree.get_node(*child_id).nv.name == dep.name);
+
+    if let Some((_child_spec, child_id)) = already_resolved_by_child {
+      let child_id = *child_id;
+      let mut peer_ancestor_nvs = ancestor_nvs.to_vec();
+      peer_ancestor_nvs.push(nv.clone());
+      let peer_result = resolve_peers_of_node(
+        child_id,
+        &child_parent_pkgs,
+        ctx,
+        ancestor_path,
+        &peer_ancestor_nvs,
+      );
+      dependencies.insert(specifier.clone(), peer_result.pkg_id.clone());
+      dep_node_ids.insert(specifier.clone(), child_id);
+      all_resolved_peers
+        .insert(dep.name.clone(), peer_result.pkg_id);
+      if !all_resolved_peer_node_ids
+        .iter()
+        .any(|(n, _)| *n == dep.name)
+      {
+        all_resolved_peer_node_ids.push((dep.name.clone(), child_id));
+      }
+      for (peer_name, peer_id) in peer_result.bubbling_peers {
+        all_resolved_peers
+          .entry(peer_name.clone())
+          .or_insert(peer_id);
+      }
+      for (name, nid) in peer_result.bubbling_peer_node_ids {
+        deferred_bubbling_node_ids.push((name, nid));
+      }
+    } else if let Some((peer_nv, peer_node_id)) =
       parent_pkgs.find(&dep.name, &dep.version_req)
     {
       // Found a matching peer in the parent context.
-      // Check if the version satisfies the requirement — if not, emit
-      // an unmet peer dep diagnostic (but still resolve it).
-      // Skip diagnostics at root level since the package may be properly
-      // resolved in a different context deeper in the tree.
       if !is_root_level
         && dep.version_req.tag().is_none()
         && !dep.version_req.matches(&peer_nv.version)
       {
-        // Build ancestors in leaf-to-root order: current node first,
-        // then parent, grandparent, etc.
         let mut ancestors_for_diagnostic: Vec<PackageNv> =
           vec![(*nv).clone()];
         for anv in ancestor_nvs.iter().rev() {
@@ -361,28 +422,31 @@ fn resolve_peers_of_node(
         &peer_ancestor_nvs,
       );
       dependencies.insert(specifier.clone(), peer_result.pkg_id.clone());
-      // Add this peer to our resolved peers set
+      dep_node_ids.insert(specifier.clone(), peer_node_id);
       all_resolved_peers
         .insert(dep.name.clone(), peer_result.pkg_id);
-      // Also collect the peer's own bubbling peers (transitive peer deps).
-      // These appear as separate entries in this node's identity when
-      // they are real (non-auto-resolved) packages.
+      if !all_resolved_peer_node_ids
+        .iter()
+        .any(|(n, _)| *n == dep.name)
+      {
+        all_resolved_peer_node_ids.push((dep.name.clone(), peer_node_id));
+      }
       for (peer_name, peer_id) in peer_result.bubbling_peers {
-        all_resolved_peers.entry(peer_name).or_insert(peer_id);
+        all_resolved_peers
+          .entry(peer_name.clone())
+          .or_insert(peer_id);
+      }
+      for (name, nid) in peer_result.bubbling_peer_node_ids {
+        deferred_bubbling_node_ids.push((name, nid));
       }
     } else if !is_root_level
       && !optional_peer_dep_specifiers.contains(specifier)
     {
-      // Required peer not found — record diagnostic.
-      // Skip at root level since the package may be resolved in a
-      // different context deeper in the tree.
-      // Build ancestors in leaf-to-root order.
       let mut ancestors_for_diagnostic: Vec<PackageNv> =
         vec![(*nv).clone()];
       for anv in ancestor_nvs.iter().rev() {
         ancestors_for_diagnostic.push((**anv).clone());
       }
-
       ctx.unmet_peer_diagnostics.insert(UnmetPeerDepDiagnostic {
         ancestors: ancestors_for_diagnostic,
         dependency: PackageReq {
@@ -392,24 +456,100 @@ fn resolve_peers_of_node(
         resolved: nv.version.clone(),
       });
     }
-    // Optional peer not found — that's OK, skip it
+  }
+  // Now add the deferred bubbling peer node IDs (after all own direct peers).
+  for (name, nid) in deferred_bubbling_node_ids {
+    if !all_resolved_peer_node_ids.iter().any(|(n, _)| *n == name) {
+      all_resolved_peer_node_ids.push((name, nid));
+    }
   }
 
-  // Build NpmPackageId with ALL resolved peers (own + bubbled from children),
-  // excluding self-references (a package can't be its own peer dep).
-  // Remove self from the peer set first.
-  all_resolved_peers.remove(nv.name.as_str());
+  // Store partial peer node IDs for cycle back-edges.
+  // At this point, own peers are resolved but children haven't been processed.
+  ctx
+    .partial_peer_node_ids
+    .insert(node_id, all_resolved_peer_node_ids.clone());
 
+  // Propagate newly resolved peers to all ancestors' partials.
+  // This mirrors v1's `add_peer_deps_to_path`: when a peer dep is resolved,
+  // ALL ancestors in the current DFS path get that peer added to their
+  // partial state. This ensures that cycle back-edges to those ancestors
+  // will include the newly discovered peer.
+  propagate_peers_to_ancestors(
+    &all_resolved_peer_node_ids,
+    ancestor_path,
+    ctx,
+  );
+
+  // ── Phase 2: recurse into regular children ──
+  for (specifier, child_id) in &children {
+    let mut child_ancestor_nvs = ancestor_nvs.to_vec();
+    child_ancestor_nvs.push(nv.clone());
+    let child_result = resolve_peers_of_node(
+      *child_id,
+      &child_parent_pkgs,
+      ctx,
+      ancestor_path,
+      &child_ancestor_nvs,
+    );
+    dependencies.insert(specifier.clone(), child_result.pkg_id);
+    dep_node_ids.insert(specifier.clone(), *child_id);
+
+    let mut new_bubbled = Vec::new();
+    for (peer_name, peer_id) in child_result.bubbling_peers {
+      all_resolved_peers
+        .entry(peer_name.clone())
+        .or_insert(peer_id);
+    }
+    for (name, nid) in child_result.bubbling_peer_node_ids {
+      if !all_resolved_peer_node_ids.iter().any(|(n, _)| *n == name) {
+        all_resolved_peer_node_ids.push((name.clone(), nid));
+        new_bubbled.push((name, nid));
+      }
+    }
+
+    // After each child, update this node's partial and propagate to ancestors.
+    // This ensures that when later children's descendants encounter cycle
+    // back-edges to this node or its ancestors, they see the updated peer set
+    // (including peers discovered from earlier sibling branches).
+    if !new_bubbled.is_empty() {
+      ctx
+        .partial_peer_node_ids
+        .insert(node_id, all_resolved_peer_node_ids.clone());
+      propagate_peers_to_ancestors(&new_bubbled, ancestor_path, ctx);
+    }
+  }
+
+  // Remove self-references
+  all_resolved_peers.remove(nv.name.as_str());
+  all_resolved_peer_node_ids.retain(|(n, _)| *n != nv.name);
+
+  // Ensure all_resolved_peers has entries for all peer node IDs.
+  // Cycle returns populate bubbling_peer_node_ids but not bubbling_peers,
+  // so there may be entries in all_resolved_peer_node_ids without
+  // corresponding entries in all_resolved_peers. Fill them with bare IDs
+  // (the post-DFS rebuild will compute the correct nested structure).
+  for (name, nid) in &all_resolved_peer_node_ids {
+    all_resolved_peers.entry(name.clone()).or_insert_with(|| {
+      let peer_nv = (*ctx.tree.get_node(*nid).nv).clone();
+      NpmPackageId {
+        nv: peer_nv,
+        peer_dependencies: Default::default(),
+      }
+    });
+  }
+
+  // Build NpmPackageId (placeholder — will be rebuilt by post-DFS pass)
   let mut peer_dependencies = NpmPackageIdPeerDependencies::with_capacity(
-    all_resolved_peers.len(),
+    all_resolved_peer_node_ids.len(),
   );
   let mut seen_peer_ids = HashSet::new();
-  // Sort by name for deterministic ordering
-  let mut sorted_peers: Vec<_> = all_resolved_peers.iter().collect();
-  sorted_peers.sort_by(|(a, _), (b, _)| a.cmp(b));
-  for (_name, peer_id) in &sorted_peers {
-    if seen_peer_ids.insert((*peer_id).clone()) {
-      peer_dependencies.push((*peer_id).clone());
+  for (_name, peer_nid) in &all_resolved_peer_node_ids {
+    let peer_name = &ctx.tree.get_node(*peer_nid).nv.name;
+    if let Some(peer_id) = all_resolved_peers.get(peer_name.as_str()) {
+      if seen_peer_ids.insert(peer_id.clone()) {
+        peer_dependencies.push(peer_id.clone());
+      }
     }
   }
 
@@ -418,19 +558,25 @@ fn resolve_peers_of_node(
     peer_dependencies,
   };
 
-  // Compute bubbling peers: all_resolved_peers minus:
-  // 1. Those whose name matches a direct child ("consumed" here)
-  // 2. Auto-resolved peers (in root_packages but not package_reqs) — these
-  //    should not propagate to ancestor identities, matching v1 behavior
-  //    where auto-resolved peers are local to the requesting node.
+  // Compute bubbling peers
   let bubbling_peers: HashMap<StackString, NpmPackageId> = all_resolved_peers
     .iter()
     .filter(|(name, _)| !child_pkg_names.contains(name.as_str()))
     .filter(|(_, peer_id)| !ctx.auto_resolved_nvs.contains(&peer_id.nv))
     .map(|(k, v)| (k.clone(), v.clone()))
     .collect();
+  let bubbling_peer_node_ids: Vec<(StackString, DepTreeNodeId)> =
+    all_resolved_peer_node_ids
+      .iter()
+      .filter(|(name, _)| !child_pkg_names.contains(name.as_str()))
+      .filter(|(_, nid)| {
+        !ctx
+          .auto_resolved_nvs
+          .contains(&ctx.tree.get_node(*nid).nv)
+      })
+      .cloned()
+      .collect();
 
-  // Collect optional dependencies (from version info)
   let version_info = &node.version_info;
   let optional_dependencies: HashSet<StackString> = version_info
     .optional_dependencies
@@ -441,46 +587,263 @@ fn resolve_peers_of_node(
   let result = ResolvedNodePeers {
     pkg_id: pkg_id.clone(),
     dependencies,
+    dep_node_ids,
     optional_dependencies,
     optional_peer_dependencies: optional_peer_dep_specifiers,
     all_resolved_peers,
+    all_resolved_peer_node_ids,
   };
 
   ctx.all_results.push((node_id, result.clone()));
   ctx.peers_cache.insert(cache_key, result);
 
+  ctx.partial_peer_node_ids.remove(&node_id);
   ancestor_path.pop();
 
   NodePeerResult {
     pkg_id,
     bubbling_peers,
+    bubbling_peer_node_ids,
+  }
+}
+
+/// Propagate resolved peers to ancestors' `partial_peer_node_ids`.
+///
+/// Mirrors v1's `add_peer_deps_to_path`: when a peer dep is resolved at node N,
+/// ancestors in the DFS path between N and the resolution point get that peer
+/// added to their partial state. Propagation of each peer STOPS at the ancestor
+/// that has the peer as a direct child (the resolution point), matching v1's
+/// path construction which only spans from the requesting node to the ancestor
+/// where the peer was found.
+fn propagate_peers_to_ancestors(
+  new_peers: &[(StackString, DepTreeNodeId)],
+  ancestor_path: &[DepTreeNodeId],
+  ctx: &mut PeerResolutionCtx,
+) {
+  if new_peers.is_empty() {
+    return;
+  }
+
+  // Track which peers are still being propagated upward.
+  // Each peer stops propagating when we reach the ancestor that has it
+  // as a direct child (the resolution point).
+  let mut active: Vec<bool> = vec![true; new_peers.len()];
+
+  // The last element in ancestor_path is the current node itself (just pushed).
+  // Propagate to ancestors ABOVE the current node.
+  for &ancestor_id in ancestor_path.iter().rev().skip(1) {
+    // Check if all peers have been stopped
+    if active.iter().all(|&a| !a) {
+      break;
+    }
+
+    let ancestor_nv_name = ctx.tree.get_node(ancestor_id).nv.name.clone();
+    let ancestor_child_names: HashSet<StackString> = ctx
+      .tree
+      .get_node(ancestor_id)
+      .children
+      .values()
+      .map(|&cid| ctx.tree.get_node(cid).nv.name.clone())
+      .collect();
+
+    if let Some(partial) = ctx.partial_peer_node_ids.get_mut(&ancestor_id) {
+      for (i, (name, nid)) in new_peers.iter().enumerate() {
+        if !active[i] {
+          continue;
+        }
+        // Stop propagating self-references
+        if name.as_str() == ancestor_nv_name.as_str() {
+          active[i] = false;
+          continue;
+        }
+        // Stop propagating at the resolution point (ancestor has peer as child)
+        if ancestor_child_names.contains(name.as_str()) {
+          active[i] = false;
+          continue;
+        }
+        if !partial.iter().any(|(n, _)| n == name) {
+          partial.push((name.clone(), *nid));
+        }
+      }
+    } else {
+      // Even without a partial entry, check if this is a resolution point
+      for (i, (name, _)) in new_peers.iter().enumerate() {
+        if !active[i] {
+          continue;
+        }
+        if name.as_str() == ancestor_nv_name.as_str() {
+          active[i] = false;
+        } else if ancestor_child_names.contains(name.as_str()) {
+          active[i] = false;
+        }
+      }
+    }
   }
 }
 
 /// Build a cache key for peer resolution memoization.
+///
+/// Includes ALL parent packages in the key (not just the node's own peer deps)
+/// because descendant nodes may have peer deps that resolve differently
+/// depending on the full parent context. Without this, a node visited from
+/// two different parent contexts with different visible packages would get
+/// a cache hit when it shouldn't.
 fn make_cache_key(
   node_id: DepTreeNodeId,
   parent_pkgs: &ParentPackages,
   tree: &DepTree,
 ) -> (Rc<PackageNv>, Vec<StackString>) {
   let node = tree.get_node(node_id);
-  let mut peer_names: Vec<StackString> = node
-    .peer_dep_specifiers
+  let mut parent_pkg_names: Vec<StackString> = parent_pkgs
+    .pkgs
     .iter()
-    .filter_map(|spec| {
-      // Find the dep entry for this specifier
-      node.deps.iter().find(|d| d.bare_specifier == *spec)
-    })
-    .filter_map(|dep| {
-      parent_pkgs
-        .find(&dep.name, &dep.version_req)
-        .map(|(nv, _)| {
-          StackString::from_string(format!("{}@{}", nv.name, nv.version))
-        })
+    .map(|(_, (nv, _))| {
+      StackString::from_string(format!("{}@{}", nv.name, nv.version))
     })
     .collect();
-  peer_names.sort();
-  (node.nv.clone(), peer_names)
+  parent_pkg_names.sort();
+  (node.nv.clone(), parent_pkg_names)
+}
+
+// ======================================================================
+// Post-DFS NpmPackageId reconstruction
+// ======================================================================
+
+/// Reconstruct all NpmPackageIds using v1-style cycle-aware recursion.
+///
+/// During the DFS, peers only propagate through visited paths. In v1,
+/// peers propagate through ALL paths a node appears on (including
+/// cross-sibling paths). This pass:
+/// 1. Propagates peers from deps to parents (matching v1's behavior)
+/// 2. Rebuilds NpmPackageIds from the updated peer sets
+/// 3. Updates dependency references
+fn rebuild_npm_package_ids(
+  all_results: &mut Vec<(DepTreeNodeId, ResolvedNodePeers)>,
+  tree: &DepTree,
+) {
+  // Build map: DepTreeNodeId → peer node IDs (use entry with most peers).
+  let mut peer_map: HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>> =
+    HashMap::new();
+  for (node_id, resolved) in all_results.iter() {
+    let entry = peer_map.entry(*node_id).or_default();
+    if resolved.all_resolved_peer_node_ids.len() > entry.len() {
+      *entry = resolved.all_resolved_peer_node_ids.clone();
+    }
+  }
+
+  // Build canonical pkg_id for each DepTreeNodeId (used for cycle back-edges).
+  let mut node_to_pkg_id: HashMap<DepTreeNodeId, NpmPackageId> =
+    HashMap::with_capacity(peer_map.len());
+  for (&node_id, peer_node_ids) in &peer_map {
+    let nv = (*tree.get_node(node_id).nv).clone();
+    let mut seen = HashSet::from([nv.clone()]);
+    let pkg_id =
+      build_npm_pkg_id(peer_node_ids, &nv, tree, &peer_map, &mut seen);
+    node_to_pkg_id.insert(node_id, pkg_id);
+  }
+
+  // Phase 1: Rebuild each entry's pkg_id and collect old → new mapping.
+  let mut id_mapping: HashMap<NpmPackageId, NpmPackageId> = HashMap::new();
+  for idx in 0..all_results.len() {
+    let (node_id, _) = all_results[idx];
+    let nv = (*tree.get_node(node_id).nv).clone();
+
+    let mut seen = HashSet::from([nv.clone()]);
+    let new_pkg_id = build_npm_pkg_id(
+      &all_results[idx].1.all_resolved_peer_node_ids,
+      &nv,
+      tree,
+      &peer_map,
+      &mut seen,
+    );
+
+    let old_pkg_id = &all_results[idx].1.pkg_id;
+    if *old_pkg_id != new_pkg_id {
+      id_mapping.insert(old_pkg_id.clone(), new_pkg_id.clone());
+    }
+    all_results[idx].1.pkg_id = new_pkg_id;
+  }
+
+  // Phase 2: Update dependency references.
+  // Simple (non-recursive) id_mapping lookup for DFS placeholders,
+  // then fall back to node_to_pkg_id for cycle back-edge bare references.
+  for idx in 0..all_results.len() {
+    let dep_updates: Vec<(StackString, NpmPackageId)> = all_results[idx]
+      .1
+      .dependencies
+      .iter()
+      .filter_map(|(spec, dep_id)| {
+        if let Some(new_id) = id_mapping.get(dep_id) {
+          return Some((spec.clone(), new_id.clone()));
+        }
+        // Cycle back-edge: bare ID (no peers) where canonical has peers.
+        if dep_id.peer_dependencies.iter().next().is_none() {
+          if let Some(&dep_nid) = all_results[idx].1.dep_node_ids.get(spec) {
+            if let Some(canonical) = node_to_pkg_id.get(&dep_nid) {
+              if canonical.peer_dependencies.iter().next().is_some() {
+                return Some((spec.clone(), canonical.clone()));
+              }
+            }
+          }
+        }
+        None
+      })
+      .collect();
+    for (spec, new_id) in dep_updates {
+      all_results[idx].1.dependencies.insert(spec, new_id);
+    }
+  }
+}
+
+/// Build an NpmPackageId from peer node IDs using cycle-aware recursion.
+///
+/// Mirrors v1's `get_npm_pkg_id_from_resolved_id_with_seen`:
+/// - `seen` tracks PackageNv values currently being serialized
+/// - When a cycle is detected (peer's nv already in `seen`), use bare nv
+/// - This produces correctly nested peer encodings
+fn build_npm_pkg_id(
+  peer_node_ids: &[(StackString, DepTreeNodeId)],
+  nv: &PackageNv,
+  tree: &DepTree,
+  peer_map: &HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
+  seen: &mut HashSet<PackageNv>,
+) -> NpmPackageId {
+  let mut peer_dependencies =
+    NpmPackageIdPeerDependencies::with_capacity(peer_node_ids.len());
+  let mut seen_peer_ids = HashSet::new();
+
+  for (_name, peer_node_id) in peer_node_ids {
+    let peer_nv = (*tree.get_node(*peer_node_id).nv).clone();
+    if seen.insert(peer_nv.clone()) {
+      let child_peer_node_ids =
+        peer_map.get(peer_node_id).cloned().unwrap_or_default();
+      let child_peer = build_npm_pkg_id(
+        &child_peer_node_ids,
+        &peer_nv,
+        tree,
+        peer_map,
+        seen,
+      );
+      seen.remove(&peer_nv);
+      if seen_peer_ids.insert(child_peer.clone()) {
+        peer_dependencies.push(child_peer);
+      }
+    } else {
+      // Cycle — use bare nv
+      let bare = NpmPackageId {
+        nv: peer_nv,
+        peer_dependencies: Default::default(),
+      };
+      if seen_peer_ids.insert(bare.clone()) {
+        peer_dependencies.push(bare);
+      }
+    }
+  }
+
+  NpmPackageId {
+    nv: nv.clone(),
+    peer_dependencies,
+  }
 }
 
 // ======================================================================
