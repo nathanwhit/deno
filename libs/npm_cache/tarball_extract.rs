@@ -11,7 +11,6 @@ use deno_npm::registry::NpmPackageVersionDistInfo;
 use deno_npm::registry::NpmPackageVersionDistInfoIntegrity;
 use deno_semver::package::PackageNv;
 use flate2::read::GzDecoder;
-use sha2::Digest;
 use sys_traits::FsCanonicalize;
 use sys_traits::FsCreateDirAll;
 use sys_traits::FsFileSetPermissions;
@@ -161,8 +160,12 @@ fn verify_tarball_integrity(
       base64_hash,
     } => {
       let tarball_checksum = match *algorithm {
-        "sha512" => BASE64_STANDARD.encode(sha2::Sha512::digest(data)),
-        "sha1" => BASE64_STANDARD.encode(sha1::Sha1::digest(data)),
+        "sha512" => BASE64_STANDARD
+          .encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512, data)),
+        "sha1" => BASE64_STANDARD.encode(aws_lc_rs::digest::digest(
+          &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
+          data,
+        )),
         hash_kind => {
           return Err(TarballIntegrityError::NotImplementedHashFunction {
             package: Box::new(package.clone()),
@@ -173,7 +176,10 @@ fn verify_tarball_integrity(
       (tarball_checksum, base64_hash)
     }
     NpmPackageVersionDistInfoIntegrity::LegacySha1Hex(hex) => {
-      let digest = sha1::Sha1::digest(data);
+      let digest = aws_lc_rs::digest::digest(
+        &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        data,
+      );
       let tarball_checksum = faster_hex::hex_string(digest.as_ref());
       (tarball_checksum, hex)
     }
