@@ -115,9 +115,9 @@ struct PeerResolutionCtx<'a> {
   /// All resolved results — a node may appear multiple times with different
   /// peer contexts.
   all_results: Vec<(DepTreeNodeId, ResolvedNodePeers)>,
-  /// Cache: (nv, sorted peer pkg names) → ResolvedNodePeers
+  /// Cache: (node_id, sorted parent node IDs) → ResolvedNodePeers
   /// Avoids re-resolving the same node with the same peer context
-  peers_cache: HashMap<(Rc<PackageNv>, Vec<StackString>), ResolvedNodePeers>,
+  peers_cache: HashMap<(DepTreeNodeId, Vec<DepTreeNodeId>), ResolvedNodePeers>,
   /// Diagnostics
   unmet_peer_diagnostics: IndexSet<UnmetPeerDepDiagnostic>,
   /// NVs of auto-resolved peer deps (in root_packages but not in package_reqs).
@@ -251,7 +251,7 @@ fn resolve_peers_of_node(
   let nv = node.nv.clone();
 
   // Check cache: same nv + same visible peer package set → same result.
-  let cache_key = make_cache_key(node_id, parent_pkgs, ctx.tree);
+  let cache_key = make_cache_key(node_id, parent_pkgs);
   if let Some(cached) = ctx.peers_cache.get(&cache_key) {
     let result = cached.clone();
     // Filter bubbling by child_pkg_names: peers that are regular dep
@@ -698,18 +698,14 @@ fn propagate_peers_to_ancestors(
 fn make_cache_key(
   node_id: DepTreeNodeId,
   parent_pkgs: &ParentPackages,
-  tree: &DepTree,
-) -> (Rc<PackageNv>, Vec<StackString>) {
-  let node = tree.get_node(node_id);
-  let mut parent_pkg_names: Vec<StackString> = parent_pkgs
+) -> (DepTreeNodeId, Vec<DepTreeNodeId>) {
+  let mut parent_node_ids: Vec<DepTreeNodeId> = parent_pkgs
     .pkgs
-    .iter()
-    .map(|(_, (nv, _))| {
-      StackString::from_string(format!("{}@{}", nv.name, nv.version))
-    })
+    .values()
+    .map(|(_, nid)| *nid)
     .collect();
-  parent_pkg_names.sort();
-  (node.nv.clone(), parent_pkg_names)
+  parent_node_ids.sort();
+  (node_id, parent_node_ids)
 }
 
 // ======================================================================
