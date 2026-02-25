@@ -390,7 +390,14 @@ fn resolve_peers_of_node(
         deferred_bubbling_node_ids.push((name, nid));
       }
     } else if let Some((peer_nv, peer_node_id)) =
-      parent_pkgs.find(&dep.name, &dep.version_req)
+      parent_pkgs.find(&dep.name, &dep.version_req).filter(|(nv, _)| {
+        // Skip optional peers resolved only via auto-resolution. In v1,
+        // auto-resolved peers are local children of the requesting node,
+        // not globally visible, so optional peers in unrelated packages
+        // don't pick them up.
+        dep.kind != NpmDependencyEntryKind::OptionalPeer
+          || !ctx.auto_resolved_nvs.contains(nv)
+      })
     {
       // Found a matching peer in the parent context.
       if !is_root_level
