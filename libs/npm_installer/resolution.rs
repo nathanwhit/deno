@@ -199,7 +199,7 @@ impl<TNpmCacheHttpClient: NpmCacheHttpClient, TSys: NpmResolutionInstallerSys>
       tarball_cache: tarball_cache_for_prefetch,
     };
     let result = snapshot
-      .add_pkg_reqs_v2(
+      .add_pkg_reqs(
         &api,
         AddPkgReqsOptions {
           package_reqs,
@@ -223,7 +223,7 @@ impl<TNpmCacheHttpClient: NpmCacheHttpClient, TSys: NpmResolutionInstallerSys>
           tarball_cache: tarball_cache_for_prefetch,
         };
         snapshot
-          .add_pkg_reqs_v2(
+          .add_pkg_reqs(
             &api,
             AddPkgReqsOptions {
               package_reqs,
