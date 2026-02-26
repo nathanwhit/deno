@@ -411,12 +411,24 @@ impl NpmResolutionSnapshot {
     // Reconstruct tree from existing snapshot if non-empty
     if !self.is_empty() {
       // Collect cached package infos from snapshot packages
-      let mut cached_infos = HashMap::new();
-      for pkg_id in self.packages.keys() {
-        if !cached_infos.contains_key(&pkg_id.nv.name) {
-          if let Ok(info) = api.package_info(&pkg_id.nv.name).await {
-            cached_infos.insert(pkg_id.nv.name.clone(), info);
-          }
+      let unique_names: Vec<PackageName> = self
+        .packages
+        .keys()
+        .map(|id| &id.nv.name)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect();
+      let infos = futures::future::join_all(
+        unique_names
+          .iter()
+          .map(|name| async move { (name, api.package_info(name).await) }),
+      )
+      .await;
+      let mut cached_infos = HashMap::with_capacity(infos.len());
+      for (name, result) in infos {
+        if let Ok(info) = result {
+          cached_infos.insert(name.clone(), info);
         }
       }
       dep_tree =

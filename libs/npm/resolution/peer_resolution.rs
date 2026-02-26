@@ -8,10 +8,12 @@
 //! dependencies encoded, and builds the final `NpmResolutionSnapshot`.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use deno_semver::StackString;
+use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
+use rustc_hash::FxBuildHasher;
 use deno_semver::VersionReq;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
@@ -35,16 +37,16 @@ pub(crate) struct ResolvedNodePeers {
   /// The final NpmPackageId with peers encoded
   pkg_id: NpmPackageId,
   /// Full dependency map including resolved peers: specifier → NpmPackageId
-  dependencies: HashMap<StackString, NpmPackageId>,
+  dependencies: FxHashMap<StackString, NpmPackageId>,
   /// Dependency specifier → DepTreeNodeId (for post-DFS NpmPackageId reconstruction)
-  dep_node_ids: HashMap<StackString, DepTreeNodeId>,
+  dep_node_ids: FxHashMap<StackString, DepTreeNodeId>,
   /// Which specifiers are optional dependencies
-  optional_dependencies: HashSet<StackString>,
+  optional_dependencies: FxHashSet<StackString>,
   /// Which specifiers are optional peer dependencies
-  optional_peer_dependencies: HashSet<StackString>,
+  optional_peer_dependencies: FxHashSet<StackString>,
   /// All resolved peers (own + bubbled from children) — keyed by package name.
   /// Used by the parent to propagate peers upward through the tree.
-  all_resolved_peers: HashMap<StackString, NpmPackageId>,
+  all_resolved_peers: FxHashMap<StackString, NpmPackageId>,
   /// Ordered resolved peer node IDs for post-DFS NpmPackageId reconstruction.
   /// Preserves insertion order: own peers first, then bubbled from children.
   all_resolved_peer_node_ids: Vec<(StackString, DepTreeNodeId)>,
@@ -57,7 +59,7 @@ pub struct PeerResolutionResult {
   /// with different peer versions).
   pub(crate) all_resolved: Vec<(DepTreeNodeId, ResolvedNodePeers)>,
   /// Maps root package nv node_id → resolved peers (for root_packages mapping).
-  pub(crate) root_resolved: HashMap<DepTreeNodeId, ResolvedNodePeers>,
+  pub(crate) root_resolved: FxHashMap<DepTreeNodeId, ResolvedNodePeers>,
   /// Diagnostics for unmet required peer deps.
   pub unmet_peer_diagnostics: Vec<UnmetPeerDepDiagnostic>,
 }
@@ -69,13 +71,13 @@ pub struct PeerResolutionResult {
 #[derive(Debug, Clone)]
 struct ParentPackages {
   /// name → (nv, DepTreeNodeId)
-  pkgs: HashMap<StackString, (Rc<PackageNv>, DepTreeNodeId)>,
+  pkgs: FxHashMap<StackString, (Rc<PackageNv>, DepTreeNodeId)>,
 }
 
 impl ParentPackages {
   fn new() -> Self {
     Self {
-      pkgs: HashMap::new(),
+      pkgs: FxHashMap::default(),
     }
   }
 
@@ -117,7 +119,7 @@ struct PeerResolutionCtx<'a> {
   all_results: Vec<(DepTreeNodeId, ResolvedNodePeers)>,
   /// Cache: (node_id, sorted parent node IDs) → ResolvedNodePeers
   /// Avoids re-resolving the same node with the same peer context
-  peers_cache: HashMap<(DepTreeNodeId, Vec<DepTreeNodeId>), ResolvedNodePeers>,
+  peers_cache: HashMap<(DepTreeNodeId, Vec<DepTreeNodeId>), ResolvedNodePeers, FxBuildHasher>,
   /// Diagnostics
   unmet_peer_diagnostics: IndexSet<UnmetPeerDepDiagnostic>,
   /// NVs of auto-resolved peer deps (in root_packages but not in package_reqs).
@@ -125,22 +127,22 @@ struct PeerResolutionCtx<'a> {
   /// bubble up through the tree to affect ancestor identities — matching the v1
   /// behavior where auto-resolved peers are placed as local children of the
   /// requesting node rather than at the root.
-  auto_resolved_nvs: HashSet<PackageNv>,
+  auto_resolved_nvs: FxHashSet<PackageNv>,
   /// Partially resolved peer node IDs (own peers only, before children).
   /// Used for cycle back-edge bubbling so that ancestors' own peers
   /// propagate correctly even during cycles.
-  partial_peer_node_ids: HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
+  partial_peer_node_ids: FxHashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
 }
 
 /// Run Phase 2 peer resolution on the frozen dep tree.
 pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
   // Compute auto-resolved NVs: packages in root_packages but not in package_reqs.
-  let package_req_nvs: HashSet<&PackageNv> = tree
+  let package_req_nvs: FxHashSet<&PackageNv> = tree
     .package_reqs
     .values()
     .map(|nv| nv.as_ref())
     .collect();
-  let auto_resolved_nvs: HashSet<PackageNv> = tree
+  let auto_resolved_nvs: FxHashSet<PackageNv> = tree
     .root_packages
     .keys()
     .filter(|nv| !package_req_nvs.contains(nv.as_ref()))
@@ -150,10 +152,10 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
   let mut ctx = PeerResolutionCtx {
     tree,
     all_results: Vec::with_capacity(tree.nodes.len()),
-    peers_cache: HashMap::new(),
+    peers_cache: HashMap::with_hasher(FxBuildHasher),
     unmet_peer_diagnostics: IndexSet::new(),
     auto_resolved_nvs,
-    partial_peer_node_ids: HashMap::new(),
+    partial_peer_node_ids: FxHashMap::default(),
   };
 
   let root_parent_pkgs = {
@@ -165,12 +167,15 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
     pkgs
   };
 
+  let mut ancestor_path = Vec::new();
+  let mut ancestor_set = FxHashSet::default();
   for (_, &node_id) in &tree.root_packages {
     resolve_peers_of_node(
       node_id,
       &root_parent_pkgs,
       &mut ctx,
-      &mut vec![],
+      &mut ancestor_path,
+      &mut ancestor_set,
       &[],
     );
   }
@@ -185,7 +190,7 @@ pub fn resolve_peers(tree: &DepTree) -> PeerResolutionResult {
   // may have a better resolution (with more peer deps) than the root-level one.
   // Use the root-level resolution (first entry) by default, and only
   // replace it if a deeper resolution has strictly MORE peer deps.
-  let mut root_resolved = HashMap::with_capacity(tree.root_packages.len());
+  let mut root_resolved = FxHashMap::with_capacity_and_hasher(tree.root_packages.len(), Default::default());
   for (_, &node_id) in &tree.root_packages {
     let mut best: Option<&ResolvedNodePeers> = None;
     for (id, resolved) in ctx.all_results.iter() {
@@ -225,7 +230,7 @@ struct NodePeerResult {
   pkg_id: NpmPackageId,
   /// Peers that should continue bubbling to the parent.
   /// Keyed by package name for dedup and filtering.
-  bubbling_peers: HashMap<StackString, NpmPackageId>,
+  bubbling_peers: FxHashMap<StackString, NpmPackageId>,
   /// Ordered peer node IDs that should bubble to the parent
   /// (for post-DFS NpmPackageId reconstruction).
   bubbling_peer_node_ids: Vec<(StackString, DepTreeNodeId)>,
@@ -244,6 +249,7 @@ fn resolve_peers_of_node(
   parent_pkgs: &ParentPackages,
   ctx: &mut PeerResolutionCtx,
   ancestor_path: &mut Vec<DepTreeNodeId>,
+  ancestor_set: &mut FxHashSet<DepTreeNodeId>,
   ancestor_nvs: &[Rc<PackageNv>],
 ) -> NodePeerResult {
   let is_root_level = ancestor_nvs.is_empty();
@@ -257,7 +263,7 @@ fn resolve_peers_of_node(
     // Filter bubbling by child_pkg_names: peers that are regular dep
     // children of this node should not bubble to the caller. This matches
     // the filtering done in the non-cache path (lines ~589-599).
-    let node_child_pkg_names: HashSet<StackString> = ctx
+    let node_child_pkg_names: FxHashSet<StackString> = ctx
       .tree
       .get_node(node_id)
       .children
@@ -292,7 +298,7 @@ fn resolve_peers_of_node(
 
   // Detect cycles: if this node is already in the ancestor path,
   // return a placeholder ID and bubble the ancestor's own peers.
-  if ancestor_path.contains(&node_id) {
+  if ancestor_set.contains(&node_id) {
     let partial = ctx
       .partial_peer_node_ids
       .get(&node_id)
@@ -303,12 +309,13 @@ fn resolve_peers_of_node(
         nv: (*nv).clone(),
         peer_dependencies: Default::default(),
       },
-      bubbling_peers: HashMap::new(),
+      bubbling_peers: FxHashMap::default(),
       bubbling_peer_node_ids: partial,
     };
   }
 
   ancestor_path.push(node_id);
+  ancestor_set.insert(node_id);
 
   // Build parent_pkgs for children: current parent_pkgs + this node's children
   let child_parent_pkgs = parent_pkgs.extended_with(ctx.tree, node_id);
@@ -319,21 +326,22 @@ fn resolve_peers_of_node(
     .iter()
     .map(|(k, v)| (k.clone(), *v))
     .collect();
-  let child_pkg_names: HashSet<StackString> = children
+  let child_pkg_names: FxHashSet<StackString> = children
     .iter()
     .map(|(_, child_id)| ctx.tree.get_node(*child_id).nv.name.clone())
     .collect();
 
-  let mut all_resolved_peers: HashMap<StackString, NpmPackageId> =
-    HashMap::new();
+  let mut all_resolved_peers: FxHashMap<StackString, NpmPackageId> =
+    FxHashMap::default();
   let mut all_resolved_peer_node_ids: Vec<(StackString, DepTreeNodeId)> =
     Vec::new();
-  let mut dep_node_ids: HashMap<StackString, DepTreeNodeId> = HashMap::new();
-  let mut dependencies = HashMap::with_capacity(
-    node.children.len() + node.peer_dep_specifiers.len(),
-  );
+  // Track names already in all_resolved_peer_node_ids for O(1) dedup checks
+  let mut peer_node_id_names: FxHashSet<StackString> = FxHashSet::default();
+  let mut dep_node_ids: FxHashMap<StackString, DepTreeNodeId> = FxHashMap::default();
+  let dep_capacity = node.children.len() + node.peer_dep_specifiers.len();
+  let mut dependencies = FxHashMap::with_capacity_and_hasher(dep_capacity, Default::default());
 
-  let optional_peer_dep_specifiers = node.optional_peer_dep_specifiers.clone();
+  let optional_peer_dep_specifiers: FxHashSet<StackString> = node.optional_peer_dep_specifiers.iter().cloned().collect();
   let deps = node.deps.clone();
 
   // ── Phase 1: resolve OWN peer deps first ──
@@ -369,16 +377,14 @@ fn resolve_peers_of_node(
         &child_parent_pkgs,
         ctx,
         ancestor_path,
+        ancestor_set,
         &peer_ancestor_nvs,
       );
       dependencies.insert(specifier.clone(), peer_result.pkg_id.clone());
       dep_node_ids.insert(specifier.clone(), child_id);
       all_resolved_peers
         .insert(dep.name.clone(), peer_result.pkg_id);
-      if !all_resolved_peer_node_ids
-        .iter()
-        .any(|(n, _)| *n == dep.name)
-      {
+      if peer_node_id_names.insert(dep.name.clone()) {
         all_resolved_peer_node_ids.push((dep.name.clone(), child_id));
       }
       for (peer_name, peer_id) in peer_result.bubbling_peers {
@@ -426,16 +432,14 @@ fn resolve_peers_of_node(
         &child_parent_pkgs,
         ctx,
         ancestor_path,
+        ancestor_set,
         &peer_ancestor_nvs,
       );
       dependencies.insert(specifier.clone(), peer_result.pkg_id.clone());
       dep_node_ids.insert(specifier.clone(), peer_node_id);
       all_resolved_peers
         .insert(dep.name.clone(), peer_result.pkg_id);
-      if !all_resolved_peer_node_ids
-        .iter()
-        .any(|(n, _)| *n == dep.name)
-      {
+      if peer_node_id_names.insert(dep.name.clone()) {
         all_resolved_peer_node_ids.push((dep.name.clone(), peer_node_id));
       }
       for (peer_name, peer_id) in peer_result.bubbling_peers {
@@ -466,7 +470,7 @@ fn resolve_peers_of_node(
   }
   // Now add the deferred bubbling peer node IDs (after all own direct peers).
   for (name, nid) in deferred_bubbling_node_ids {
-    if !all_resolved_peer_node_ids.iter().any(|(n, _)| *n == name) {
+    if peer_node_id_names.insert(name.clone()) {
       all_resolved_peer_node_ids.push((name, nid));
     }
   }
@@ -497,6 +501,7 @@ fn resolve_peers_of_node(
       &child_parent_pkgs,
       ctx,
       ancestor_path,
+      ancestor_set,
       &child_ancestor_nvs,
     );
     dependencies.insert(specifier.clone(), child_result.pkg_id);
@@ -509,7 +514,7 @@ fn resolve_peers_of_node(
         .or_insert(peer_id);
     }
     for (name, nid) in child_result.bubbling_peer_node_ids {
-      if !all_resolved_peer_node_ids.iter().any(|(n, _)| *n == name) {
+      if peer_node_id_names.insert(name.clone()) {
         all_resolved_peer_node_ids.push((name.clone(), nid));
         new_bubbled.push((name, nid));
       }
@@ -550,7 +555,7 @@ fn resolve_peers_of_node(
   let mut peer_dependencies = NpmPackageIdPeerDependencies::with_capacity(
     all_resolved_peer_node_ids.len(),
   );
-  let mut seen_peer_ids = HashSet::new();
+  let mut seen_peer_ids = FxHashSet::default();
   for (_name, peer_nid) in &all_resolved_peer_node_ids {
     let peer_name = &ctx.tree.get_node(*peer_nid).nv.name;
     if let Some(peer_id) = all_resolved_peers.get(peer_name.as_str()) {
@@ -566,7 +571,7 @@ fn resolve_peers_of_node(
   };
 
   // Compute bubbling peers
-  let bubbling_peers: HashMap<StackString, NpmPackageId> = all_resolved_peers
+  let bubbling_peers: FxHashMap<StackString, NpmPackageId> = all_resolved_peers
     .iter()
     .filter(|(name, _)| !child_pkg_names.contains(name.as_str()))
     .filter(|(_, peer_id)| !ctx.auto_resolved_nvs.contains(&peer_id.nv))
@@ -585,7 +590,7 @@ fn resolve_peers_of_node(
       .collect();
 
   let version_info = &node.version_info;
-  let optional_dependencies: HashSet<StackString> = version_info
+  let optional_dependencies: FxHashSet<StackString> = version_info
     .optional_dependencies
     .keys()
     .cloned()
@@ -606,6 +611,7 @@ fn resolve_peers_of_node(
 
   ctx.partial_peer_node_ids.remove(&node_id);
   ancestor_path.pop();
+  ancestor_set.remove(&node_id);
 
   NodePeerResult {
     pkg_id,
@@ -645,7 +651,7 @@ fn propagate_peers_to_ancestors(
     }
 
     let ancestor_nv_name = ctx.tree.get_node(ancestor_id).nv.name.clone();
-    let ancestor_child_names: HashSet<StackString> = ctx
+    let ancestor_child_names: FxHashSet<StackString> = ctx
       .tree
       .get_node(ancestor_id)
       .children
@@ -725,8 +731,8 @@ fn rebuild_npm_package_ids(
   tree: &DepTree,
 ) {
   // Build map: DepTreeNodeId → peer node IDs (use entry with most peers).
-  let mut peer_map: HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>> =
-    HashMap::new();
+  let mut peer_map: FxHashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>> =
+    FxHashMap::default();
   for (node_id, resolved) in all_results.iter() {
     let entry = peer_map.entry(*node_id).or_default();
     if resolved.all_resolved_peer_node_ids.len() > entry.len() {
@@ -735,23 +741,23 @@ fn rebuild_npm_package_ids(
   }
 
   // Build canonical pkg_id for each DepTreeNodeId (used for cycle back-edges).
-  let mut node_to_pkg_id: HashMap<DepTreeNodeId, NpmPackageId> =
-    HashMap::with_capacity(peer_map.len());
+  let mut node_to_pkg_id: FxHashMap<DepTreeNodeId, NpmPackageId> =
+    FxHashMap::with_capacity_and_hasher(peer_map.len(), Default::default());
   for (&node_id, peer_node_ids) in &peer_map {
     let nv = (*tree.get_node(node_id).nv).clone();
-    let mut seen = HashSet::from([nv.clone()]);
+    let mut seen = FxHashSet::from_iter([nv.clone()]);
     let pkg_id =
       build_npm_pkg_id(peer_node_ids, &nv, tree, &peer_map, &mut seen);
     node_to_pkg_id.insert(node_id, pkg_id);
   }
 
   // Phase 1: Rebuild each entry's pkg_id and collect old → new mapping.
-  let mut id_mapping: HashMap<NpmPackageId, NpmPackageId> = HashMap::new();
+  let mut id_mapping: FxHashMap<NpmPackageId, NpmPackageId> = FxHashMap::default();
   for idx in 0..all_results.len() {
     let (node_id, _) = all_results[idx];
     let nv = (*tree.get_node(node_id).nv).clone();
 
-    let mut seen = HashSet::from([nv.clone()]);
+    let mut seen = FxHashSet::from_iter([nv.clone()]);
     let new_pkg_id = build_npm_pkg_id(
       &all_results[idx].1.all_resolved_peer_node_ids,
       &nv,
@@ -808,12 +814,12 @@ fn build_npm_pkg_id(
   peer_node_ids: &[(StackString, DepTreeNodeId)],
   nv: &PackageNv,
   tree: &DepTree,
-  peer_map: &HashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
-  seen: &mut HashSet<PackageNv>,
+  peer_map: &FxHashMap<DepTreeNodeId, Vec<(StackString, DepTreeNodeId)>>,
+  seen: &mut FxHashSet<PackageNv>,
 ) -> NpmPackageId {
   let mut peer_dependencies =
     NpmPackageIdPeerDependencies::with_capacity(peer_node_ids.len());
-  let mut seen_peer_ids = HashSet::new();
+  let mut seen_peer_ids = FxHashSet::default();
 
   for (_name, peer_node_id) in peer_node_ids {
     let peer_nv = (*tree.get_node(*peer_node_id).nv).clone();
@@ -895,7 +901,7 @@ fn is_compatible_superset(
   }
 
   // All subset dependency values must exist in superset dependency values
-  let superset_dep_values: HashSet<&NpmPackageId> =
+  let superset_dep_values: FxHashSet<&NpmPackageId> =
     superset.dependencies.values().collect();
   for dep_value in subset.dependencies.values() {
     if !superset_dep_values.contains(dep_value) {
@@ -920,10 +926,10 @@ fn is_compatible_superset(
 /// using pnpm's greedy algorithm.
 fn find_peer_dep_merges(
   all_resolved: &[(DepTreeNodeId, ResolvedNodePeers)],
-) -> HashMap<NpmPackageId, NpmPackageId> {
+) -> FxHashMap<NpmPackageId, NpmPackageId> {
   // Group by PackageNv → unique NpmPackageId → representative ResolvedNodePeers
-  let mut by_nv: HashMap<&PackageNv, HashMap<&NpmPackageId, &ResolvedNodePeers>> =
-    HashMap::new();
+  let mut by_nv: FxHashMap<&PackageNv, FxHashMap<&NpmPackageId, &ResolvedNodePeers>> =
+    FxHashMap::default();
   for (_, resolved) in all_resolved {
     by_nv
       .entry(&resolved.pkg_id.nv)
@@ -932,7 +938,7 @@ fn find_peer_dep_merges(
       .or_insert(resolved);
   }
 
-  let mut merge_map = HashMap::new();
+  let mut merge_map = FxHashMap::default();
 
   for unique_by_id in by_nv.values() {
     if unique_by_id.len() <= 1 {
@@ -968,10 +974,17 @@ fn find_peer_dep_merges(
 /// nested peer_dependencies.
 fn apply_merge_to_id(
   id: &NpmPackageId,
-  merge_map: &HashMap<NpmPackageId, NpmPackageId>,
+  merge_map: &FxHashMap<NpmPackageId, NpmPackageId>,
+  cache: &mut FxHashMap<NpmPackageId, NpmPackageId>,
 ) -> NpmPackageId {
+  // Check memoization cache first
+  if let Some(cached) = cache.get(id) {
+    return cached.clone();
+  }
+
   // Check if this exact ID is in the merge map
   if let Some(new_id) = merge_map.get(id) {
+    cache.insert(id.clone(), new_id.clone());
     return new_id.clone();
   }
 
@@ -985,14 +998,14 @@ fn apply_merge_to_id(
     NpmPackageIdPeerDependencies::with_capacity(peer_count);
   let mut changed = false;
   for peer in id.peer_dependencies.iter() {
-    let new_peer = apply_merge_to_id(peer, merge_map);
+    let new_peer = apply_merge_to_id(peer, merge_map, cache);
     if new_peer != *peer {
       changed = true;
     }
     new_peers.push(new_peer);
   }
 
-  if changed {
+  let result = if changed {
     let result = NpmPackageId {
       nv: id.nv.clone(),
       peer_dependencies: new_peers,
@@ -1001,37 +1014,42 @@ fn apply_merge_to_id(
     merge_map.get(&result).cloned().unwrap_or(result)
   } else {
     id.clone()
-  }
+  };
+
+  cache.insert(id.clone(), result.clone());
+  result
 }
 
 /// Apply the merge map to all NpmPackageIds in all_resolved entries.
 fn apply_merge_map(
   all_resolved: &mut [(DepTreeNodeId, ResolvedNodePeers)],
-  merge_map: &HashMap<NpmPackageId, NpmPackageId>,
+  merge_map: &FxHashMap<NpmPackageId, NpmPackageId>,
 ) {
+  let mut cache = FxHashMap::default();
   for (_, resolved) in all_resolved.iter_mut() {
-    resolved.pkg_id = apply_merge_to_id(&resolved.pkg_id, merge_map);
+    resolved.pkg_id = apply_merge_to_id(&resolved.pkg_id, merge_map, &mut cache);
     for dep_id in resolved.dependencies.values_mut() {
-      *dep_id = apply_merge_to_id(dep_id, merge_map);
+      *dep_id = apply_merge_to_id(dep_id, merge_map, &mut cache);
     }
     for peer_id in resolved.all_resolved_peers.values_mut() {
-      *peer_id = apply_merge_to_id(peer_id, merge_map);
+      *peer_id = apply_merge_to_id(peer_id, merge_map, &mut cache);
     }
   }
 }
 
 /// Apply the merge map to all NpmPackageIds in a HashMap of entries.
 fn apply_merge_map_entries(
-  entries: &mut HashMap<DepTreeNodeId, ResolvedNodePeers>,
-  merge_map: &HashMap<NpmPackageId, NpmPackageId>,
+  entries: &mut FxHashMap<DepTreeNodeId, ResolvedNodePeers>,
+  merge_map: &FxHashMap<NpmPackageId, NpmPackageId>,
 ) {
+  let mut cache = FxHashMap::default();
   for resolved in entries.values_mut() {
-    resolved.pkg_id = apply_merge_to_id(&resolved.pkg_id, merge_map);
+    resolved.pkg_id = apply_merge_to_id(&resolved.pkg_id, merge_map, &mut cache);
     for dep_id in resolved.dependencies.values_mut() {
-      *dep_id = apply_merge_to_id(dep_id, merge_map);
+      *dep_id = apply_merge_to_id(dep_id, merge_map, &mut cache);
     }
     for peer_id in resolved.all_resolved_peers.values_mut() {
-      *peer_id = apply_merge_to_id(peer_id, merge_map);
+      *peer_id = apply_merge_to_id(peer_id, merge_map, &mut cache);
     }
   }
 }
@@ -1061,8 +1079,9 @@ pub fn build_snapshot(
   // (e.g., after dedupe_peer_dependents merging), prefer the entry with
   // more dependencies — it's the superset that others were merged into.
   let mut resolved_by_pkg_id =
-    HashMap::<NpmPackageId, (DepTreeNodeId, &ResolvedNodePeers)>::with_capacity(
+    FxHashMap::<NpmPackageId, (DepTreeNodeId, &ResolvedNodePeers)>::with_capacity_and_hasher(
       peer_result.all_resolved.len(),
+      Default::default(),
     );
   for (node_id, resolved) in &peer_result.all_resolved {
     match resolved_by_pkg_id.entry(resolved.pkg_id.clone()) {
@@ -1084,7 +1103,7 @@ pub fn build_snapshot(
   // Only include packages that have a corresponding package_req — auto-resolved
   // peer deps are in tree.root_packages for Phase 2 visibility but should not
   // appear as top-level packages in the snapshot.
-  let package_req_nvs: HashSet<&PackageNv> =
+  let package_req_nvs: FxHashSet<&PackageNv> =
     tree.package_reqs.values().map(|nv| nv.as_ref()).collect();
   for (req, nv) in &tree.package_reqs {
     package_reqs.insert(req.clone(), (**nv).clone());
@@ -1102,7 +1121,7 @@ pub fn build_snapshot(
   // This avoids including incomplete resolutions (e.g., root-level
   // resolutions where peer deps weren't found but were resolved
   // in a deeper context).
-  let mut traversed_ids = HashSet::with_capacity(peer_result.all_resolved.len());
+  let mut traversed_ids = FxHashSet::with_capacity_and_hasher(peer_result.all_resolved.len(), Default::default());
   let mut pending = VecDeque::new();
 
   // Use sorted root_packages for deterministic copy_index assignment
@@ -1147,11 +1166,11 @@ pub fn build_snapshot(
         copy_index,
         system,
         dist: version_info.dist.clone(),
-        dependencies: resolved.dependencies.clone(),
-        optional_dependencies: resolved.optional_dependencies.clone(),
+        dependencies: resolved.dependencies.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        optional_dependencies: resolved.optional_dependencies.iter().cloned().collect(),
         optional_peer_dependencies: resolved
           .optional_peer_dependencies
-          .clone(),
+          .iter().cloned().collect(),
         extra: Some(NpmPackageExtraInfo {
           bin: version_info.bin.clone(),
           scripts: version_info.scripts.clone(),

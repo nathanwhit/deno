@@ -2645,6 +2645,7 @@ dependencies = [
  "monch",
  "pretty_assertions",
  "reqwest",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "sha2",

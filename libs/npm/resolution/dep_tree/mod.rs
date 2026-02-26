@@ -23,6 +23,7 @@ use deno_semver::package::PackageName;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
 use log::debug;
+use rustc_hash::FxHashMap;
 
 use super::common::NpmPackageVersionResolver;
 use super::common::NpmVersionResolver;
@@ -80,6 +81,8 @@ pub struct DepTree {
   pub all_peer_dep_names: HashSet<StackString>,
   /// Tracks all resolved versions per package name (for dedup & version reuse)
   pub package_name_versions: HashMap<StackString, HashSet<Version>>,
+  /// Index from PackageNv → DepTreeNodeId for O(1) node lookup by nv.
+  nv_to_node: FxHashMap<PackageNv, DepTreeNodeId>,
 }
 
 impl DepTree {
@@ -90,6 +93,7 @@ impl DepTree {
       nodes: Vec::new(),
       all_peer_dep_names: HashSet::new(),
       package_name_versions: HashMap::new(),
+      nv_to_node: FxHashMap::default(),
     }
   }
 
@@ -185,6 +189,7 @@ impl DepTree {
 
       let no_peers = peer_dep_specifiers.is_empty();
       let node_id = DepTreeNodeId(tree.nodes.len() as u32);
+      tree.nv_to_node.insert((*nv).clone(), node_id);
       tree.nodes.push(DepTreeNode {
         nv,
         children: BTreeMap::new(),
@@ -279,6 +284,7 @@ impl DepTree {
       .insert(nv.version.clone());
 
     let id = DepTreeNodeId(self.nodes.len() as u32);
+    self.nv_to_node.insert((*nv).clone(), id);
     self.nodes.push(DepTreeNode {
       nv,
       children: BTreeMap::new(),
@@ -294,14 +300,7 @@ impl DepTree {
 
   /// Find an existing node for the given nv (without peer deps).
   fn find_node_for_nv(&self, nv: &PackageNv) -> Option<DepTreeNodeId> {
-    // Linear scan is fine — in practice the number of distinct versions
-    // per package is small, and we only need this during tree construction.
-    for (i, node) in self.nodes.iter().enumerate() {
-      if *node.nv == *nv {
-        return Some(DepTreeNodeId(i as u32));
-      }
-    }
-    None
+    self.nv_to_node.get(nv).copied()
   }
 }
 
@@ -869,6 +868,25 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
       )
       .await;
 
+      // Speculatively prefetch grandchild package infos
+      for (_, manifest_result) in &manifests {
+        if let Ok(info) = manifest_result {
+          let version_info = info
+            .dist_tags
+            .get("latest")
+            .and_then(|v| info.versions.get(v))
+            .or_else(|| info.versions.values().next());
+          if let Some(vi) = version_info {
+            for dep_name in vi.dependencies.keys() {
+              self.api.prefetch_package_info(dep_name);
+            }
+            for dep_name in vi.optional_dependencies.keys() {
+              self.api.prefetch_package_info(dep_name);
+            }
+          }
+        }
+      }
+
       // --- Phase C: Create children synchronously (brief mutable borrow) ---
       let children_to_resolve = {
         let mut state = self.state.borrow_mut();
@@ -1074,15 +1092,19 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
       HashMap<VersionReq, Version>,
     > = Default::default();
 
-    for (package_name, reqs_by_version) in package_version_reqs_by_version {
-      if reqs_by_version.len() <= 1 {
-        continue;
-      }
-      let final_versions = self
-        .assign_highest_satisfying(&package_name, &reqs_by_version)
-        .await;
-      if !final_versions.is_empty() {
-        consolidated_versions.insert(package_name, final_versions);
+    let to_dedup: Vec<_> = package_version_reqs_by_version
+      .into_iter()
+      .filter(|(_, reqs)| reqs.len() > 1)
+      .collect();
+    let results = futures::future::join_all(
+      to_dedup
+        .iter()
+        .map(|(name, reqs)| self.assign_highest_satisfying(name, reqs)),
+    )
+    .await;
+    for ((name, _), versions) in to_dedup.into_iter().zip(results) {
+      if !versions.is_empty() {
+        consolidated_versions.insert(name, versions);
       }
     }
 
