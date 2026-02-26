@@ -376,10 +376,19 @@ impl<
                   Ok::<_, SyncResolutionWithFsError>(())
                 }
               });
+              let needs_extra_from_disk = package.extra.is_none()
+                // When using abbreviated packument format, has_scripts may
+                // be true (from hasInstallScript) while extra.scripts is
+                // empty. In that case, read from disk to get real scripts.
+                || (package.has_scripts
+                  && package
+                    .extra
+                    .as_ref()
+                    .map_or(false, |e| e.scripts.is_empty()));
               let extra_fut = if (package.has_bin
                 || package.has_scripts
                 || package.is_deprecated)
-                && package.extra.is_none()
+                && needs_extra_from_disk
               {
                 extra_info_provider
                   .get_package_extra_info(

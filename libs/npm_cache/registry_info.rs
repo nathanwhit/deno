@@ -153,7 +153,7 @@ pub struct LoadPackageInfoInnerError(pub Arc<JsErrorBox>);
 /// caps total concurrent downloads for prefetched packages. The critical path
 /// only starts its own downloads for packages not yet prefetched. Setting this
 /// too low starves the critical path of pre-warmed cache entries.
-const MAX_CONCURRENT_PREFETCH_TASKS: usize = 50;
+const MAX_CONCURRENT_PREFETCH_TASKS: usize = 128;
 
 #[derive(Debug)]
 struct RegistryInfoProviderInner<

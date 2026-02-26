@@ -110,6 +110,17 @@ impl deno_npm_cache::NpmCacheHttpClient for CliNpmCacheHttpClient {
         http::header::HeaderValue::try_from(etag).unwrap(),
       );
     }
+    // Request the abbreviated install manifest when possible. This is 2-5x
+    // smaller than the full packument (e.g. @types/node: 2.3 MB vs 10.9 MB).
+    // Uses content negotiation with quality factors for registry compatibility
+    // (some registries like older Artifactory don't support the abbreviated
+    // format and need the JSON fallback).
+    headers.insert(
+      http::header::ACCEPT,
+      http::header::HeaderValue::from_static(
+        "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
+      ),
+    );
     // Request gzip and bypass the tower-http Decompression middleware so
     // that gzip inflate happens on a blocking thread instead of inline on
     // the async event loop. This prevents large packument decompression

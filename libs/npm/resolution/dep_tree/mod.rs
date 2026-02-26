@@ -847,178 +847,226 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi> DepTreeBuilder<'a, TNpmRegistryApi> {
         })
         .collect();
 
-      // Fetch all regular dep manifests + alias manifests concurrently
-      let manifest_futures = regular_deps.iter().map(|dep| {
-        let name = dep.name.clone();
-        async move { (name, self.api.package_info(&dep.name).await) }
-      });
+      // --- Phase B+C+D: Stream manifests, create children and resolve as
+      // each arrives ---
+      //
+      // Instead of fetching ALL manifests then creating ALL children, we
+      // process each dependency as its manifest arrives. This breaks the
+      // "wait for slowest sibling" barrier: if child A's manifest arrives
+      // in 10ms but child Z takes 2s, A's subtree resolution (and its
+      // grandchild prefetches) start 2s earlier.
+      //
+      // We use a single FuturesUnordered with an enum to interleave
+      // manifest arrivals with child subtree completions.
 
-      let alias_futures = alias_names.iter().map(|alias| async move {
-        match alias {
-          Some(alias_name) => {
-            Some(self.api.package_info(alias_name.as_str()).await)
+      type ManifestResult =
+        Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
+
+      enum ResolveEvent<'a> {
+        ManifestReady {
+          index: usize,
+          manifest: ManifestResult,
+          alias: Option<ManifestResult>,
+        },
+        ChildDone(
+          Result<(), NpmResolutionError>,
+          // This is a phantom marker to tie the lifetime to the
+          // borrow of `self` in the child future.
+          std::marker::PhantomData<&'a ()>,
+        ),
+      }
+
+      let mut work: futures::stream::FuturesUnordered<
+        Pin<Box<dyn Future<Output = ResolveEvent<'_>> + '_>>,
+      > = futures::stream::FuturesUnordered::new();
+
+      // Push manifest fetch futures (one per dep, paired with alias)
+      for (i, dep) in regular_deps.iter().enumerate() {
+        let alias = alias_names[i].clone();
+        work.push(Box::pin(async move {
+          let (manifest, alias_info) = futures::future::join(
+            async {
+              self.api.package_info(&dep.name).await
+            },
+            async {
+              match &alias {
+                Some(alias_name) => {
+                  Some(self.api.package_info(alias_name.as_str()).await)
+                }
+                None => None,
+              }
+            },
+          )
+          .await;
+          ResolveEvent::ManifestReady {
+            index: i,
+            manifest,
+            alias: alias_info,
           }
-          None => None,
-        }
+        }));
+      }
+
+      let has_peer_deps = deps.iter().any(|d| {
+        matches!(
+          d.kind,
+          NpmDependencyEntryKind::Peer
+            | NpmDependencyEntryKind::OptionalPeer
+        )
       });
+      let mut found_peer = has_peer_deps;
+      let mut created_any_child = false;
 
-      let (manifests, alias_infos): (Vec<_>, Vec<_>) = futures::future::join(
-        futures::future::join_all(manifest_futures),
-        futures::future::join_all(alias_futures),
-      )
-      .await;
+      while let Some(event) =
+        futures::StreamExt::next(&mut work).await
+      {
+        match event {
+          ResolveEvent::ManifestReady {
+            index,
+            manifest,
+            alias,
+          } => {
+            let dep = &regular_deps[index];
+            let package_info = match &manifest {
+              Ok(info) => info,
+              Err(_) => continue,
+            };
 
-      // Speculatively prefetch grandchild package infos
-      for (_, manifest_result) in &manifests {
-        if let Ok(info) = manifest_result {
-          let version_info = info
-            .dist_tags
-            .get("latest")
-            .and_then(|v| info.versions.get(v))
-            .or_else(|| info.versions.values().next());
-          if let Some(vi) = version_info {
-            for dep_name in vi.dependencies.keys() {
-              self.api.prefetch_package_info(dep_name);
+            // Speculatively prefetch grandchild deps from this manifest
+            let version_info = package_info
+              .dist_tags
+              .get("latest")
+              .and_then(|v| package_info.versions.get(v))
+              .or_else(|| package_info.versions.values().next());
+            if let Some(vi) = version_info {
+              for dep_name in vi.dependencies.keys() {
+                self.api.prefetch_package_info(dep_name);
+              }
+              for dep_name in vi.optional_dependencies.keys() {
+                self.api.prefetch_package_info(dep_name);
+              }
             }
-            for dep_name in vi.optional_dependencies.keys() {
-              self.api.prefetch_package_info(dep_name);
+
+            // Brief borrow_mut to create this one child node
+            let maybe_child = {
+              let mut state = self.state.borrow_mut();
+
+              // Check if already resolved as a child of this node
+              if state.tree.nodes[pending.node_id.0 as usize]
+                .children
+                .contains_key(&dep.bare_specifier)
+              {
+                None
+              } else {
+                // Use alias info if available
+                let effective_info = match &alias {
+                  Some(Ok(alias_info)) => alias_info,
+                  _ => package_info,
+                };
+                let effective_version_resolver =
+                  self.version_resolver.get_for_package(effective_info);
+
+                // Apply overrides
+                let effective_req = match active_overrides
+                  .get_override_for(&dep.name, None)
+                {
+                  Some(req) => req,
+                  None => {
+                    let natural_version = effective_version_resolver
+                      .resolve_best_package_version_info(
+                        &dep.version_req,
+                        state
+                          .tree
+                          .package_name_versions
+                          .entry(
+                            effective_version_resolver
+                              .info()
+                              .name
+                              .clone(),
+                          )
+                          .or_default()
+                          .iter(),
+                      )
+                      .ok()
+                      .map(|info| info.version.clone());
+                    match natural_version.as_ref().and_then(|v| {
+                      active_overrides
+                        .get_override_for(&dep.name, Some(v))
+                    }) {
+                      Some(req) => req,
+                      None => &dep.version_req,
+                    }
+                  }
+                };
+
+                let (child_nv, child_id, _) =
+                  Self::resolve_node_from_info_on_state(
+                    &mut state,
+                    self.api,
+                    &dep.name,
+                    effective_req,
+                    &effective_version_resolver,
+                    &active_overrides,
+                  )?;
+
+                // Skip self-dependencies
+                if child_nv == parent_nv {
+                  None
+                } else {
+                  let is_circular = pending
+                    .ancestors
+                    .iter()
+                    .any(|anc| **anc == *child_nv);
+
+                  state.tree.nodes[pending.node_id.0 as usize]
+                    .children
+                    .insert(dep.bare_specifier.clone(), child_id);
+                  created_any_child = true;
+
+                  if !found_peer {
+                    found_peer =
+                      !state.tree.nodes[child_id.0 as usize].no_peers;
+                  }
+
+                  if !is_circular {
+                    let mut child_ancestors =
+                      pending.ancestors.clone();
+                    child_ancestors.push(parent_nv.clone());
+                    let child_overrides = active_overrides
+                      .for_child(&child_nv.name, &child_nv.version);
+                    Some(PendingNode {
+                      node_id: child_id,
+                      ancestors: child_ancestors,
+                      active_overrides: child_overrides,
+                    })
+                  } else {
+                    None
+                  }
+                }
+              }
+            }; // borrow_mut released
+
+            // Start resolving child subtree immediately
+            if let Some(child) = maybe_child {
+              work.push(Box::pin(async move {
+                let result = self.resolve_subtree(child).await;
+                ResolveEvent::ChildDone(
+                  result,
+                  std::marker::PhantomData,
+                )
+              }));
             }
+          }
+          ResolveEvent::ChildDone(result, _) => {
+            result?;
           }
         }
       }
 
-      // --- Phase C: Create children synchronously (brief mutable borrow) ---
-      let children_to_resolve = {
+      // Update no_peers after all children are processed
+      if created_any_child && !found_peer {
         let mut state = self.state.borrow_mut();
-        let mut children = Vec::new();
-        let mut found_peer = false;
-        let mut created_any_child = false;
-
-        for (i, dep) in regular_deps.iter().enumerate() {
-          let (ref _name, ref manifest_result) = manifests[i];
-          let package_info = match manifest_result {
-            Ok(info) => info,
-            Err(_) => {
-              continue;
-            }
-          };
-
-          // Check if already resolved as a child of this node
-          if state.tree.nodes[pending.node_id.0 as usize]
-            .children
-            .contains_key(&dep.bare_specifier)
-          {
-            continue;
-          }
-
-          // Use alias info if available
-          let effective_info = match &alias_infos[i] {
-            Some(Ok(alias_info)) => alias_info,
-            _ => package_info,
-          };
-          let effective_version_resolver =
-            self.version_resolver.get_for_package(effective_info);
-
-          // Apply overrides
-          let effective_req =
-            match active_overrides.get_override_for(&dep.name, None) {
-              Some(req) => req,
-              None => {
-                let natural_version = effective_version_resolver
-                  .resolve_best_package_version_info(
-                    &dep.version_req,
-                    state
-                      .tree
-                      .package_name_versions
-                      .entry(
-                        effective_version_resolver.info().name.clone(),
-                      )
-                      .or_default()
-                      .iter(),
-                  )
-                  .ok()
-                  .map(|info| info.version.clone());
-                match natural_version.as_ref().and_then(|v| {
-                  active_overrides.get_override_for(&dep.name, Some(v))
-                }) {
-                  Some(req) => req,
-                  None => &dep.version_req,
-                }
-              }
-            };
-
-          let (child_nv, child_id, _) =
-            Self::resolve_node_from_info_on_state(
-              &mut state,
-              self.api,
-              &dep.name,
-              effective_req,
-              &effective_version_resolver,
-              &active_overrides,
-            )?;
-
-          // Skip self-dependencies
-          if child_nv == parent_nv {
-            continue;
-          }
-
-          // Check for circular dependency (ancestor has same nv)
-          let is_circular =
-            pending.ancestors.iter().any(|anc| **anc == *child_nv);
-
-          state.tree.nodes[pending.node_id.0 as usize]
-            .children
-            .insert(dep.bare_specifier.clone(), child_id);
-          created_any_child = true;
-
-          if !is_circular {
-            let mut child_ancestors = pending.ancestors.clone();
-            child_ancestors.push(parent_nv.clone());
-            // Compute override context for the child's subtree
-            let child_overrides = active_overrides
-              .for_child(&child_nv.name, &child_nv.version);
-            children.push(PendingNode {
-              node_id: child_id,
-              ancestors: child_ancestors,
-              active_overrides: child_overrides,
-            });
-          }
-
-          if !found_peer {
-            found_peer =
-              !state.tree.nodes[child_id.0 as usize].no_peers;
-          }
-        }
-
-        // Only update no_peers if we actually created children for this node.
-        // If another concurrent subtree already resolved this node, all
-        // children would already exist and no_peers was already set correctly.
-        if created_any_child {
-          // Handle peer dep markers
-          if deps.iter().any(|d| {
-            matches!(
-              d.kind,
-              NpmDependencyEntryKind::Peer
-                | NpmDependencyEntryKind::OptionalPeer
-            )
-          }) {
-            found_peer = true;
-          }
-          if !found_peer {
-            state.tree.nodes[pending.node_id.0 as usize].no_peers = true;
-          }
-        }
-
-        children
-      }; // borrow_mut released
-
-      // --- Phase D: Recursively resolve ALL children concurrently ---
-      futures::future::try_join_all(
-        children_to_resolve
-          .into_iter()
-          .map(|child| self.resolve_subtree(child)),
-      )
-      .await?;
+        state.tree.nodes[pending.node_id.0 as usize].no_peers = true;
+      }
 
       Ok(())
     })
