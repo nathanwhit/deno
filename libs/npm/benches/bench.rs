@@ -267,31 +267,3 @@ async fn run_resolver_and_get_snapshot(
     .await;
   result.dep_graph_result.unwrap()
 }
-
-async fn run_resolver_and_get_snapshot2(
-  api: &impl NpmRegistryApi,
-  reqs: &[String],
-) -> NpmResolutionSnapshot {
-  let snapshot = NpmResolutionSnapshot::new(Default::default());
-  let reqs = reqs
-    .iter()
-    .map(|req| PackageReq::from_str(req).unwrap())
-    .collect::<Vec<_>>();
-  let version_resolver = NpmVersionResolver {
-    link_packages: Default::default(),
-    newest_dependency_date_options: Default::default(),
-    overrides: Default::default(),
-  };
-  let result = snapshot
-    .add_pkg_reqs_v2(
-      api,
-      AddPkgReqsOptions {
-        package_reqs: &reqs,
-        version_resolver: &version_resolver,
-        should_dedup: true,
-      },
-      None,
-    )
-    .await;
-  result.dep_graph_result.unwrap()
-}
