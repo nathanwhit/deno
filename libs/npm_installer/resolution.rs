@@ -132,8 +132,9 @@ impl<TNpmCacheHttpClient: NpmCacheHttpClient, TSys: NpmResolutionInstallerSys>
     package_reqs: &[PackageReq],
     prefetch_tarballs: bool,
   ) -> AddPkgReqsResult {
-    let (results, dependencies_result) =
-      self.add_package_reqs_inner(package_reqs, prefetch_tarballs).await;
+    let (results, dependencies_result) = self
+      .add_package_reqs_inner(package_reqs, prefetch_tarballs)
+      .await;
     AddPkgReqsResult {
       results,
       dependencies_result: dependencies_result.map_err(JsErrorBox::from_err),
