@@ -6,6 +6,7 @@ mod tsgo_version;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use deno_ast::ModuleSpecifier;
 use deno_config::deno_json::CompilerOptions;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
+use deno_graph::Module;
 use deno_graph::ModuleGraph;
 use deno_resolver::deno_json::JsxImportSourceConfigResolver;
 use deno_typescript_go_client_rust::CallbackHandler;
@@ -23,10 +25,12 @@ use deno_typescript_go_client_rust::types::GetImpliedNodeFormatForFilePayload;
 use deno_typescript_go_client_rust::types::Project;
 use deno_typescript_go_client_rust::types::ResolveModuleNamePayload;
 use deno_typescript_go_client_rust::types::ResolveTypeReferenceDirectivePayload;
+use node_resolver::ResolutionMode;
 pub use setup::DownloadError;
 pub use setup::ensure_tsgo;
 
 use super::Request;
+use super::RequestNpmState;
 use super::Response;
 use crate::args::TypeCheckMode;
 
@@ -63,6 +67,11 @@ fn synthetic_config(
     obj.insert("jsx".to_string(), json!("react-jsx"));
   }
   obj.insert("allowArbitraryExtensions".to_string(), json!(true));
+  obj.insert("incremental".to_string(), json!(true));
+  obj.insert(
+    "tsBuildInfoFile".to_string(),
+    json!("internal:///.tsbuildinfo"),
+  );
   let config = serde_json::to_string(&json!({
     "compilerOptions": config,
     "files": root_names,
@@ -92,9 +101,18 @@ fn exec_request_inner(
   request: Request,
   root_names: Vec<String>,
   root_map: HashMap<String, ModuleSpecifier>,
-  remapped_specifiers: HashMap<String, ModuleSpecifier>,
+  mut remapped_specifiers: HashMap<String, ModuleSpecifier>,
   tsgo_path: &Path,
 ) -> Result<Response, ExecError> {
+  // Build resolution preload before constructing the handler,
+  // since resolve_specifier_for_tsc mutates remapped_specifiers
+  let preload = build_resolution_preload(
+    &request.graph,
+    request.maybe_npm.as_ref(),
+    &mut remapped_specifiers,
+    &root_map,
+  );
+
   let handler = Handler::new(
     "/virtual/tsconfig.json".to_string(),
     synthetic_config(request.config.as_ref(), &root_names, request.check_mode)?,
@@ -122,6 +140,18 @@ fn exec_request_inner(
     })?,
   )?;
 
+  // Send preloaded resolution data so tsgo can resolve locally.
+  // If the tsgo binary doesn't support this, we fall back to per-resolution
+  // IPC callbacks (the old behavior).
+  let preload_json = serde_json::to_string(&preload)?;
+  log::debug!("preloadResolutions payload: {:.2} MB", preload_json.len() as f64 / (1024.0 * 1024.0));
+  if let Err(err) = channel.request_sync(
+    "preloadResolutions",
+    preload_json,
+  ) {
+    log::debug!("Failed to send preloadResolutions: {err}");
+  }
+
   let project = channel.request_sync(
     "loadProject",
     jsons!({
@@ -135,20 +165,34 @@ fn exec_request_inner(
   } else {
     Vec::new()
   };
-  let diagnostics = channel.request_sync(
-    "getDiagnostics",
+
+  let result = channel.request_sync(
+    "getIncrementalDiagnostics",
     jsons!({
       "project": &project.id,
       "fileNames": file_names,
+      "buildInfo": request.maybe_tsbuildinfo,
     })?,
   )?;
-  let diagnostics = deser::<
-    Vec<deno_typescript_go_client_rust::types::Diagnostic>,
-  >(diagnostics)?;
+  let result = deser::<
+    deno_typescript_go_client_rust::types::IncrementalDiagnosticsResult,
+  >(result)?;
+
+  let (bytes_read, bytes_written, msgs_read, msgs_written) =
+    channel.io_stats();
+  log::debug!(
+    "tsgo IPC stats: read {:.2} MB ({} msgs), wrote {:.2} MB ({} msgs), total {:.2} MB",
+    bytes_read as f64 / (1024.0 * 1024.0),
+    msgs_read,
+    bytes_written as f64 / (1024.0 * 1024.0),
+    msgs_written,
+    (bytes_read + bytes_written) as f64 / (1024.0 * 1024.0),
+  );
+  channel.callback_handler().log_callback_stats();
 
   Ok(Response {
-    diagnostics: convert_diagnostics(diagnostics),
-    maybe_tsbuildinfo: None,
+    diagnostics: convert_diagnostics(result.diagnostics),
+    maybe_tsbuildinfo: result.build_info,
     ambient_modules: vec![],
     stats: super::Stats::default(),
   })
@@ -300,6 +344,7 @@ impl Handler {
         maybe_npm,
         module_kind_map: HashMap::new(),
         load_result_pending: HashMap::new(),
+        callback_stats: HashMap::new(),
       }),
     }
   }
@@ -357,6 +402,12 @@ fn append_raw_import_fragment(specifier: &mut String, raw_kind: &str) {
   }
 }
 
+struct CallbackStats {
+  call_count: u64,
+  request_bytes: u64,
+  response_bytes: u64,
+}
+
 struct HandlerState {
   config_path: String,
   synthetic_config: String,
@@ -371,6 +422,7 @@ struct HandlerState {
     HashMap<String, deno_typescript_go_client_rust::types::ResolutionMode>,
 
   load_result_pending: HashMap<String, LoadResult>,
+  callback_stats: HashMap<String, CallbackStats>,
 }
 
 impl deno_typescript_go_client_rust::CallbackHandler for Handler {
@@ -392,7 +444,51 @@ impl deno_typescript_go_client_rust::CallbackHandler for Handler {
     name: &str,
     payload: String,
   ) -> Result<String, deno_typescript_go_client_rust::Error> {
+    let request_bytes = payload.len() as u64;
     let mut state = self.state.borrow_mut();
+    let result = Self::handle_callback_inner(&mut state, name, payload);
+    if let Ok(ref response) = result {
+      let stats = state
+        .callback_stats
+        .entry(name.to_string())
+        .or_insert_with(|| CallbackStats {
+          call_count: 0,
+          request_bytes: 0,
+          response_bytes: 0,
+        });
+      stats.call_count += 1;
+      stats.request_bytes += request_bytes;
+      stats.response_bytes += response.len() as u64;
+    }
+    result
+  }
+}
+
+impl Handler {
+  fn log_callback_stats(&self) {
+    let state = self.state.borrow();
+    if state.callback_stats.is_empty() {
+      return;
+    }
+    let mut entries: Vec<_> = state.callback_stats.iter().collect();
+    entries.sort_by(|a, b| b.1.response_bytes.cmp(&a.1.response_bytes));
+    let mut msg = String::from("tsgo callback stats:\n");
+    for (name, stats) in &entries {
+      msg.push_str(&format!(
+        "  {name}: {calls} calls, req {req:.2} MB, resp {resp:.2} MB\n",
+        calls = stats.call_count,
+        req = stats.request_bytes as f64 / (1024.0 * 1024.0),
+        resp = stats.response_bytes as f64 / (1024.0 * 1024.0),
+      ));
+    }
+    log::debug!("{msg}");
+  }
+
+  fn handle_callback_inner(
+    mut state: &mut HandlerState,
+    name: &str,
+    payload: String,
+  ) -> Result<String, deno_typescript_go_client_rust::Error> {
     match name {
       "readFile" => {
         log::debug!("readFile: {}", payload);
@@ -641,6 +737,234 @@ pub enum ExecError {
   #[class(generic)]
   #[error(transparent)]
   LoadError(#[from] super::LoadError),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreloadedResolution {
+  resolved_file_name: String,
+  extension: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreloadedFileData {
+  resolutions: HashMap<String, PreloadedResolution>,
+  module_kind: Option<deno_typescript_go_client_rust::types::ResolutionMode>,
+  is_node_source: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolutionPreload {
+  files: HashMap<String, PreloadedFileData>,
+}
+
+/// Compute the tsgo-visible path for a module specifier.
+/// This applies the same mapping as used for root names and resolve results.
+fn specifier_to_tsgo_path(
+  specifier: &ModuleSpecifier,
+  media_type: MediaType,
+  remapped_specifiers: &mut HashMap<String, ModuleSpecifier>,
+) -> String {
+  match specifier.scheme() {
+    "data" | "blob" => {
+      let specifier_str = super::hash_url(specifier, media_type);
+      remapped_specifiers
+        .insert(specifier_str.clone(), specifier.clone());
+      specifier_str
+    }
+    _ => {
+      if let Some(new_specifier) =
+        super::mapped_specifier_for_tsc(specifier, media_type)
+      {
+        remapped_specifiers
+          .insert(new_specifier.clone(), specifier.clone());
+        new_specifier
+      } else {
+        specifier.to_string()
+      }
+    }
+  }
+}
+
+/// Walk the module graph and precompute all resolution data that tsgo
+/// will need, so it can resolve locally without IPC round-trips.
+fn build_resolution_preload(
+  graph: &ModuleGraph,
+  maybe_npm: Option<&RequestNpmState>,
+  remapped_specifiers: &mut HashMap<String, ModuleSpecifier>,
+  root_map: &HashMap<String, ModuleSpecifier>,
+) -> ResolutionPreload {
+  let mut files: HashMap<String, PreloadedFileData> = HashMap::new();
+
+  for module in graph.modules() {
+    let (specifier, media_type) = match module {
+      Module::Js(m) => (&m.specifier, m.media_type),
+      Module::Wasm(m) => (&m.specifier, MediaType::Dmts),
+      Module::Json(m) => (&m.specifier, m.media_type),
+      Module::Npm(_) | Module::Node(_) | Module::External(_) => continue,
+    };
+
+    // Compute the tsgo-visible path for this module
+    let tsgo_path =
+      specifier_to_tsgo_path(specifier, media_type, remapped_specifiers);
+
+    // Determine if this is a node source file
+    let is_node_source = maybe_npm
+      .map(|npm| npm.node_resolver.in_npm_package(specifier))
+      .unwrap_or(false);
+
+    // Compute module kind (ESM/CJS)
+    let module_kind = match module {
+      Module::Js(m) => {
+        let is_cjs = maybe_npm
+          .and_then(|npm| {
+            npm
+              .cjs_tracker
+              .is_cjs_with_known_is_script(specifier, m.media_type, m.is_script)
+              .ok()
+          })
+          .unwrap_or(false);
+        Some(get_resolution_mode(is_cjs, m.media_type))
+      }
+      Module::Wasm(_) => {
+        Some(deno_typescript_go_client_rust::types::ResolutionMode::ESM)
+      }
+      Module::Json(_) => {
+        Some(deno_typescript_go_client_rust::types::ResolutionMode::None)
+      }
+      _ => None,
+    };
+
+    // Build resolution map for dependencies
+    let mut resolutions = HashMap::new();
+
+    // Get Wasm dependencies separately since we can't borrow from the
+    // Module enum variant inside the match arm above
+    let wasm_deps;
+    let dep_iter: Option<&indexmap::IndexMap<String, deno_graph::Dependency>> =
+      match module {
+        Module::Js(m) => Some(m.dependencies_prefer_fast_check()),
+        Module::Wasm(m) => {
+          wasm_deps = &m.dependencies;
+          Some(wasm_deps)
+        }
+        _ => None,
+      };
+
+    if let Some(deps) = dep_iter {
+      for (dep_specifier, dep) in deps {
+        let referrer_module = graph.get(specifier);
+        match super::resolve_specifier_for_tsc(
+          dep_specifier.clone(),
+          specifier,
+          graph,
+          ResolutionMode::Import, // default; tsgo will pass the actual mode
+          maybe_npm,
+          referrer_module,
+          remapped_specifiers,
+        ) {
+          Ok((resolved_file_name, extension)) => {
+            // Collect unique attribute types from individual imports.
+            // The same specifier can be imported with different attributes
+            // (e.g., `import "./foo.ts"` and `import "./foo.ts" with { type: "bytes" }`),
+            // so we need to store separate preload entries for each variant.
+            let mut attr_types = HashSet::new();
+            for import in &dep.imports {
+              attr_types.insert(import.attributes.get("type"));
+            }
+            // If no imports tracked (shouldn't happen), use maybe_attribute_type
+            if attr_types.is_empty() {
+              attr_types.insert(dep.maybe_attribute_type.as_deref());
+            }
+
+            for attr_type in &attr_types {
+              let mut resolved_name = resolved_file_name.clone();
+              let mut ext = extension;
+              let key = if let Some(attr_type) = attr_type
+                && matches!(*attr_type, "text" | "bytes")
+              {
+                append_raw_import_fragment(
+                  &mut resolved_name,
+                  attr_type,
+                );
+                ext = Some("ts");
+                // Use composite key: specifier + \0 + attribute_type
+                format!("{}\0{}", dep_specifier, attr_type)
+              } else {
+                dep_specifier.clone()
+              };
+              resolutions.insert(
+                key,
+                PreloadedResolution {
+                  resolved_file_name: resolved_name,
+                  extension: ext,
+                },
+              );
+            }
+          }
+          Err(err) => {
+            log::debug!(
+              "Failed to preload resolution for {} from {}: {}",
+              dep_specifier,
+              specifier,
+              err
+            );
+          }
+        }
+      }
+    }
+
+    files.insert(
+      tsgo_path,
+      PreloadedFileData {
+        resolutions,
+        module_kind,
+        is_node_source,
+      },
+    );
+  }
+
+  // Also add root_map entries (reverse mapping for root files that got mapped)
+  // so tsgo can look up by the original specifier too
+  for (mapped_path, original_specifier) in root_map {
+    if !files.contains_key(mapped_path) {
+      if let Some(module) = graph.get(original_specifier) {
+        let is_node_source = maybe_npm
+          .map(|npm| npm.node_resolver.in_npm_package(original_specifier))
+          .unwrap_or(false);
+        let module_kind = match module {
+          Module::Js(m) => {
+            let is_cjs = maybe_npm
+              .and_then(|npm| {
+                npm
+                  .cjs_tracker
+                  .is_cjs_with_known_is_script(
+                    original_specifier,
+                    m.media_type,
+                    m.is_script,
+                  )
+                  .ok()
+              })
+              .unwrap_or(false);
+            Some(get_resolution_mode(is_cjs, m.media_type))
+          }
+          _ => None,
+        };
+        files.insert(
+          mapped_path.clone(),
+          PreloadedFileData {
+            resolutions: HashMap::new(),
+            module_kind,
+            is_node_source,
+          },
+        );
+      }
+    }
+  }
+
+  ResolutionPreload { files }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -188,6 +188,20 @@ impl<T: CallbackHandler> SyncRpcChannel<T> {
     }
   }
 
+  /// Returns (bytes_read, bytes_written, messages_read, messages_written).
+  pub fn io_stats(&self) -> (u64, u64, u64, u64) {
+    (
+      self.conn.bytes_read,
+      self.conn.bytes_written,
+      self.conn.message_count_read,
+      self.conn.message_count_written,
+    )
+  }
+
+  pub fn callback_handler(&self) -> &T {
+    &self.callback_handler
+  }
+
   // Closes the channel, terminating its underlying process.
   pub fn close(&mut self) -> Result<(), Error> {
     self.child.kill().map_err(Error::ProcessKill)?;

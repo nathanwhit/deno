@@ -12,11 +12,22 @@ use std::io::{self};
 pub struct RpcConnection<R: BufRead, W: Write> {
   reader: R,
   writer: W,
+  pub bytes_read: u64,
+  pub bytes_written: u64,
+  pub message_count_read: u64,
+  pub message_count_written: u64,
 }
 
 impl<R: BufRead, W: Write> RpcConnection<R, W> {
   pub fn new(reader: R, writer: W) -> Result<Self> {
-    Ok(Self { reader, writer })
+    Ok(Self {
+      reader,
+      writer,
+      bytes_read: 0,
+      bytes_written: 0,
+      message_count_read: 0,
+      message_count_written: 0,
+    })
   }
 
   pub fn write(&mut self, ty: u8, name: &[u8], payload: &[u8]) -> Result<()> {
@@ -26,6 +37,9 @@ impl<R: BufRead, W: Write> RpcConnection<R, W> {
     rmp::encode::write_bin(w, name)?;
     rmp::encode::write_bin(w, payload)?;
     w.flush()?;
+    // ~10 bytes msgpack framing overhead per message
+    self.bytes_written += 10 + name.len() as u64 + payload.len() as u64;
+    self.message_count_written += 1;
     Ok(())
   }
 
@@ -36,11 +50,13 @@ impl<R: BufRead, W: Write> RpcConnection<R, W> {
       3,
       "Message components must be a valid 3-part messagepack array."
     );
-    Ok((
-      rmp::decode::read_int(r).map_err(to_io)?,
-      self.read_bin()?,
-      self.read_bin()?,
-    ))
+    let ty = rmp::decode::read_int(r).map_err(to_io)?;
+    let name = self.read_bin()?;
+    let payload = self.read_bin()?;
+    // ~10 bytes msgpack framing overhead per message
+    self.bytes_read += 10 + name.len() as u64 + payload.len() as u64;
+    self.message_count_read += 1;
+    Ok((ty, name, payload))
   }
 
   fn read_bin(&mut self) -> Result<Vec<u8>> {

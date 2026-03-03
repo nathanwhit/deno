@@ -133,3 +133,10 @@ pub struct GetImpliedNodeFormatForFilePayload {
   pub file_name: String,
   pub package_json_type: String,
 }
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IncrementalDiagnosticsResult {
+  pub diagnostics: Vec<Diagnostic>,
+  pub build_info: Option<String>,
+}
