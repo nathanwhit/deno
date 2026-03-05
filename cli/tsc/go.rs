@@ -178,18 +178,6 @@ fn exec_request_inner(
     deno_typescript_go_client_rust::types::IncrementalDiagnosticsResult,
   >(result)?;
 
-  let (bytes_read, bytes_written, msgs_read, msgs_written) =
-    channel.io_stats();
-  log::debug!(
-    "tsgo IPC stats: read {:.2} MB ({} msgs), wrote {:.2} MB ({} msgs), total {:.2} MB",
-    bytes_read as f64 / (1024.0 * 1024.0),
-    msgs_read,
-    bytes_written as f64 / (1024.0 * 1024.0),
-    msgs_written,
-    (bytes_read + bytes_written) as f64 / (1024.0 * 1024.0),
-  );
-  channel.callback_handler().log_callback_stats();
-
   Ok(Response {
     diagnostics: convert_diagnostics(result.diagnostics),
     maybe_tsbuildinfo: result.build_info,
@@ -344,7 +332,6 @@ impl Handler {
         maybe_npm,
         module_kind_map: HashMap::new(),
         load_result_pending: HashMap::new(),
-        callback_stats: HashMap::new(),
       }),
     }
   }
@@ -402,12 +389,6 @@ fn append_raw_import_fragment(specifier: &mut String, raw_kind: &str) {
   }
 }
 
-struct CallbackStats {
-  call_count: u64,
-  request_bytes: u64,
-  response_bytes: u64,
-}
-
 struct HandlerState {
   config_path: String,
   synthetic_config: String,
@@ -422,7 +403,6 @@ struct HandlerState {
     HashMap<String, deno_typescript_go_client_rust::types::ResolutionMode>,
 
   load_result_pending: HashMap<String, LoadResult>,
-  callback_stats: HashMap<String, CallbackStats>,
 }
 
 impl deno_typescript_go_client_rust::CallbackHandler for Handler {
@@ -444,46 +424,12 @@ impl deno_typescript_go_client_rust::CallbackHandler for Handler {
     name: &str,
     payload: String,
   ) -> Result<String, deno_typescript_go_client_rust::Error> {
-    let request_bytes = payload.len() as u64;
     let mut state = self.state.borrow_mut();
-    let result = Self::handle_callback_inner(&mut state, name, payload);
-    if let Ok(ref response) = result {
-      let stats = state
-        .callback_stats
-        .entry(name.to_string())
-        .or_insert_with(|| CallbackStats {
-          call_count: 0,
-          request_bytes: 0,
-          response_bytes: 0,
-        });
-      stats.call_count += 1;
-      stats.request_bytes += request_bytes;
-      stats.response_bytes += response.len() as u64;
-    }
-    result
+    Self::handle_callback_inner(&mut state, name, payload)
   }
 }
 
 impl Handler {
-  fn log_callback_stats(&self) {
-    let state = self.state.borrow();
-    if state.callback_stats.is_empty() {
-      return;
-    }
-    let mut entries: Vec<_> = state.callback_stats.iter().collect();
-    entries.sort_by(|a, b| b.1.response_bytes.cmp(&a.1.response_bytes));
-    let mut msg = String::from("tsgo callback stats:\n");
-    for (name, stats) in &entries {
-      msg.push_str(&format!(
-        "  {name}: {calls} calls, req {req:.2} MB, resp {resp:.2} MB\n",
-        calls = stats.call_count,
-        req = stats.request_bytes as f64 / (1024.0 * 1024.0),
-        resp = stats.response_bytes as f64 / (1024.0 * 1024.0),
-      ));
-    }
-    log::debug!("{msg}");
-  }
-
   fn handle_callback_inner(
     mut state: &mut HandlerState,
     name: &str,
