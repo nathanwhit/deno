@@ -67,6 +67,7 @@ use self::util::env::resolve_cwd;
 use crate::args::CompletionsFlags;
 use crate::args::DenoSubcommand;
 use crate::args::Flags;
+use crate::args::JitProfMode;
 use crate::args::flags_from_vec_with_initial_cwd;
 use crate::args::get_default_v8_flags;
 use crate::util::display;
@@ -868,7 +869,31 @@ fn init_v8(flags: &Flags) {
     .iter()
     .chain(&flags.v8_flags)
     .any(|flag| flag == "--single-threaded");
-  init_v8_flags(&default_v8_flags, &flags.v8_flags, env_v8_flags);
+  let v8_flags = if let Some(jit_prof) = flags.jit_prof.as_ref() {
+    let mut v = flags.v8_flags.clone();
+    match jit_prof.mode {
+      JitProfMode::Map => {
+        // Writes /tmp/perf-<pid>.map (path controlled by
+        // --perf-basic-prof-path). `-only-functions` skips stubs to keep
+        // the map small. `--perf-prof-unwinding-info` lets samply/perf
+        // unwind past JIT'd frames into native code on Linux (no-op
+        // elsewhere, but V8 accepts the flag cross-platform).
+        v.push("--perf-basic-prof".to_string());
+        v.push("--perf-basic-prof-only-functions".to_string());
+        v.push("--perf-prof-unwinding-info".to_string());
+      }
+      JitProfMode::Jitdump => {
+        // Writes jit-<pid>.dump to cwd (override with
+        // --v8-flags=--perf-prof-path=<dir>).
+        v.push("--perf-prof".to_string());
+        v.push("--perf-prof-unwinding-info".to_string());
+      }
+    }
+    v
+  } else {
+    flags.v8_flags.clone()
+  };
+  init_v8_flags(&default_v8_flags, &v8_flags, env_v8_flags);
   let v8_platform = if is_single_threaded {
     Some(::deno_core::v8::Platform::new_single_threaded(true).make_shared())
   } else {

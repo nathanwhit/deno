@@ -288,6 +288,20 @@ pub struct CpuProfFlags {
   pub flamegraph: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum JitProfMode {
+  /// Emit `/tmp/perf-<pid>.map` (portable, what samply reads on macOS too).
+  #[default]
+  Map,
+  /// Emit a Linux jitdump file with line-number info (richer, Linux-only).
+  Jitdump,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct JitProfFlags {
+  pub mode: JitProfMode,
+}
+
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct EvalFlags {
   pub print: bool,
@@ -960,6 +974,7 @@ pub struct Flags {
   pub require: Vec<String>,
   pub tunnel: bool,
   pub cpu_prof: Option<CpuProfFlags>,
+  pub jit_prof: Option<JitProfFlags>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
@@ -5674,6 +5689,7 @@ fn cpu_prof_args(cmd: Command) -> Command {
     .arg(cpu_prof_interval_arg())
     .arg(cpu_prof_md_arg())
     .arg(cpu_prof_flamegraph_arg())
+    .arg(jit_prof_arg())
 }
 
 fn cpu_prof_parse(matches: &mut ArgMatches) -> Option<CpuProfFlags> {
@@ -5700,6 +5716,15 @@ fn cpu_prof_parse(matches: &mut ArgMatches) -> Option<CpuProfFlags> {
   } else {
     None
   }
+}
+
+fn jit_prof_parse(matches: &mut ArgMatches) -> Option<JitProfFlags> {
+  let mode = matches.remove_one::<String>("jit-prof")?;
+  let mode = match mode.as_str() {
+    "jitdump" => JitProfMode::Jitdump,
+    _ => JitProfMode::Map,
+  };
+  Some(JitProfFlags { mode })
 }
 
 fn cpu_prof_arg() -> Arg {
@@ -5746,6 +5771,20 @@ fn cpu_prof_flamegraph_arg() -> Arg {
     .long("cpu-prof-flamegraph")
     .help("Generate an SVG flamegraph alongside the CPU profile")
     .action(ArgAction::SetTrue)
+}
+
+fn jit_prof_arg() -> Arg {
+  Arg::new("jit-prof")
+    .long("jit-prof")
+    .value_name("MODE")
+    .num_args(0..=1)
+    .require_equals(true)
+    .default_missing_value("map")
+    .value_parser(["map", "jitdump"])
+    .help(cstr!("Emit JIT symbol info for external sampling profilers (e.g. samply, perf) so JS frames resolve to function names instead of raw addresses.
+  <p(245)>map      </>Write <c>/tmp/perf-<<pid>>.map</> (simple addr→name table). [default]
+  <p(245)>jitdump  </>Write <c>jit-<<pid>>.dump</> in the current directory (richer format with line-number info).
+  <p(245)>Both modes work on Linux and macOS. If MODE is omitted, defaults to <c>map</>."))
 }
 
 fn permit_no_files_arg() -> Arg {
@@ -6613,6 +6652,7 @@ fn eval_parse(
 
   ext_arg_parse(flags, matches);
   flags.cpu_prof = cpu_prof_parse(matches);
+  flags.jit_prof = jit_prof_parse(matches);
 
   let print = matches.get_flag("print");
   let mut code_args = matches.remove_many::<String>("code_arg").unwrap();
@@ -7187,6 +7227,7 @@ fn run_parse(
   flags.code_cache_enabled = !matches.get_flag("no-code-cache");
   let coverage_dir = matches.remove_one::<String>("coverage");
   flags.cpu_prof = cpu_prof_parse(matches);
+  flags.jit_prof = jit_prof_parse(matches);
 
   match matches.remove_many::<String>("script_arg") {
     Some(mut script_arg) => {
@@ -7254,6 +7295,7 @@ fn serve_parse(
 
   ext_arg_parse(flags, matches);
   flags.cpu_prof = cpu_prof_parse(matches);
+  flags.jit_prof = jit_prof_parse(matches);
 
   flags.subcommand = DenoSubcommand::Serve(ServeFlags {
     script,
