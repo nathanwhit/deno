@@ -40,6 +40,7 @@ pub use resolution::REQUIRE_CONDITIONS;
 pub use resolution::ResolutionMode;
 pub use resolution::is_binary;
 pub use resolution::parse_npm_pkg_name;
+pub use resolution::path_is_native_binary;
 pub use resolution::read_bin_value;
 pub use resolution::resolve_specifier_into_node_modules;
 pub use resolution::types_package_name;

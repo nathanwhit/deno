@@ -2729,6 +2729,17 @@ pub fn is_binary(data: &[u8]) -> bool {
   is_elf(data) || is_macho(data) || is_pe(data)
 }
 
+/// Returns whether the file at `path` is a native binary (ELF/Mach-O/PE)
+/// based on its magic bytes. Returns `Ok(false)` if the file is shorter than
+/// the magic-byte window or doesn't match a known format.
+pub fn path_is_native_binary(path: &Path) -> std::io::Result<bool> {
+  use std::io::Read;
+  let mut file = std::fs::File::open(path)?;
+  let mut buf = [0u8; 4];
+  let n = file.read(&mut buf)?;
+  Ok(n >= 4 && is_binary(&buf))
+}
+
 // vendored from libsui because they're super small
 /// Check if the given data is an ELF64 binary
 fn is_elf(data: &[u8]) -> bool {

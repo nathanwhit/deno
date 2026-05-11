@@ -591,13 +591,7 @@ fn resolve_native_binary_path(
   // generate an `exec`-the-file shim instead of a `deno run` shim. On
   // Windows there is no shebang interpretation, so that breaks installs of
   // ordinary npm packages whose bin scripts use a non-Node shebang.
-  use std::io::Read;
-  let mut file = std::fs::File::open(&bin_path).ok()?;
-  let mut buf = [0u8; 4];
-  if file.read(&mut buf).ok()? < 4 {
-    return None;
-  }
-  if node_resolver::is_binary(&buf) {
+  if node_resolver::path_is_native_binary(&bin_path).ok()? {
     Some(bin_path)
   } else {
     None
