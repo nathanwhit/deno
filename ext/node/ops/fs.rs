@@ -243,6 +243,23 @@ pub struct NodeFsErrorContext {
   syscall: Option<String>,
 }
 
+impl NodeFsErrorContext {
+  // Public constructor for ops outside this crate (runtime's fs.watch ops)
+  // that need to build fully-formed node fs errors.
+  pub fn new_syscall_path(syscall: &str, path: &str) -> Self {
+    Self {
+      syscall: Some(syscall.to_string()),
+      path: Some(path.to_string()),
+      ..Default::default()
+    }
+  }
+
+  pub fn with_message(mut self, message: String) -> Self {
+    self.message = Some(message);
+    self
+  }
+}
+
 // Maps a raw OS errno to its libuv error-code name (e.g. `ENOENT`). On unix
 // the OS errno is matched directly via `libc`; on windows the value is a Win32
 // error code translated by libuv's table. Returns `"UNKNOWN"` when unmapped.
@@ -488,7 +505,7 @@ impl NodeFsError {
 
   // Builds the fully-formed node error from a raw OS errno, so ops can throw
   // the final error without a JS round-trip.
-  fn new(os_errno: i32, context: NodeFsErrorContext) -> Self {
+  pub fn new(os_errno: i32, context: NodeFsErrorContext) -> Self {
     let code = os_errno_to_uv_code(os_errno);
     let (_, win_errno) = uv_code_info(code);
     let errno = if cfg!(windows) { win_errno } else { -os_errno };
@@ -497,7 +514,7 @@ impl NodeFsError {
 
   // Builds a node error from a uv code name directly (for synthetic errors not
   // backed by a real OS error).
-  fn from_code(code: &'static str, context: NodeFsErrorContext) -> Self {
+  pub fn from_code(code: &'static str, context: NodeFsErrorContext) -> Self {
     let (_, win_errno) = uv_code_info(code);
     #[cfg(windows)]
     let errno = win_errno;
@@ -622,6 +639,9 @@ fn invalid_arg_type_helper(
     } else {
       format!("Symbol({})", desc.to_rust_string_lossy(scope))
     }
+  } else if actual.is_big_int() {
+    // inspect renders bigints with the literal `n` suffix.
+    format!("{}n", actual.to_rust_string_lossy(scope))
   } else {
     actual.to_rust_string_lossy(scope)
   };
@@ -954,8 +974,14 @@ fn fmt_num(n: f64) -> String {
   if n.is_infinite() {
     return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
   }
-  if n.fract() == 0.0 && n.abs() < 9e15 {
-    let s = format!("{}", n as i64);
+  if n.fract() == 0.0 && n.abs() < 1e21 {
+    // JS `String()` keeps integers below 1e21 in decimal notation; values at
+    // or above 2**63 need the float formatter to render their digits.
+    let s = if n.abs() < 9.2e18 {
+      format!("{}", n as i64)
+    } else {
+      format!("{n:.0}")
+    };
     // node's ERR_OUT_OF_RANGE adds `_` thousands separators when an integer
     // value's magnitude exceeds 2**32.
     if n.abs() > 4294967296.0 {
@@ -1388,6 +1414,9 @@ pub fn op_node_open(
   let open_options = options;
 
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let file = fs
       .open_async(path, open_options)
       .await
@@ -1414,13 +1443,15 @@ pub fn op_node_open(
     Ok(fd)
   })
 }
-// `fs.statfs` result: an object with the 7 statfs fields, all Numbers or all
-// BigInts per the `bigint` option (node's StatFs has no methods, only own
-// data properties).
+// `fs.statfs` result: a cppgc `StatFs` (so `constructor.name` is "StatFs"
+// like node's class) carrying the 8 statfs fields as OWN data properties, all
+// Numbers or all BigInts per the `bigint` option (node's StatFs has no
+// methods, only own data properties assigned in its constructor).
 #[derive(Debug)]
 pub struct StatFs {
   pub typ: u64,
   pub bsize: u64,
+  pub frsize: u64,
   pub blocks: u64,
   pub bfree: u64,
   pub bavail: u64,
@@ -1429,30 +1460,47 @@ pub struct StatFs {
   pub bigint: bool,
 }
 
+// SAFETY: StatFs holds only plain data, safe to GC.
+unsafe impl GarbageCollected for StatFs {
+  fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"StatFs"
+  }
+}
+
+// No methods: node's StatFs prototype only has `constructor`. The empty op2
+// impl registers the class template (for the prototype + class name).
+#[op2]
+impl StatFs {}
+
 impl<'a> ToV8<'a> for StatFs {
   type Error = std::convert::Infallible;
   fn to_v8(
     self,
     scope: &mut v8::PinScope<'a, '_>,
   ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
-    let fields: [(&str, u64); 7] = [
+    // node's StatFs constructor assignment order.
+    let fields: [(&str, u64); 8] = [
       ("type", self.typ),
       ("bsize", self.bsize),
+      ("frsize", self.frsize),
       ("blocks", self.blocks),
       ("bfree", self.bfree),
       ("bavail", self.bavail),
       ("files", self.files),
       ("ffree", self.ffree),
     ];
-    let obj = v8::Object::new(scope);
+    let bigint = self.bigint;
+    let obj = deno_core::cppgc::make_cppgc_object(scope, self);
     for (name, value) in fields {
       let key = intern_key(scope, name);
-      let val: v8::Local<v8::Value> = if self.bigint {
+      let val: v8::Local<v8::Value> = if bigint {
         v8::BigInt::new_from_u64(scope, value).into()
       } else {
         v8::Number::new(scope, value as f64).into()
       };
-      obj.set(scope, key.into(), val);
+      obj.create_data_property(scope, key.into(), val);
     }
     Ok(obj.into())
   }
@@ -1463,6 +1511,7 @@ impl StatFs {
     StatFs {
       typ: s.typ,
       bsize: s.bsize,
+      frsize: s.frsize,
       blocks: s.blocks,
       bfree: s.bfree,
       bavail: s.bavail,
@@ -1552,6 +1601,9 @@ pub fn op_node_statfs(
     .check_sys("statfs", "node:fs.statfs")?;
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     Ok(StatFs::from_fs(
       fs.statfs_async(checked, bigint)
         .await
@@ -1562,6 +1614,7 @@ pub fn op_node_statfs(
 }
 
 #[op2(fast, stack_trace)]
+#[undefined]
 pub fn op_node_lutimes_sync(
   scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
@@ -1609,6 +1662,9 @@ pub fn op_node_lutimes(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.lutime_async(checked, atime_secs, atime_nanos, mtime_secs, mtime_nanos)
       .await
       .map_err(|e| node_fs_err(e, "utime", &path))?;
@@ -1659,6 +1715,9 @@ pub fn op_node_lchown(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.lchown_async(checked, Some(uid), Some(gid))
       .await
       .map_err(|e| node_fs_err(e, "lchown", &path))?;
@@ -1705,6 +1764,9 @@ pub fn op_node_lchmod(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.lchmod_async(checked, mode)
       .await
       .map_err(|e| node_fs_err(e, "lchmod", &path))?;
@@ -1843,6 +1905,9 @@ pub fn op_node_mkdtemp(
     )
   };
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     // https://github.com/nodejs/node/blob/2ea31e53c61463727c002c2d862615081940f355/deps/uv/src/unix/os390-syscalls.c#L409
     for _ in 0..libc::TMP_MAX {
       let candidate = temp_path_append_suffix(&prefix);
@@ -1946,7 +2011,9 @@ pub fn op_node_rmdir(
   scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
   path: v8::Local<v8::Value>,
+  options: v8::Local<v8::Value>,
 ) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
+  validate_rmdir_options(scope, options)?;
   let path = validate_path_to_string(scope, path, "path")?;
   let checked = state
     .borrow_mut::<PermissionsContainer>()
@@ -1958,6 +2025,9 @@ pub fn op_node_rmdir(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.rmdir_async(checked)
       .await
       .map_err(|e| node_fs_err(e, "rmdir", &path))?;
@@ -2145,40 +2215,255 @@ pub fn op_node_fs_close_async(
   })
 }
 
-/// Read from a raw OS fd using libc. No dup, no clone -- the read uses the
-/// fd number directly, so closing the fd from another thread interrupts the
 /// Positioned read: if position >= 0, uses pread to read without moving the
-/// file cursor. If position < 0, reads from the current position.
+/// file cursor. If position < 0, reads from the current position. Errors are
+/// node-formatted with syscall "read".
 fn read_with_position(
   file: Rc<dyn deno_io::fs::File>,
   buf: &mut [u8],
   position: i64,
 ) -> Result<u32, FsError> {
-  if position >= 0 {
-    let nread = file.read_at_sync(buf, position as u64)?;
-    Ok(nread as u32)
+  let nread = if position >= 0 {
+    file.read_at_sync(buf, position as u64)
   } else {
-    let nread = file.read_sync(buf)?;
-    Ok(nread as u32)
+    file.read_sync(buf)
+  }
+  .map_err(|e| fd_syscall_err(e, "read"))?;
+  Ok(nread as u32)
+}
+
+// `Array.isArray`: true for arrays and (recursively) for proxies whose
+// ultimate target is an array -- node's `validateObject` rejects a proxied
+// array as an options bag (test-fs-readSync-optional-params).
+fn js_is_array(
+  scope: &mut v8::PinScope<'_, '_>,
+  value: v8::Local<v8::Value>,
+) -> bool {
+  let mut v = value;
+  loop {
+    if v.is_array() {
+      return true;
+    }
+    match v8::Local::<v8::Proxy>::try_from(v) {
+      Ok(p) => v = p.get_target(scope),
+      Err(_) => return false,
+    }
   }
 }
 
-#[op2(fast)]
-#[smi]
-pub fn op_node_fs_read_sync(
-  state: &mut OpState,
-  fd: i32,
-  #[buffer] buf: &mut [u8],
-  #[bigint] position: i64,
-) -> Result<u32, FsError> {
-  let file = file_for_fd(state, fd)?;
-  read_with_position(file, buf, position)
+// node's `validateObject(value, name, kValidateObjectAllowNullable)`: `null`
+// passes; arrays (Proxy-pierced, like `ArrayIsArray`), functions, and
+// non-objects are ERR_INVALID_ARG_TYPE "object".
+fn validate_object_nullable(
+  scope: &mut v8::PinScope<'_, '_>,
+  value: v8::Local<v8::Value>,
+  name: &str,
+) -> Result<(), FsError> {
+  if value.is_null() {
+    return Ok(());
+  }
+  if js_is_array(scope, value) || value.is_function() || !value.is_object() {
+    return Err(err_invalid_arg_type(scope, name, &["object"], value).into());
+  }
+  Ok(())
 }
 
-/// Async read for node:fs. Runs a blocking read on a spawned thread using
-/// the raw OS fd directly (no dup/clone). When the fd is closed via
+// Replicates `validateOffsetLengthRead(offset, length, bufferLength)`.
+fn validate_offset_length_read(
+  offset: i64,
+  length: i64,
+  buffer_length: i64,
+) -> Result<(), FsError> {
+  if offset < 0 {
+    return Err(err_oor_int("offset", ">= 0", offset).into());
+  }
+  if length < 0 {
+    return Err(err_oor_int("length", ">= 0", length).into());
+  }
+  if offset + length > buffer_length {
+    return Err(
+      err_oor_int("length", &format!("<= {}", buffer_length - offset), length)
+        .into(),
+    );
+  }
+  Ok(())
+}
+
+// JS ToInt32 for an f64 already known to be in safe-integer range
+// (`buffer.byteLength - offset`): modular reduction into i32.
+fn js_to_int32_f64(d: f64) -> i32 {
+  (d as i64).rem_euclid(4294967296) as u32 as i32
+}
+
+// Resolves read's trailing `(offsetOrOptions, length, position)` per node:
+// the options form applies when `arguments.length <= 3` or `offsetOrOptions`
+// is `typeof "object"` (null included); otherwise the args are positional.
+// Validation order matches node readSync: options object-ness, then
+// `validateInteger(offset, 0)`, then `length |= 0` (ToInt32, with the options
+// default `buffer.byteLength - offset`), then `validatePosition`
+// (null/undefined -> -1; numbers are safe integers >= -1; bigints in
+// [-1, 2**63 - 1 - length]). Returns `Ok(None)` when a JS conversion (ToInt32
+// on a symbol or a throwing valueOf) left an exception pending -- the caller
+// must return immediately so it propagates.
+fn resolve_read_args(
+  scope: &mut v8::PinScope<'_, '_>,
+  view: v8::Local<v8::ArrayBufferView>,
+  arity: u32,
+  offset_or_options: v8::Local<v8::Value>,
+  length_v: v8::Local<v8::Value>,
+  position_v: v8::Local<v8::Value>,
+) -> Result<Option<(i64, i32, i64)>, FsError> {
+  let use_options = arity <= 3
+    || offset_or_options.is_null()
+    || (offset_or_options.is_object() && !offset_or_options.is_function());
+  let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
+  let (offset_raw, length_raw, position_raw) = if use_options {
+    if !offset_or_options.is_undefined() {
+      validate_object_nullable(scope, offset_or_options, "options")?;
+    }
+    if offset_or_options.is_null_or_undefined() {
+      (undefined, undefined, undefined)
+    } else {
+      let obj = v8::Local::<v8::Object>::try_from(offset_or_options).unwrap();
+      (
+        get_prop(scope, obj, "offset"),
+        get_prop(scope, obj, "length"),
+        get_prop(scope, obj, "position"),
+      )
+    }
+  } else {
+    (offset_or_options, length_v, position_v)
+  };
+
+  let offset: i64 = if offset_raw.is_undefined() {
+    0
+  } else {
+    validate_integer(scope, offset_raw, "offset", 0, MAX_SAFE_INTEGER)?
+  };
+
+  let length: i32 = if length_raw.is_undefined() {
+    if use_options {
+      js_to_int32_f64(view.byte_length() as f64 - offset as f64)
+    } else {
+      0
+    }
+  } else {
+    match length_raw.int32_value(scope) {
+      Some(n) => n,
+      // ToInt32 threw (symbol/bigint length or a throwing valueOf): bail so
+      // the pending exception propagates.
+      None => return Ok(None),
+    }
+  };
+
+  let position: i64 = if position_raw.is_null_or_undefined() {
+    -1
+  } else if position_raw.is_number() {
+    validate_integer(scope, position_raw, "position", -1, MAX_SAFE_INTEGER)?
+  } else if position_raw.is_big_int() {
+    // validatePosition's bigint arm: [-1, 2**63 - 1 - length]. `length` may
+    // be negative here (position is validated before the length range), so
+    // the bound is computed in i128.
+    let max = ((1i128 << 63) - 1) - length as i128;
+    let big = v8::Local::<v8::BigInt>::try_from(position_raw).unwrap();
+    let (v, lossless) = big.i64_value();
+    if !lossless || (v as i128) < -1 || (v as i128) > max {
+      let digits = position_raw.to_rust_string_lossy(scope);
+      // ERR_OUT_OF_RANGE bigint rendering: `_` separators past 2**32, `n`
+      // suffix.
+      let mut received = if !lossless || v.unsigned_abs() > 4294967296 {
+        add_numerical_separator(&digits)
+      } else {
+        digits
+      };
+      received.push('n');
+      return Err(
+        err_out_of_range("position", &format!(">= -1 && <= {max}"), &received)
+          .into(),
+      );
+    }
+    v
+  } else {
+    return Err(
+      err_invalid_arg_type(
+        scope,
+        "position",
+        &["bigint", "integer"],
+        position_raw,
+      )
+      .into(),
+    );
+  };
+
+  Ok(Some((offset, length, position)))
+}
+
+// `fs.readSync(fd, buffer, offsetOrOptions?, length?, position?)`: full node
+// overload resolution + validation + positioned read. `arity` is the caller's
+// `arguments.length` -- node's dispatch is arity-based (an explicit
+// `undefined` offsetOrOptions with arity > 3 selects the positional form).
+// Validation ORDER matches node: buffer first; the fd is validated LAST (at
+// the binding layer in node) and not at all when length resolves to 0.
+// Returns -1 as the "buffer is empty" sentinel -- the JS wrapper throws
+// ERR_INVALID_ARG_VALUE there, keeping util.inspect's rendering of the
+// received buffer.
+#[op2(fast, stack_trace)]
+#[smi]
+pub fn op_node_fs_read_v_sync(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  #[smi] arity: u32,
+  fd_v: v8::Local<v8::Value>,
+  buffer_v: v8::Local<v8::Value>,
+  offset_or_options: v8::Local<v8::Value>,
+  length_v: v8::Local<v8::Value>,
+  position_v: v8::Local<v8::Value>,
+) -> Result<i32, FsError> {
+  let view =
+    v8::Local::<v8::ArrayBufferView>::try_from(buffer_v).map_err(|_| {
+      err_invalid_arg_type(
+        scope,
+        "buffer",
+        &["Buffer", "TypedArray", "DataView"],
+        buffer_v,
+      )
+    })?;
+  let Some((offset, length, position)) = resolve_read_args(
+    scope,
+    view,
+    arity,
+    offset_or_options,
+    length_v,
+    position_v,
+  )?
+  else {
+    return Ok(0);
+  };
+  if length == 0 {
+    return Ok(0);
+  }
+  let byte_length = view.byte_length();
+  if byte_length == 0 {
+    return Ok(-1);
+  }
+  validate_offset_length_read(offset, length as i64, byte_length as i64)?;
+  let fd = validate_fd_value(scope, fd_v)?;
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("read"))?;
+  // SAFETY: no JS runs during this synchronous op and `buffer_v` keeps the
+  // view alive; [offset, offset + length) was just range-checked against the
+  // view, whose `data()` already includes its byte_offset.
+  let buf: &mut [u8] = unsafe {
+    std::slice::from_raw_parts_mut(
+      (view.data() as *mut u8).add(offset as usize),
+      length as usize,
+    )
+  };
+  read_with_position(file, buf, position).map(|n| n as i32)
+}
+
 /// Async read for node:fs. Uses the File trait from FdTable for proper
-/// I/O through the file handle.
+/// I/O through the file handle. Errors are node-formatted with syscall
+/// "read" (EBADF included), matching node's binding-level read errors.
 #[op2]
 #[smi]
 pub async fn op_node_fs_read_deferred(
@@ -2187,16 +2472,16 @@ pub async fn op_node_fs_read_deferred(
   #[buffer] buf: JsBuffer,
   #[bigint] position: i64,
 ) -> Result<u32, FsError> {
-  let file = file_for_fd(&state.borrow(), fd)?;
-  if position >= 0 {
-    let view = deno_core::BufMutView::from(buf);
-    let (nread, _) = file.read_at_async(view, position as u64).await?;
-    Ok(nread as u32)
+  let file =
+    file_for_fd(&state.borrow(), fd).map_err(|_| ebadf_node("read"))?;
+  let view = deno_core::BufMutView::from(buf);
+  let result = if position >= 0 {
+    file.read_at_async(view, position as u64).await
   } else {
-    let view = deno_core::BufMutView::from(buf);
-    let (nread, _) = file.read_byob(view).await?;
-    Ok(nread as u32)
-  }
+    file.read_byob(view).await
+  };
+  let (nread, _) = result.map_err(|e| fd_syscall_err(e, "read"))?;
+  Ok(nread as u32)
 }
 
 /// Positioned write: if position >= 0, uses pwrite to write without moving
@@ -2212,14 +2497,18 @@ fn write_with_position(
     while total < buf.len() {
       let nwritten = file
         .clone()
-        .write_at_sync(&buf[total..], position as u64 + total as u64)?;
+        .write_at_sync(&buf[total..], position as u64 + total as u64)
+        .map_err(|e| fd_syscall_err(e, "write"))?;
       total += nwritten;
     }
     Ok(total as u32)
   } else {
     let mut total = 0usize;
     while total < buf.len() {
-      let nwritten = file.clone().write_sync(&buf[total..])?;
+      let nwritten = file
+        .clone()
+        .write_sync(&buf[total..])
+        .map_err(|e| fd_syscall_err(e, "write"))?;
       total += nwritten;
     }
     Ok(total as u32)
@@ -2379,10 +2668,26 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 // Replicates `getValidatedFd`: `-0` -> 0, otherwise `validateInt32(fd,"fd",0)`.
+// This is node's BINDING-level check (node_file.cc GetValidatedFd), whose C++
+// message renders a bigint without inspect's `n` suffix -- `(2)`, where the
+// JS validators say `(2n)`.
 fn validate_fd_value(
   scope: &mut v8::PinScope<'_, '_>,
   value: v8::Local<v8::Value>,
 ) -> Result<i32, FsError> {
+  if value.is_big_int() {
+    return Err(
+      NodeArgError {
+        class: deno_error::builtin_classes::TYPE_ERROR,
+        code: "ERR_INVALID_ARG_TYPE",
+        message: format!(
+          "The \"fd\" argument must be of type number. Received type bigint ({})",
+          value.to_rust_string_lossy(scope)
+        ),
+      }
+      .into(),
+    );
+  }
   Ok(validate_integer(scope, value, "fd", 0, i32::MAX as i64)? as i32)
 }
 
@@ -2570,7 +2875,7 @@ pub fn op_node_fs_write_v_sync(
     position_v,
     false,
   )?;
-  let file = file_for_fd(state, fd)?;
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("write"))?;
   write_with_position(file, &bytes, position)
 }
 
@@ -2881,7 +3186,7 @@ pub fn op_node_fs_write_v(
     position_v,
     true,
   )?;
-  let file = file_for_fd(state, fd);
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("write"));
   Ok(async move {
     // Yield once so EBADF/write errors reject (callback) instead of
     // completing on the eager poll (which eager_throw rethrows sync).
@@ -2971,7 +3276,7 @@ pub fn op_node_fs_writev_sync<'a>(
     return Ok(0);
   }
   let combined = concat_buffer_views(scope, buffers);
-  let file = file_for_fd(state, fd)?;
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("write"))?;
   write_with_position(file, &combined, position)
 }
 
@@ -2995,7 +3300,7 @@ pub fn op_node_fs_writev<'a>(
   let file = if empty {
     None
   } else {
-    Some(file_for_fd(state, fd))
+    Some(file_for_fd(state, fd).map_err(|_| ebadf_node("write")))
   };
   Ok(async move {
     // Yield once so EBADF/write errors reject (callback) instead of
@@ -3030,15 +3335,17 @@ fn write_all_node(
   Ok(())
 }
 
-// Resolves `fs.writeFile{,Sync}`'s (data, options) arguments: returns
-// (bytes-to-write, open flags, mode). Replicates node's order: encoding is
-// validated first (`getOptions`/`assertEncoding`), then `data`
-// (`validateStringAfterArrayBufferView` + `Buffer.from(str, encoding)`), then
-// `options.flag` (default "w") and `options.mode`.
+// Resolves `fs.writeFile{,Sync}`/`fs.appendFile{,Sync}`'s (data, options)
+// arguments: returns (bytes-to-write, open flags, mode). Replicates node's
+// order: encoding is validated first (`getOptions`/`assertEncoding`), then
+// `data` (`validateStringAfterArrayBufferView` + `Buffer.from(str,
+// encoding)`), then `options.flag` (default "w", or "a" for the appendFile
+// variants) and `options.mode`.
 fn resolve_write_file_args(
   scope: &mut v8::PinScope<'_, '_>,
   data: v8::Local<v8::Value>,
   options: v8::Local<v8::Value>,
+  append: bool,
 ) -> Result<(Vec<u8>, i32, Option<u32>), FsError> {
   let enc = parse_encoding_options(scope, options, Some(BufEnc::Utf8))?;
   let bytes = if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(data)
@@ -3072,8 +3379,13 @@ fn resolve_write_file_args(
     (undef, undef)
   };
   let flags = if flag_v.is_null_or_undefined() {
-    // writeFile's default flag is "w", not stringToFlags' "r".
-    libc::O_TRUNC | libc::O_CREAT | libc::O_WRONLY
+    // writeFile's default flag is "w" (appendFile's is "a"), not
+    // stringToFlags' "r".
+    if append {
+      libc::O_APPEND | libc::O_CREAT | libc::O_WRONLY
+    } else {
+      libc::O_TRUNC | libc::O_CREAT | libc::O_WRONLY
+    }
   } else {
     string_to_flags(scope, flag_v, "options.flag")?
   };
@@ -3090,19 +3402,23 @@ fn resolve_write_file_args(
 // fd, writes all bytes; for a path, opens (flags + default 0o666), optionally
 // chmods to `mode`, writes all bytes, then closes (the file `Rc` drops at
 // scope end, including error paths). Emits the final node errors
-// (open -> "open" w/ path, write -> "write").
-#[op2(fast, stack_trace)]
-pub fn op_node_fs_write_file_sync(
+// (open -> "open" w/ path, write -> "write"). `append` selects the
+// appendFile{,Sync} variant (default flag "a"; for an fd the flag is moot --
+// like node, the write goes to the fd as-is).
+fn write_file_sync_impl(
   scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
   path_or_rid: v8::Local<v8::Value>,
   data: v8::Local<v8::Value>,
   options: v8::Local<v8::Value>,
+  append: bool,
+  api_name: &str,
 ) -> Result<(), FsError> {
-  let (bytes, flags, mode) = resolve_write_file_args(scope, data, options)?;
+  let (bytes, flags, mode) =
+    resolve_write_file_args(scope, data, options, append)?;
   if path_or_rid.is_number() {
     let fd = path_or_rid.int32_value(scope).unwrap_or(0);
-    let file = file_for_fd(state, fd)?;
+    let file = file_for_fd(state, fd).map_err(|_| ebadf_node("write"))?;
     return write_all_node(file, &bytes);
   }
   let path = validate_path_to_string(scope, path_or_rid, "path")?;
@@ -3110,7 +3426,7 @@ pub fn op_node_fs_write_file_sync(
   let checked = state.borrow_mut::<PermissionsContainer>().check_open(
     Cow::Borrowed(Path::new(&path)),
     open_options_to_access_kind(&open_options),
-    Some("node:fs.writeFileSync"),
+    Some(api_name),
   )?;
   let fs = state.borrow::<FileSystemRc>().clone();
   let file = fs
@@ -3125,20 +3441,65 @@ pub fn op_node_fs_write_file_sync(
   write_all_node(file, &bytes)
 }
 
-// Async `fs.writeFile` for the common case (no AbortSignal, no custom
-// iterable — those stay in JS), both path and fd. Validates synchronously in
-// the eager prologue; open + optional chmod + write-all + close run on the
-// event loop. The file `Rc` drops at scope end. Emits node errors
-// (open -> "open", write -> "write").
-#[op2(async(eager_throw), stack_trace)]
-pub fn op_node_fs_write_file(
+#[op2(fast, stack_trace)]
+pub fn op_node_fs_write_file_sync(
   scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
   path_or_rid: v8::Local<v8::Value>,
   data: v8::Local<v8::Value>,
   options: v8::Local<v8::Value>,
+) -> Result<(), FsError> {
+  write_file_sync_impl(
+    scope,
+    state,
+    path_or_rid,
+    data,
+    options,
+    false,
+    "node:fs.writeFileSync",
+  )
+}
+
+// `fs.appendFileSync(pathOrFd, data, options)`: writeFileSync with node's
+// appendFile option handling (default flag "a") done natively, so the public
+// API is a direct op binding.
+#[op2(fast, stack_trace)]
+pub fn op_node_fs_append_file_sync(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  path_or_rid: v8::Local<v8::Value>,
+  data: v8::Local<v8::Value>,
+  options: v8::Local<v8::Value>,
+) -> Result<(), FsError> {
+  write_file_sync_impl(
+    scope,
+    state,
+    path_or_rid,
+    data,
+    options,
+    true,
+    "node:fs.appendFileSync",
+  )
+}
+
+// Async `fs.writeFile`/`fs.appendFile` for the common case (no AbortSignal,
+// no custom iterable — those stay in JS), both path and fd. Validates
+// synchronously in the eager prologue; open + optional chmod + write-all +
+// close run on the event loop. The file `Rc` drops at scope end. Emits node
+// errors (open -> "open", write -> "write").
+fn write_file_async_impl(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  path_or_rid: v8::Local<v8::Value>,
+  data: v8::Local<v8::Value>,
+  options: v8::Local<v8::Value>,
+  append: bool,
+  cancel_rid: Option<ResourceId>,
+  api_name: &str,
 ) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
-  let (bytes, flags, mode) = resolve_write_file_args(scope, data, options)?;
+  let cancel = cancel_handle_for(state, cancel_rid);
+  let (bytes, flags, mode) =
+    resolve_write_file_args(scope, data, options, append)?;
   enum Target {
     // The lookup Result is deferred into the future so a bad fd surfaces as
     // EBADF via the callback (node) rather than a synchronous throw.
@@ -3147,7 +3508,7 @@ pub fn op_node_fs_write_file(
   }
   let target = if path_or_rid.is_number() {
     let fd = path_or_rid.int32_value(scope).unwrap_or(0);
-    Target::Fd(file_for_fd(state, fd))
+    Target::Fd(file_for_fd(state, fd).map_err(|_| ebadf_node("write")))
   } else {
     let path = validate_path_to_string(scope, path_or_rid, "path")?;
     let open_options = get_open_options(flags, Some(0o666));
@@ -3156,40 +3517,83 @@ pub fn op_node_fs_write_file(
       .check_open(
         Cow::Owned(PathBuf::from(&path)),
         open_options_to_access_kind(&open_options),
-        Some("node:fs.writeFile"),
+        Some(api_name),
       )?
       .into_owned();
     Target::Path(path, checked)
   };
   let fs = state.borrow::<FileSystemRc>().clone();
-  Ok(async move {
-    let file = match target {
-      Target::Fd(file) => {
-        // This branch's body is otherwise fully synchronous; yield once so an
-        // immediately-failing lookup/write rejects (reaching the callback)
-        // instead of completing on the eager poll, which eager_throw would
-        // rethrow synchronously.
-        tokio::task::yield_now().await;
-        file?
-      }
-      Target::Path(path, checked) => {
-        let open_options = get_open_options(flags, Some(0o666));
-        let file = fs
-          .open_async(checked, open_options)
-          .await
-          .map_err(|e| node_fs_err(e, "open", &path))?;
-        if let Some(mode) = mode {
-          file
-            .clone()
-            .chmod_async(mode)
+  Ok(with_cancel_handle(
+    async move {
+      // Yield once so I/O errors reject (callback) instead of completing
+      // on the eager poll, which async(eager_throw) rethrows synchronously.
+      tokio::task::yield_now().await;
+      let file = match target {
+        Target::Fd(file) => file?,
+        Target::Path(path, checked) => {
+          let open_options = get_open_options(flags, Some(0o666));
+          let file = fs
+            .open_async(checked, open_options)
             .await
-            .map_err(|e| node_fs_err(e, "chmod", &path))?;
+            .map_err(|e| node_fs_err(e, "open", &path))?;
+          if let Some(mode) = mode {
+            file
+              .clone()
+              .chmod_async(mode)
+              .await
+              .map_err(|e| node_fs_err(e, "chmod", &path))?;
+          }
+          file
         }
-        file
-      }
-    };
-    write_all_node(file, &bytes)
-  })
+      };
+      write_all_node(file, &bytes)
+    },
+    cancel,
+  ))
+}
+
+#[op2(async(eager_throw), stack_trace)]
+pub fn op_node_fs_write_file(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  path_or_rid: v8::Local<v8::Value>,
+  data: v8::Local<v8::Value>,
+  options: v8::Local<v8::Value>,
+  #[smi] cancel_rid: Option<ResourceId>,
+) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
+  write_file_async_impl(
+    scope,
+    state,
+    path_or_rid,
+    data,
+    options,
+    false,
+    cancel_rid,
+    "node:fs.writeFile",
+  )
+}
+
+// Async `fs.appendFile` for the common case (no AbortSignal, no custom
+// iterable): writeFile with node's appendFile option handling (default flag
+// "a") done natively.
+#[op2(async(eager_throw), stack_trace)]
+pub fn op_node_fs_append_file(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  path_or_rid: v8::Local<v8::Value>,
+  data: v8::Local<v8::Value>,
+  options: v8::Local<v8::Value>,
+) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
+  write_file_async_impl(
+    scope,
+    state,
+    path_or_rid,
+    data,
+    options,
+    true,
+    None,
+    "node:fs.appendFile",
+  )
 }
 
 // `fs.truncateSync(path, len)`: node opens 'r+' (so ENOENT etc. surface with
@@ -3264,6 +3668,9 @@ pub fn op_node_fs_truncate(
     )?
     .into_owned();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let file = fs
       .open_async(checked, options)
       .await
@@ -3869,26 +4276,6 @@ impl<'a> deno_core::ToV8<'a> for MaybeString {
   }
 }
 
-#[op2]
-pub fn op_node_fs_fstat_sync(
-  state: &mut OpState,
-  fd: i32,
-) -> Result<NodeFsStat, FsError> {
-  let file = file_for_fd(state, fd)?;
-  let stat = file.stat_sync()?;
-  Ok(NodeFsStat::from(stat))
-}
-
-#[op2]
-pub async fn op_node_fs_fstat(
-  state: Rc<RefCell<OpState>>,
-  fd: i32,
-) -> Result<NodeFsStat, FsError> {
-  let file = file_for_fd(&state.borrow(), fd)?;
-  let stat = file.stat_async().await?;
-  Ok(NodeFsStat::from(stat))
-}
-
 // stat/lstat/fstat returning the cppgc `Stats` object directly, so the JS
 // `convertFileInfoToStats`/`CFISBIS` + `Stats` classes are unnecessary.
 #[op2(stack_trace)]
@@ -3941,6 +4328,9 @@ pub fn op_node_fs_stat(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     match fs.stat_async(checked).await {
       Ok(s) => Ok(MaybeStats(Some(Stats::build(s, bigint)))),
       Err(e)
@@ -4006,6 +4396,9 @@ pub fn op_node_fs_lstat(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     match fs.lstat_async(checked).await {
       Ok(s) => Ok(MaybeStats(Some(Stats::build(s, bigint)))),
       Err(e)
@@ -4030,7 +4423,7 @@ pub fn op_node_fs_fstat_stats_sync(
 ) -> Result<MaybeStats, FsError> {
   let fd = validate_fd_value(scope, fd)?;
   let bigint = parse_bigint_option(scope, options);
-  let file = file_for_fd(state, fd)?;
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fstat"))?;
   match file.stat_sync() {
     Ok(s) => Ok(MaybeStats(Some(Stats::build(s, bigint)))),
     Err(e) => Err(map_fs_error_to_node_fs_error(
@@ -4240,14 +4633,17 @@ struct ReaddirItem {
 
 // Collect one directory's entries, queueing subdirs when recursive. For
 // recursive walks `name` is the path relative to the root (node semantics).
+// Entries are sorted per directory: libuv's uv_fs_scandir runs alphasort, so
+// node's readdir output is alphabetical (test-fs-readdir-types relies on it).
 fn readdir_collect(
   root: &Path,
   dir: &Path,
   recursive: bool,
-  entries: Vec<deno_fs::FsDirEntry>,
+  mut entries: Vec<deno_fs::FsDirEntry>,
   queue: &mut std::collections::VecDeque<PathBuf>,
   items: &mut Vec<ReaddirItem>,
 ) {
+  entries.sort_by(|a, b| a.name.cmp(&b.name));
   for ent in entries {
     if recursive && ent.is_directory {
       queue.push_back(dir.join(&ent.name));
@@ -4418,10 +4814,18 @@ pub async fn op_node_fs_readdir(
       )?;
       (state.borrow::<FileSystemRc>().clone(), checked.into_owned())
     };
-    let entries = fs
+    let reader = fs
       .read_dir_async(checked)
       .await
       .map_err(|e| readdir_scandir_err(e, &dir))?;
+    let mut entries = Vec::new();
+    while let Some(ent) = reader
+      .next()
+      .await
+      .map_err(|e| readdir_scandir_err(e, &dir))?
+    {
+      entries.push(ent);
+    }
     readdir_collect(&root, &dir, recursive, entries, &mut queue, &mut items);
   }
   Ok(ReaddirOutput {
@@ -4696,6 +5100,9 @@ pub fn op_node_fs_mkdir(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     match fs.mkdir_async(checked, recursive, Some(mode)).await {
       Ok(()) => Ok(first_non_existent),
       Err(e) => {
@@ -4750,6 +5157,9 @@ pub fn op_node_fs_remove(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.remove_async(checked, false)
       .await
       .map_err(|e| node_fs_err(e, "unlink", &path))?;
@@ -4908,6 +5318,9 @@ pub fn op_node_fs_rm(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     // node's `rm` reports validateRmOptions' lstat ENOENT / ERR_FS_EISDIR via
     // the callback. `lstat_async` can resolve on the eager first poll (e.g. a
     // missing path), which `eager_throw` would rethrow synchronously — yield
@@ -4993,6 +5406,9 @@ pub fn op_node_fs_rename(
     )
   };
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.rename_async(old, new)
       .await
       .map_err(|e| node_fs_err_dest(e, "rename", &oldpath, &newpath))?;
@@ -5061,6 +5477,9 @@ pub fn op_node_fs_realpath(
   };
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let resolved = fs
       .realpath_async(checked)
       .await
@@ -5126,6 +5545,9 @@ pub fn op_node_fs_read_link(
   };
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let target = fs
       .read_link_async(checked)
       .await
@@ -5219,6 +5641,9 @@ pub fn op_node_fs_access(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let stat = fs
       .lstat_async(checked)
       .await
@@ -5277,6 +5702,9 @@ pub fn op_node_fs_chmod(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.chmod_async(checked, mode)
       .await
       .map_err(|e| node_fs_err(e, "chmod", &path))?;
@@ -5329,6 +5757,9 @@ pub fn op_node_fs_chown(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.chown_async(checked, Some(uid), Some(gid))
       .await
       .map_err(|e| node_fs_err(e, "chown", &path))?;
@@ -5390,6 +5821,9 @@ pub fn op_node_fs_link(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.link_async(old, new)
       .await
       .map_err(|e| node_fs_err_dest(e, "link", &oldpath, &newpath))?;
@@ -5513,6 +5947,9 @@ pub fn op_node_fs_symlink(
     None => resolve_symlink_kind(&fs, &target, &path),
   };
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     let target_p = CheckedPathBuf::unsafe_new(PathBuf::from(&target));
     let path_p = CheckedPathBuf::unsafe_new(PathBuf::from(&path));
     fs.symlink_async(target_p, path_p, file_type)
@@ -5524,56 +5961,121 @@ pub fn op_node_fs_symlink(
 
 // --- copy_file ---
 
+const COPYFILE_EXCL: i64 = 1;
+// COPYFILE_EXCL | COPYFILE_FICLONE | COPYFILE_FICLONE_FORCE
+const COPYFILE_MODE_MAX: i64 = 7;
+
+// node's `getValidMode(mode, "copyFile")` (done in its C++ binding):
+// null/undefined -> 0, otherwise an integer within [0, 7].
+fn validate_copy_mode(
+  scope: &mut v8::PinScope<'_, '_>,
+  mode: v8::Local<v8::Value>,
+) -> Result<i64, FsError> {
+  if mode.is_null_or_undefined() {
+    return Ok(0);
+  }
+  validate_integer(scope, mode, "mode", 0, COPYFILE_MODE_MAX)
+}
+
+fn copyfile_eexist(src: &str, dest: &str) -> FsError {
+  NodeFsError::from_code(
+    "EEXIST",
+    NodeFsErrorContext {
+      syscall: Some("copyfile".to_string()),
+      path: Some(src.to_string()),
+      dest: Some(dest.to_string()),
+      ..Default::default()
+    },
+  )
+  .into()
+}
+
+// `COPYFILE_EXCL` fails with node's EEXIST error when the destination exists;
+// libuv opens the dest O_EXCL, so an existing (even dangling) symlink counts
+// -- hence the lstat probe. libuv opens the SOURCE first though, so a missing
+// source must surface ENOENT before the dest EEXIST -- when the src probe
+// fails we fall through and let the copy produce the real error. The FICLONE
+// flags are validated but treated as hints: the underlying `copy_file`
+// already clones where the platform supports it, and node permits
+// COPYFILE_FICLONE_FORCE to succeed when cloning works.
+
 #[op2(fast, stack_trace)]
+#[undefined]
 pub fn op_node_fs_copy_file_sync(
+  scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
-  #[string] oldpath: &str,
-  #[string] newpath: &str,
+  src: v8::Local<v8::Value>,
+  dest: v8::Local<v8::Value>,
+  mode: v8::Local<v8::Value>,
 ) -> Result<(), FsError> {
+  let srcpath = validate_path_to_string(scope, src, "src")?;
+  let destpath = validate_path_to_string(scope, dest, "dest")?;
+  let mode = validate_copy_mode(scope, mode)?;
   let old = state.borrow_mut::<PermissionsContainer>().check_open(
-    Cow::Borrowed(Path::new(oldpath)),
+    Cow::Borrowed(Path::new(&srcpath)),
     OpenAccessKind::Read,
     Some("node:fs.copyFileSync"),
   )?;
   let new = state.borrow_mut::<PermissionsContainer>().check_open(
-    Cow::Borrowed(Path::new(newpath)),
+    Cow::Borrowed(Path::new(&destpath)),
     OpenAccessKind::WriteNoFollow,
     Some("node:fs.copyFileSync"),
   )?;
   let fs = state.borrow::<FileSystemRc>();
+  if mode & COPYFILE_EXCL != 0
+    && fs.lstat_sync(&old).is_ok()
+    && fs.lstat_sync(&new).is_ok()
+  {
+    return Err(copyfile_eexist(&srcpath, &destpath));
+  }
   fs.copy_file_sync(&old, &new)
-    .map_err(|e| node_fs_err_dest(e, "copyfile", oldpath, newpath))?;
+    .map_err(|e| node_fs_err_dest(e, "copyfile", &srcpath, &destpath))?;
   Ok(())
 }
 
-#[op2(stack_trace)]
-pub async fn op_node_fs_copy_file(
-  state: Rc<RefCell<OpState>>,
-  #[string] oldpath: String,
-  #[string] newpath: String,
-) -> Result<(), FsError> {
-  let (fs, old, new) = {
-    let mut state = state.borrow_mut();
-    let old = state.borrow_mut::<PermissionsContainer>().check_open(
-      Cow::Owned(PathBuf::from(&oldpath)),
+#[op2(async(eager_throw), stack_trace)]
+pub fn op_node_fs_copy_file(
+  scope: &mut v8::PinScope<'_, '_>,
+  state: &mut OpState,
+  src: v8::Local<v8::Value>,
+  dest: v8::Local<v8::Value>,
+  mode: v8::Local<v8::Value>,
+) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
+  let srcpath = validate_path_to_string(scope, src, "src")?;
+  let destpath = validate_path_to_string(scope, dest, "dest")?;
+  let mode = validate_copy_mode(scope, mode)?;
+  let old = state
+    .borrow_mut::<PermissionsContainer>()
+    .check_open(
+      Cow::Owned(PathBuf::from(&srcpath)),
       OpenAccessKind::Read,
       Some("node:fs.copyFile"),
-    )?;
-    let new = state.borrow_mut::<PermissionsContainer>().check_open(
-      Cow::Owned(PathBuf::from(&newpath)),
+    )?
+    .into_owned();
+  let new = state
+    .borrow_mut::<PermissionsContainer>()
+    .check_open(
+      Cow::Owned(PathBuf::from(&destpath)),
       OpenAccessKind::WriteNoFollow,
       Some("node:fs.copyFile"),
-    )?;
-    (
-      state.borrow::<FileSystemRc>().clone(),
-      old.into_owned(),
-      new.into_owned(),
-    )
-  };
-  fs.copy_file_async(old, new)
-    .await
-    .map_err(|e| node_fs_err_dest(e, "copyfile", &oldpath, &newpath))?;
-  Ok(())
+    )?
+    .into_owned();
+  let fs = state.borrow::<FileSystemRc>().clone();
+  Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
+    if mode & COPYFILE_EXCL != 0
+      && fs.lstat_async(old.clone()).await.is_ok()
+      && fs.lstat_async(new.clone()).await.is_ok()
+    {
+      return Err(copyfile_eexist(&srcpath, &destpath));
+    }
+    fs.copy_file_async(old, new)
+      .await
+      .map_err(|e| node_fs_err_dest(e, "copyfile", &srcpath, &destpath))?;
+    Ok(())
+  })
 }
 
 // --- utimes ---
@@ -5626,6 +6128,9 @@ pub fn op_node_fs_utime(
     .into_owned();
   let fs = state.borrow::<FileSystemRc>().clone();
   Ok(async move {
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
     fs.utime_async(checked, atime_secs, atime_nanos, mtime_secs, mtime_nanos)
       .await
       .map_err(|e| node_fs_err(e, "utime", &path))?;
@@ -5633,11 +6138,10 @@ pub fn op_node_fs_utime(
   })
 }
 
-// An all-zero `Stats`, used as the watchFile sentinel (`emptyStats`). Built
-// lazily on first use since cppgc objects can't be created at snapshot time.
-#[op2]
-#[cppgc]
-pub fn op_node_fs_empty_stats(bigint: bool) -> Stats {
+// An all-zero `Stats`, the watchFile sentinel for a path that can't be
+// stat'ed — matching libuv's `uv_fs_poll_t`, which reports zeroed stats when
+// the poll target doesn't exist.
+fn empty_stats(bigint: bool) -> Stats {
   Stats {
     dev: 0.0,
     ino: 0.0,
@@ -5665,21 +6169,198 @@ pub fn op_node_fs_empty_stats(bigint: bool) -> Stats {
   }
 }
 
+// The fields node's watchFile change detector compares
+// (lib/internal/fs/watchers.js onchange). `None` (a failed stat) compares as
+// all zeros, mirroring libuv's zeroed `uv_fs_poll_t` stats.
+fn watch_cmp_fields(
+  stat: &Option<deno_io::fs::FsStat>,
+) -> (f64, f64, f64, u32, u32, u32, f64, f64) {
+  match stat {
+    None => (0.0, 0.0, 0.0, 0, 0, 0, 0.0, 0.0),
+    Some(s) => {
+      let n = NodeFsStat::from(*s);
+      (
+        n.mtime_ms.unwrap_or(0.0),
+        n.ctime_ms.unwrap_or(0.0),
+        n.size,
+        n.mode,
+        n.uid,
+        n.gid,
+        n.ino,
+        n.dev,
+      )
+    }
+  }
+}
+
 // `watchFile`'s change detector: any difference in the fields node compares
-// (lib/internal/fs/watchers.js onchange) counts as a change.
-#[op2(fast)]
-pub fn op_node_fs_stats_changed(
-  #[cppgc] prev: &Stats,
-  #[cppgc] curr: &Stats,
+// counts as a change (chmod/chown, file replacement, and sub-mtime-resolution
+// changes all fire "change").
+fn watch_stats_changed(
+  prev: &Option<deno_io::fs::FsStat>,
+  curr: &Option<deno_io::fs::FsStat>,
 ) -> bool {
-  prev.mtime_ms != curr.mtime_ms
-    || prev.ctime_ms != curr.ctime_ms
-    || prev.size != curr.size
-    || prev.mode != curr.mode
-    || prev.uid != curr.uid
-    || prev.gid != curr.gid
-    || prev.ino != curr.ino
-    || prev.dev != curr.dev
+  watch_cmp_fields(prev) != watch_cmp_fields(curr)
+}
+
+// The Rust half of `fs.watchFile`'s StatWatcher: owns the poll interval and
+// the previous stat snapshot. JS keeps only the EventEmitter shell; each
+// `op_node_fs_stat_watcher_poll` call resolves with the next [curr, prev]
+// change pair (or null once the resource is closed by `unwatchFile`/`stop`).
+struct StatWatcherResource {
+  path: String,
+  bigint: bool,
+  interval_ms: u64,
+  poll_state: deno_core::AsyncRefCell<StatWatcherPollState>,
+  cancel: deno_core::CancelHandle,
+}
+
+#[derive(Default)]
+struct StatWatcherPollState {
+  started: bool,
+  prev: Option<deno_io::fs::FsStat>,
+}
+
+impl deno_core::Resource for StatWatcherResource {
+  fn name(&self) -> Cow<'_, str> {
+    "nodeStatWatcher".into()
+  }
+
+  fn close(self: Rc<Self>) {
+    self.cancel.cancel();
+  }
+}
+
+// A watchFile poll result stat: a real stat (converted with own data
+// properties like every op-built Stats), or the zeroed sentinel for a failed
+// stat. The sentinel is a bare cppgc object with NO own properties so it
+// deep-equals a constructor-built `new fs.Stats()`, matching node (where the
+// zeroed stats also come from the binding) and the previous `emptyStats()`
+// polyfill helper.
+struct WatchStat(Option<deno_io::fs::FsStat>, bool);
+
+impl WatchStat {
+  fn into_v8<'a>(
+    self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> v8::Local<'a, v8::Value> {
+    match self.0 {
+      Some(stat) => stats_to_v8(scope, Stats::build(stat, self.1)),
+      None => {
+        deno_core::cppgc::make_cppgc_object(scope, empty_stats(self.1)).into()
+      }
+    }
+  }
+}
+
+// `[curr, prev]` Stats pair for a watchFile "change" emission, or `null` once
+// the watcher is stopped (ends the JS poll loop).
+struct StatsPair(Option<(WatchStat, WatchStat)>);
+
+impl<'a> ToV8<'a> for StatsPair {
+  type Error = std::convert::Infallible;
+  fn to_v8(
+    self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+    Ok(match self.0 {
+      Some((curr, prev)) => {
+        let curr = curr.into_v8(scope);
+        let prev = prev.into_v8(scope);
+        v8::Array::new_with_elements(scope, &[curr, prev]).into()
+      }
+      None => v8::null(scope).into(),
+    })
+  }
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_node_fs_stat_watcher_open(
+  state: &mut OpState,
+  #[string] path: String,
+  bigint: bool,
+  interval: f64,
+) -> ResourceId {
+  state.resource_table.add(StatWatcherResource {
+    path,
+    bigint,
+    interval_ms: interval.max(0.0) as u64,
+    poll_state: deno_core::AsyncRefCell::new(StatWatcherPollState::default()),
+    cancel: deno_core::CancelHandle::default(),
+  })
+}
+
+// watchFile swallows stat errors into the zeroed-stats sentinel (`None`),
+// including permission errors — matching the JS `statAsync` it replaces.
+async fn stat_watch_path(
+  state: &Rc<RefCell<OpState>>,
+  path: &str,
+) -> Option<deno_io::fs::FsStat> {
+  let (fs, checked) = {
+    let mut state = state.borrow_mut();
+    let checked = state
+      .borrow_mut::<PermissionsContainer>()
+      .check_open(
+        Cow::Owned(PathBuf::from(path)),
+        OpenAccessKind::Read,
+        Some("node:fs.watchFile"),
+      )
+      .ok()?
+      .into_owned();
+    (state.borrow::<FileSystemRc>().clone(), checked)
+  };
+  fs.stat_async(checked).await.ok()
+}
+
+// Resolves with the next change pair. The first call performs the initial
+// stat; libuv emits an initial "change" (with zeroed stats for both args)
+// only when that first stat fails, which is mirrored here. Resolves null when
+// the resource is closed.
+#[op2]
+pub async fn op_node_fs_stat_watcher_poll(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+) -> Result<StatsPair, deno_core::error::ResourceError> {
+  let resource = state
+    .borrow()
+    .resource_table
+    .get::<StatWatcherResource>(rid)?;
+  let mut poll_state = deno_core::RcRef::map(&resource, |r| &r.poll_state)
+    .borrow_mut()
+    .await;
+  if !poll_state.started {
+    poll_state.started = true;
+    poll_state.prev = stat_watch_path(&state, &resource.path).await;
+    if poll_state.prev.is_none() {
+      return Ok(StatsPair(Some((
+        WatchStat(None, resource.bigint),
+        WatchStat(None, resource.bigint),
+      ))));
+    }
+  }
+  loop {
+    let cancel = deno_core::RcRef::map(&resource, |r| &r.cancel);
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(
+      resource.interval_ms,
+    ));
+    if deno_core::CancelFuture::or_cancel(sleep, cancel)
+      .await
+      .is_err()
+    {
+      // Closed by `unwatchFile`/`stop()`.
+      return Ok(StatsPair(None));
+    }
+    let curr = stat_watch_path(&state, &resource.path).await;
+    if watch_stats_changed(&poll_state.prev, &curr) {
+      let prev = poll_state.prev.take();
+      poll_state.prev = curr;
+      return Ok(StatsPair(Some((
+        WatchStat(poll_state.prev, resource.bigint),
+        WatchStat(prev, resource.bigint),
+      ))));
+    }
+  }
 }
 
 // Replicates `validateIgnoreOption` from node's lib/internal/fs/watchers.js:
@@ -5918,11 +6599,16 @@ pub fn op_node_fs_futimes(
     time_to_sec_nsec_full(get_valid_time(scope, atime, "atime")?);
   let (mtime_secs, mtime_nanos) =
     time_to_sec_nsec_full(get_valid_time(scope, mtime, "mtime")?);
-  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("futime"))?;
+  // Deferred so a bad fd surfaces as EBADF via the callback, like node.
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("futime"));
   Ok(async move {
-    file
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
+    file?
       .utime_async(atime_secs, atime_nanos, mtime_secs, mtime_nanos)
-      .await?;
+      .await
+      .map_err(|e| fd_syscall_err(e, "futime"))?;
     Ok(())
   })
 }
@@ -5951,9 +6637,16 @@ pub fn op_node_fs_fchmod(
 ) -> Result<impl Future<Output = Result<(), FsError>> + use<>, FsError> {
   let fd = validate_integer(scope, fd, "fd", 0, 2147483647)? as i32;
   let mode = parse_file_mode(scope, mode, "mode", None)?;
-  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fchmod"))?;
+  // Deferred so a bad fd surfaces as EBADF via the callback, like node.
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fchmod"));
   Ok(async move {
-    file.chmod_async(mode).await?;
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
+    file?
+      .chmod_async(mode)
+      .await
+      .map_err(|e| fd_syscall_err(e, "fchmod"))?;
     Ok(())
   })
 }
@@ -5986,9 +6679,16 @@ pub fn op_node_fs_fchown(
   let fd = validate_integer(scope, fd, "fd", 0, 2147483647)? as i32;
   let uid = validate_integer(scope, uid, "uid", -1, K_MAX_USER_ID)? as u32;
   let gid = validate_integer(scope, gid, "gid", -1, K_MAX_USER_ID)? as u32;
-  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fchown"))?;
+  // Deferred so a bad fd surfaces as EBADF via the callback, like node.
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fchown"));
   Ok(async move {
-    file.chown_async(Some(uid), Some(gid)).await?;
+    // Yield once so I/O errors reject (callback) instead of completing
+    // on the eager poll, which async(eager_throw) rethrows synchronously.
+    tokio::task::yield_now().await;
+    file?
+      .chown_async(Some(uid), Some(gid))
+      .await
+      .map_err(|e| fd_syscall_err(e, "fchown"))?;
     Ok(())
   })
 }
@@ -6031,6 +6731,41 @@ async fn check_read_file_size_async(
   Ok(())
 }
 
+// Cancellation plumbing for the AbortSignal-capable ops (readFile/writeFile):
+// JS passes the rid of a `CancelHandle` resource that the signal's abort
+// handler closes, interrupting the in-flight I/O. The op-side cancellation
+// error is a placeholder -- the JS wrapper always replaces it with node's
+// AbortError once `signal.aborted` is set.
+fn cancel_handle_for(
+  state: &OpState,
+  cancel_rid: Option<ResourceId>,
+) -> Option<Rc<deno_core::CancelHandle>> {
+  cancel_rid.and_then(|rid| {
+    state
+      .resource_table
+      .get::<deno_core::CancelHandle>(rid)
+      .ok()
+  })
+}
+
+async fn with_cancel_handle<T>(
+  fut: impl Future<Output = Result<T, FsError>>,
+  cancel: Option<Rc<deno_core::CancelHandle>>,
+) -> Result<T, FsError> {
+  match cancel {
+    Some(cancel) => {
+      match deno_core::CancelFuture::or_cancel(fut, cancel).await {
+        Ok(res) => res,
+        Err(_canceled) => Err(FsError::Io(std::io::Error::new(
+          std::io::ErrorKind::Interrupted,
+          "operation canceled",
+        ))),
+      }
+    }
+    None => fut.await,
+  }
+}
+
 // Extracts `options.flag` (when `options` is an object) for `string_to_flags`;
 // the string-options form (`readFileSync(p, "utf8")`) has no flag slot.
 fn read_file_flags(
@@ -6062,9 +6797,13 @@ pub fn op_node_fs_read_file_path_sync(
   let enc = parse_encoding_options(scope, options, None)?;
   if path.is_number() {
     let fd = path.int32_value(scope).unwrap_or(0);
-    let file = file_for_fd(state, fd)?;
+    // node fstats the fd first to size the buffer, so a bad fd reports
+    // syscall "fstat"; read failures report "read".
+    let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fstat"))?;
     check_read_file_size_sync(&file)?;
-    let buf = file.read_all_sync()?;
+    let buf = file
+      .read_all_sync()
+      .map_err(|e| fd_syscall_err(e, "read"))?;
     return Ok(MaybeEncodedBytes::new(state, buf.to_vec(), enc));
   }
   let path = validate_path_to_string(scope, path, "path")?;
@@ -6086,17 +6825,20 @@ pub fn op_node_fs_read_file_path_sync(
   Ok(MaybeEncodedBytes::new(state, buf.to_vec(), enc))
 }
 
-// `fs.readFile(path, options)`: async counterpart of the above.
+// `fs.readFile(path, options)`: async counterpart of the above. `cancel_rid`
+// (an AbortSignal-backed CancelHandle) interrupts the open/read when given.
 #[op2(async(eager_throw), stack_trace)]
 pub fn op_node_fs_read_file_path(
   scope: &mut v8::PinScope<'_, '_>,
   state: &mut OpState,
   path: v8::Local<v8::Value>,
   options: v8::Local<v8::Value>,
+  #[smi] cancel_rid: Option<ResourceId>,
 ) -> Result<
   impl Future<Output = Result<MaybeEncodedBytes, FsError>> + use<>,
   FsError,
 > {
+  let cancel = cancel_handle_for(state, cancel_rid);
   let path = validate_path_to_string(scope, path, "path")?;
   let enc = parse_encoding_options(scope, options, None)?;
   let flags = read_file_flags(scope, options)?;
@@ -6115,27 +6857,37 @@ pub fn op_node_fs_read_file_path(
     None
   };
   let fs = state.borrow::<FileSystemRc>().clone();
-  Ok(async move {
-    let file = fs
-      .open_async(checked, open_options)
-      .await
-      .map_err(|e| node_fs_err(e, "open", &path))?;
-    check_read_file_size_async(&file).await?;
-    let buf = file
-      .read_all_async()
-      .await
-      .map_err(|e| node_fs_err(e, "open", &path))?;
-    Ok(MaybeEncodedBytes {
-      bytes: buf.to_vec(),
-      enc,
-      proto,
-    })
-  })
+  Ok(with_cancel_handle(
+    async move {
+      // Yield once so I/O errors reject (callback) instead of completing
+      // on the eager poll, which async(eager_throw) rethrows synchronously.
+      tokio::task::yield_now().await;
+      let file = fs
+        .open_async(checked, open_options)
+        .await
+        .map_err(|e| node_fs_err(e, "open", &path))?;
+      check_read_file_size_async(&file).await?;
+      let buf = file
+        .read_all_async()
+        .await
+        .map_err(|e| node_fs_err(e, "open", &path))?;
+      Ok(MaybeEncodedBytes {
+        bytes: buf.to_vec(),
+        enc,
+        proto,
+      })
+    },
+    cancel,
+  ))
 }
 
 // `fs.readFile(fd, options)`: read all bytes from the fd's current position
 // (read_to_end handles unknown-size sources like pipes), returning them
-// already encoded per `options.encoding` (default: a Buffer).
+// already encoded per `options.encoding` (default: a Buffer). The
+// AbortSignal-capable fd read stays in JS: node guarantees that an abort
+// scheduled via process.nextTick before a chunk read completes is observed,
+// which needs JS-visible async hops between chunk reads (a one-shot native
+// read with or_cancel races the nextTick queue).
 #[op2(async(eager_throw), stack_trace)]
 pub fn op_node_fs_read_file(
   scope: &mut v8::PinScope<'_, '_>,
@@ -6152,15 +6904,19 @@ pub fn op_node_fs_read_file(
   } else {
     None
   };
-  // Deferred so a bad fd rejects (EBADF via the callback) like node.
-  let file = file_for_fd(state, fd);
+  // Deferred so a bad fd rejects (EBADF via the callback) like node. node
+  // fstats the fd first to size the buffer, hence syscall "fstat".
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fstat"));
   Ok(async move {
     // Yield once so a bad-fd error rejects instead of completing on the
     // eager poll (which eager_throw rethrows synchronously).
     tokio::task::yield_now().await;
     let file = file?;
     check_read_file_size_async(&file).await?;
-    let buf = file.read_all_async().await?;
+    let buf = file
+      .read_all_async()
+      .await
+      .map_err(|e| fd_syscall_err(e, "read"))?;
     Ok(MaybeEncodedBytes {
       bytes: buf.to_vec(),
       enc,
@@ -6169,8 +6925,21 @@ pub fn op_node_fs_read_file(
   })
 }
 
+// fstat field-object form for the JS abort-signal fd read (it needs
+// isFile/size to mirror node's readFileHandle chunking).
+#[op2]
+pub fn op_node_fs_fstat_sync(
+  state: &mut OpState,
+  fd: i32,
+) -> Result<NodeFsStat, FsError> {
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("fstat"))?;
+  let stat = file.stat_sync().map_err(|e| fd_syscall_err(e, "fstat"))?;
+  Ok(NodeFsStat::from(stat))
+}
+
 // Encodes already-read bytes per `options.encoding` (default: a Buffer); used
-// by the JS abort-signal read paths whose data arrives as a plain Uint8Array.
+// by the JS abort-signal fd read path whose data arrives as a plain
+// Uint8Array.
 #[op2(stack_trace)]
 pub fn op_node_fs_encode_bytes(
   scope: &mut v8::PinScope<'_, '_>,
@@ -6200,11 +6969,12 @@ pub fn op_node_fs_readv_sync<'a>(
   if buffers.length() == 0 {
     return Ok(0);
   }
-  let file = file_for_fd(state, fd)?;
+  let file = file_for_fd(state, fd).map_err(|_| ebadf_node("read"))?;
   if position >= 0 {
     file
       .clone()
-      .seek_sync(std::io::SeekFrom::Start(position as u64))?;
+      .seek_sync(std::io::SeekFrom::Start(position as u64))
+      .map_err(|e| fd_syscall_err(e, "read"))?;
   }
   let mut read_total: u32 = 0;
   'outer: for i in 0..buffers.length() {
@@ -6226,7 +6996,10 @@ pub fn op_node_fs_readv_sync<'a>(
       unsafe { std::slice::from_raw_parts_mut(view.data() as *mut u8, len) };
     let mut filled = 0usize;
     while filled < len {
-      let nread = file.clone().read_sync(&mut buf[filled..])?;
+      let nread = file
+        .clone()
+        .read_sync(&mut buf[filled..])
+        .map_err(|e| fd_syscall_err(e, "read"))?;
       if nread == 0 {
         break 'outer; // EOF
       }
@@ -6263,7 +7036,7 @@ pub fn op_node_fs_readv<'a>(
   let file = if buffers.length() == 0 {
     None
   } else {
-    Some(file_for_fd(state, fd))
+    Some(file_for_fd(state, fd).map_err(|_| ebadf_node("read")))
   };
   let mut views: Vec<RawView> = Vec::with_capacity(buffers.length() as usize);
   for i in 0..buffers.length() {

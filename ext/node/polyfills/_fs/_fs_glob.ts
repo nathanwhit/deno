@@ -13,13 +13,15 @@ const {
 const { isMacOS, isWindows } = core.loadExtScript("ext:deno_node/_util/os.ts");
 const { kEmptyObject } = core.loadExtScript("ext:deno_node/internal/util.mjs");
 const lazyProcess = core.createLazyLoader("node:process");
-const lazyReaddir = core.createLazyLoader(
-  "ext:deno_node/_fs/_fs_readdir.ts",
-);
+// The ops validate the path + extract options themselves; the async ops are
+// directly the promise form (lstat resolves the cppgc Stats, readdir the
+// Dirent array -- glob always wants `withFileTypes: true`, utf8 names).
 const {
-  lstatPromise: lstat,
-  lstatSync,
-} = core.loadExtScript("ext:deno_node/_fs/_fs_lstat.ts");
+  op_node_fs_lstat: lstat,
+  op_node_fs_lstat_sync: lstatSync,
+  op_node_fs_readdir,
+  op_node_fs_readdir_sync,
+} = core.ops;
 
 const {
   basename,
@@ -302,10 +304,7 @@ class Cache {
       return cached;
     }
     const promise = PromisePrototypeThen(
-      lazyReaddir().readdirPromise(path, {
-        __proto__: null,
-        withFileTypes: true,
-      }),
+      op_node_fs_readdir(path, false, true),
       null,
       () => [],
     );
@@ -319,10 +318,7 @@ class Cache {
     }
     let val;
     try {
-      val = lazyReaddir().readdirSync(path, {
-        __proto__: null,
-        withFileTypes: true,
-      });
+      val = op_node_fs_readdir_sync(path, false, true);
     } catch {
       val = [];
     }
