@@ -13,6 +13,7 @@ import {
   op_module_hooks_register,
   op_module_hooks_respond_load,
   op_napi_open,
+  op_node_fs_set_buffer_prototype,
   op_node_has_child_ipc_pipe,
   op_node_strip_typescript_types,
   op_require_as_file_path,
@@ -3385,9 +3386,16 @@ function initialize(args) {
       core.loadExtScript("ext:deno_node/cluster.ts");
       internals.__initCluster(nodeClusterUniqueId, nodeClusterSchedPolicy);
     }
-    // (stream-wrap GothamState registration moved to process.ts's
-    // __bootstrapNodeProcess, which this calls above at 3090 -- single
-    // registration point that also covers the node-defer path.)
+    const { streamBaseState } = core.loadExtScript(
+      "ext:deno_node/internal_binding/stream_wrap.ts",
+    );
+    op_stream_base_register_state(streamBaseState);
+    // Let native fs ops construct real `Buffer`s (Uint8Arrays carrying this
+    // prototype). Must run per-runtime: OpState set at snapshot time is lost.
+    const { Buffer } = core.loadExtScript(
+      "ext:deno_node/internal/buffer.mjs",
+    );
+    op_node_fs_set_buffer_prototype(Buffer.prototype);
     nativeModuleExports["internal/console/constructor"].bindStreamsLazy(
       nativeModuleExports["console"],
       nativeModuleExports["process"],
