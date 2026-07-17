@@ -1299,6 +1299,7 @@
     "parallel/test-fs-cp-async-dereference-force-false-silent-fail.mjs": {},
     "parallel/test-fs-cp-async-dereference-symlink.mjs": {},
     "parallel/test-fs-cp-async-dest-symlink-points-to-src-error.mjs": {},
+    "parallel/test-fs-cp-async-dir-exists-error-on-exist.mjs": {},
     "parallel/test-fs-cp-async-dir-to-file.mjs": {},
     "parallel/test-fs-cp-async-error-on-exist.mjs": {},
     "parallel/test-fs-cp-async-file-to-dir.mjs": {},
@@ -5402,6 +5403,7 @@
       "reason": "times out"
     },
     "pummel/test-fs-read-file-sync-utf8-memory.js": {},
+    "pummel/test-fs-readfile-tostring-fail.js": {},
     "pummel/test-fs-watch-file-slow.js": {},
     "pummel/test-fs-watch-non-recursive.js": {},
     "pummel/test-heapsnapshot-near-heap-limit-bounded.js": {},
