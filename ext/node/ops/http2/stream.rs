@@ -564,8 +564,19 @@ mod tests {
     assert_eq!(headers.nva.len(), 1);
     assert_eq!(headers.nva[0].flags, ffi::NGHTTP2_NV_FLAG_NO_INDEX as u8);
   }
-}
 
+  #[test]
+  fn http2_pending_data_limit_allows_data_until_cap() {
+    assert!(can_queue_pending_data(0, MAX_PENDING_DATA_PER_STREAM));
+    assert!(can_queue_pending_data(MAX_PENDING_DATA_PER_STREAM - 1, 1));
+  }
+
+  #[test]
+  fn http2_pending_data_limit_rejects_over_cap_or_overflow() {
+    assert!(!can_queue_pending_data(MAX_PENDING_DATA_PER_STREAM, 1));
+    assert!(!can_queue_pending_data(usize::MAX, 1));
+  }
+}
 #[op2]
 impl Http2Stream {
   #[fast]
