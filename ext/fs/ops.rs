@@ -2101,6 +2101,7 @@ create_struct_writer! {
     is_symlink: bool,
     size: u64,
     // In milliseconds, like JavaScript. Available on both Unix or Windows.
+    // Signed so pre-epoch times stay negative.
     mtime_set: bool,
     mtime: i64,
     atime_set: bool,
